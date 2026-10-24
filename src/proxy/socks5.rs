@@ -161,7 +161,10 @@ async fn handle_socks_connection(mut oc: OutboundConnection, mut stream: TcpStre
                 }
             };
             let remote_addr = socket::to_canonical(peer);
-            oc.proxy_to(stream, remote_addr, target).await
+            // The xDS-drain select makes proxy_to's composed future large.
+            // Box it after SOCKS negotiation so the accept task keeps its
+            // existing per-connection future-size bound.
+            Box::pin(oc.proxy_to(stream, remote_addr, target)).await
         }
         Err(e) => {
             warn!("failed to negotiate socks connection: {e}");

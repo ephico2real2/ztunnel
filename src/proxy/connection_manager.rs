@@ -59,6 +59,8 @@ impl ConnectionDrain {
 pub struct ConnectionManager {
     drains: Arc<RwLock<HashMap<InboundConnection, ConnectionDrain>>>,
     outbound_connections: Arc<RwLock<HashSet<OutboundConnection>>>,
+    // Only strict mesh outbound flows need to participate in xDS session drains.
+    outbound_drains: Arc<RwLock<HashMap<OutboundConnection, ConnectionDrain>>>,
 }
 
 impl std::fmt::Debug for ConnectionManager {
@@ -72,6 +74,7 @@ impl Default for ConnectionManager {
         ConnectionManager {
             drains: Arc::new(RwLock::new(HashMap::new())),
             outbound_connections: Arc::new(RwLock::new(HashSet::new())),
+            outbound_drains: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
@@ -120,6 +123,13 @@ impl Drop for ConnectionGuard {
 pub struct OutboundConnectionGuard {
     cm: ConnectionManager,
     conn: OutboundConnection,
+    watch: Option<DrainWatcher>,
+}
+
+impl OutboundConnectionGuard {
+    pub fn watcher(&mut self) -> Option<DrainWatcher> {
+        self.watch.take()
+    }
 }
 
 impl Drop for OutboundConnectionGuard {
@@ -161,6 +171,7 @@ impl ConnectionManager {
         original_dst: SocketAddr,
         actual_dst: SocketAddr,
         protocol: OutboundProtocol,
+        drain_on_xds_change: bool,
     ) -> OutboundConnectionGuard {
         let c = OutboundConnection {
             src,
@@ -174,9 +185,36 @@ impl ConnectionManager {
             .expect("mutex")
             .insert(c.clone());
 
+        let watch = if drain_on_xds_change {
+            Some(self.register_outbound(&c))
+        } else {
+            None
+        };
+
         OutboundConnectionGuard {
             cm: self.clone(),
             conn: c,
+            watch,
+        }
+    }
+
+    fn register_outbound(&self, connection: &OutboundConnection) -> DrainWatcher {
+        match self
+            .outbound_drains
+            .write()
+            .expect("mutex")
+            .entry(connection.clone())
+        {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().count += 1;
+                entry.get().rx.clone()
+            }
+            Entry::Vacant(entry) => {
+                let drain = ConnectionDrain::new();
+                let watch = drain.rx.clone();
+                entry.insert(drain);
+                watch
+            }
         }
     }
 
@@ -242,6 +280,13 @@ impl ConnectionManager {
 
     fn release_outbound(&self, c: &OutboundConnection) {
         self.outbound_connections.write().expect("mutex").remove(c);
+        let mut drains = self.outbound_drains.write().expect("mutex");
+        if let Some((key, mut drain)) = drains.remove_entry(c)
+            && drain.count > 1
+        {
+            drain.count -= 1;
+            drains.insert(key, drain);
+        }
     }
 
     // signal all connections listening to this channel to take action (typically terminate traffic)
@@ -253,6 +298,47 @@ impl ConnectionManager {
             // this is bad, possibly drain called twice
             error!("requested drain on a Connection which wasn't initialized");
         }
+    }
+
+    /// Closes every inbound stream and strict mesh outbound flow before a
+    /// refreshed xDS session can authorize new connections.
+    async fn close_all(&self) -> usize {
+        let connections = self.connections();
+        let protected_outbound = self.protected_outbound_connections();
+        let count = connections.len() + protected_outbound.len();
+        tokio::join!(
+            futures::future::join_all(
+                connections
+                    .into_iter()
+                    .map(|connection| async move { self.close(&connection).await }),
+            ),
+            futures::future::join_all(
+                protected_outbound
+                    .into_iter()
+                    .map(|connection| async move { self.close_outbound(&connection).await })
+            ),
+        );
+        count
+    }
+
+    async fn close_outbound(&self, connection: &OutboundConnection) {
+        let drain = self
+            .outbound_drains
+            .write()
+            .expect("mutex")
+            .remove(connection);
+        if let Some(drain) = drain {
+            drain.drain().await;
+        }
+    }
+
+    fn protected_outbound_connections(&self) -> Vec<OutboundConnection> {
+        self.outbound_drains
+            .read()
+            .expect("mutex")
+            .keys()
+            .cloned()
+            .collect()
     }
 
     //  get a list of all connections being tracked
@@ -306,6 +392,8 @@ pub struct PolicyWatcher {
     state: DemandProxyState,
     stop: DrainWatcher,
     connection_manager: ConnectionManager,
+    drain_participant: Option<crate::xds::DrainParticipant>,
+    policies_changed: tokio::sync::watch::Receiver<()>,
 }
 
 impl PolicyWatcher {
@@ -314,19 +402,62 @@ impl PolicyWatcher {
         stop: DrainWatcher,
         connection_manager: ConnectionManager,
     ) -> Self {
+        // Subscribe before the watcher task is spawned so policy changes cannot
+        // be lost between construction and its first poll.
+        let policies_changed = state.read().policies.subscribe();
+        let drain_participant = state
+            .xds_session()
+            .map(|gate| gate.register_drain_participant());
         PolicyWatcher {
             state,
             stop,
             connection_manager,
+            drain_participant,
+            policies_changed,
         }
     }
 
     pub async fn run(self) {
-        let mut policies_changed = self.state.read().policies.subscribe();
+        let mut policies_changed = self.policies_changed;
+        let session_gate = self.state.xds_session();
+        let mut session_changes = session_gate.as_ref().map(|gate| gate.subscribe());
+        if let (Some(gate), Some(participant)) = (&session_gate, self.drain_participant) {
+            let snapshot = gate.snapshot();
+            if gate.needs_drain(snapshot.generation, participant) {
+                let closed = self.connection_manager.close_all().await;
+                gate.mark_drained(snapshot.generation, participant);
+                info!(
+                    session_generation = snapshot.generation,
+                    closed_connections = closed,
+                    "drained inbound connections for initial xDS session state"
+                );
+            }
+        }
         loop {
             tokio::select! {
                 _ = self.stop.clone().wait_for_drain() => {
                     break;
+                }
+                changed = async {
+                    match session_changes.as_mut() {
+                        Some(receiver) => receiver.changed().await.ok(),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_some()
+                        && let (Some(gate), Some(participant)) = (&session_gate, self.drain_participant)
+                    {
+                        let snapshot = gate.snapshot();
+                        if gate.needs_drain(snapshot.generation, participant) {
+                            let closed = self.connection_manager.close_all().await;
+                            gate.mark_drained(snapshot.generation, participant);
+                            info!(
+                                session_generation = snapshot.generation,
+                                closed_connections = closed,
+                                "drained inbound connections for xDS session transition"
+                            );
+                        }
+                    }
                 }
                 _ = policies_changed.changed() => {
                     let connections = self.connection_manager.connections();
@@ -338,6 +469,10 @@ impl PolicyWatcher {
                     }
                 }
             }
+        }
+        if let (Some(gate), Some(participant)) = (&session_gate, self.drain_participant) {
+            self.connection_manager.close_all().await;
+            gate.unregister_drain_participant(participant);
         }
     }
 }
@@ -352,7 +487,8 @@ mod tests {
     use std::sync::{Arc, RwLock};
     use std::time::Duration;
 
-    use crate::rbac::Connection;
+    use crate::identity::Identity;
+    use crate::rbac::{Authorization as RbacAuthorization, Connection, RbacAction, RbacScope};
     use crate::state::{DemandProxyState, ProxyState};
     use crate::test_helpers::test_default_workload;
     use crate::xds::ProxyStateUpdateMutator;
@@ -655,6 +791,347 @@ mod tests {
 
         // send the signal which stops policy watcher
         tx.start_drain_and_wait(drain::DrainMode::Immediate).await;
+    }
+
+    #[tokio::test]
+    async fn policy_watcher_drains_connections_when_xds_session_becomes_stale() {
+        let state = Arc::new(RwLock::new(ProxyState::new(None)));
+        let mut registry = Registry::default();
+        let metrics = Arc::new(crate::proxy::Metrics::new(&mut registry));
+        let session = crate::xds::XdsSessionGate::new();
+        let generation = session.begin_session();
+        session.mark_snapshot_ready(generation);
+        let dstate = DemandProxyState::new(
+            state,
+            None,
+            ResolverConfig::default(),
+            ResolverOpts::default(),
+            metrics,
+        )
+        .with_require_inbound_mtls(true)
+        .with_xds_session(Some(session.clone()));
+        let connection = |source_port| InboundConnection {
+            ctx: crate::state::ProxyRbacContext {
+                conn: Connection {
+                    src_identity: None,
+                    src: std::net::SocketAddr::new(
+                        Ipv4Addr::new(192, 168, 0, 1).into(),
+                        source_port,
+                    ),
+                    dst_network: "".into(),
+                    dst: std::net::SocketAddr::V4(SocketAddrV4::new(
+                        Ipv4Addr::new(192, 168, 0, 2),
+                        8080,
+                    )),
+                },
+                dest_workload: Arc::new(test_default_workload()),
+            },
+            dest_service: None,
+        };
+        let first_manager = ConnectionManager::default();
+        let second_manager = ConnectionManager::default();
+        let first_conn = connection(80);
+        let second_conn = connection(81);
+        let third_conn = connection(82);
+        let first_connection_drain = first_manager
+            .register(&first_conn)
+            .expect("connection must be tracked before invalidation");
+        let second_connection_drain = first_manager
+            .register(&second_conn)
+            .expect("second connection must be tracked before invalidation");
+        let third_connection_drain = second_manager
+            .register(&third_conn)
+            .expect("third connection must be tracked before invalidation");
+
+        let (first_stop_tx, first_stop) = drain::new();
+        let (second_stop_tx, second_stop) = drain::new();
+        let first_watcher = PolicyWatcher::new(dstate.clone(), first_stop, first_manager.clone());
+        let second_watcher = PolicyWatcher::new(dstate, second_stop, second_manager.clone());
+        let first_task = tokio::spawn(first_watcher.run());
+        let second_task = tokio::spawn(second_watcher.run());
+        session.mark_stale(generation);
+        let fresh_generation = session.begin_session();
+        session.mark_snapshot_ready(fresh_generation);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !first_manager.connections().is_empty()
+                || !second_manager.connections().is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("policy watcher must drain existing inbound streams");
+        assert!(first_manager.connections().is_empty());
+        assert!(second_manager.connections().is_empty());
+        assert!(!session.is_open());
+
+        // Each manager signals all its streams while the other manager is also
+        // draining. The shared gate must wait for every manager's acknowledgment.
+        let first_drain_ack = tokio::time::timeout(
+            Duration::from_secs(1),
+            first_connection_drain.clone().wait_for_drain(),
+        )
+        .await
+        .expect("first manager's first stream must receive its drain signal");
+        let second_drain_ack = tokio::time::timeout(
+            Duration::from_secs(1),
+            second_connection_drain.clone().wait_for_drain(),
+        )
+        .await
+        .expect("first manager's second stream must receive its drain signal");
+        let third_drain_ack = tokio::time::timeout(
+            Duration::from_secs(1),
+            third_connection_drain.clone().wait_for_drain(),
+        )
+        .await
+        .expect("second manager's stream must receive its drain signal");
+
+        // Keep stream watchers alive to prove removing connection registry
+        // entries does not count as a completed drain.
+        drop(first_connection_drain);
+        drop(second_connection_drain);
+        drop(first_drain_ack);
+        drop(second_drain_ack);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.snapshot().pending_drains != 1 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("one manager acknowledgment must leave the other pending");
+        assert!(
+            !session.is_open(),
+            "one drained manager cannot reopen the gate"
+        );
+
+        drop(third_connection_drain);
+        drop(third_drain_ack);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.snapshot().drained_generation < fresh_generation
+                || session.snapshot().pending_drains != 0
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("every manager must acknowledge the fresh generation drain");
+        assert!(session.is_open());
+
+        first_stop_tx
+            .start_drain_and_wait(drain::DrainMode::Immediate)
+            .await;
+        second_stop_tx
+            .start_drain_and_wait(drain::DrainMode::Immediate)
+            .await;
+        first_task
+            .await
+            .expect("first policy watcher should stop cleanly");
+        second_task
+            .await
+            .expect("second policy watcher should stop cleanly");
+    }
+
+    #[tokio::test]
+    async fn policy_watcher_closes_existing_connection_when_final_allow_is_removed() {
+        let state = Arc::new(RwLock::new(ProxyState::new(None)));
+        state.write().unwrap().policies.insert(
+            "allow-all".into(),
+            RbacAuthorization {
+                action: RbacAction::Allow,
+                namespace: "".into(),
+                name: "allow-all".into(),
+                rules: vec![vec![]],
+                scope: RbacScope::Global,
+                dry_run: false,
+            },
+        );
+
+        let mut registry = Registry::default();
+        let metrics = Arc::new(crate::proxy::Metrics::new(&mut registry));
+        let xds_session = crate::xds::XdsSessionGate::new();
+        let generation = xds_session.begin_session();
+        xds_session.mark_snapshot_ready(generation);
+        let dstate = DemandProxyState::new(
+            state.clone(),
+            None,
+            ResolverConfig::default(),
+            ResolverOpts::default(),
+            metrics,
+        )
+        .with_require_inbound_mtls(true)
+        .with_xds_session(Some(xds_session.clone()));
+
+        let connection = InboundConnection {
+            ctx: crate::state::ProxyRbacContext {
+                conn: Connection {
+                    src_identity: Some(Identity::Spiffe {
+                        trust_domain: "cluster.local".into(),
+                        namespace: "default".into(),
+                        service_account: "client".into(),
+                    }),
+                    src: std::net::SocketAddr::new(Ipv4Addr::new(192, 168, 0, 1).into(), 41000),
+                    dst_network: "".into(),
+                    dst: std::net::SocketAddr::V4(SocketAddrV4::new(
+                        Ipv4Addr::new(192, 168, 0, 2),
+                        8080,
+                    )),
+                },
+                dest_workload: Arc::new(test_default_workload()),
+            },
+            dest_service: None,
+        };
+        let connection_manager = ConnectionManager::default();
+        let (stop_tx, stop) = drain::new();
+        // PolicyWatcher subscribes synchronously in new(), before this task can
+        // race with the policy update below.
+        let watcher = PolicyWatcher::new(dstate.clone(), stop, connection_manager.clone());
+        let watcher_task = tokio::spawn(watcher.run());
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !xds_session.is_open() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("policy watcher must acknowledge the current xDS generation before admission");
+        assert!(dstate.assert_rbac(&connection.ctx).await.is_ok());
+        let stream_drain = connection_manager
+            .register(&connection)
+            .expect("authenticated connection is tracked before policy removal");
+
+        {
+            let mut state = state.write().unwrap();
+            state.policies.remove("allow-all".into());
+            state.policies.send();
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !connection_manager.connections().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("removing the final ALLOW must close an active inbound stream");
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), stream_drain.wait_for_drain())
+                .await
+                .expect("active stream must receive its drain signal"),
+        );
+        assert_eq!(
+            dstate.assert_rbac(&connection.ctx).await,
+            Err(crate::proxy::AuthorizationRejectionError::NoEffectiveAllowPolicy)
+        );
+
+        stop_tx
+            .start_drain_and_wait(drain::DrainMode::Immediate)
+            .await;
+        watcher_task
+            .await
+            .expect("policy watcher should stop cleanly after the test");
+    }
+
+    #[tokio::test]
+    async fn xds_session_drain_cancels_protected_outbound_before_reopening() {
+        let gate = crate::xds::XdsSessionGate::new();
+        let first_generation = gate.begin_session();
+        gate.mark_snapshot_ready(first_generation);
+
+        let state = Arc::new(RwLock::new(ProxyState::new(None)));
+        let mut registry = Registry::default();
+        let metrics = Arc::new(crate::proxy::Metrics::new(&mut registry));
+        let dstate = DemandProxyState::new(
+            state,
+            None,
+            ResolverConfig::default(),
+            ResolverOpts::default(),
+            metrics,
+        )
+        .with_xds_session(Some(gate.clone()));
+        let manager = ConnectionManager::default();
+        let (stop_tx, stop) = drain::new();
+        let watcher = PolicyWatcher::new(dstate, stop, manager.clone());
+        let watcher_task = tokio::spawn(watcher.run());
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !gate.is_open() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("PolicyWatcher must drain before opening the initial snapshot");
+
+        let flow_manager = manager.clone();
+        let (flow_started_tx, flow_started_rx) = tokio::sync::oneshot::channel();
+        let flow = tokio::spawn(async move {
+            let mut guard = flow_manager.track_outbound(
+                "10.244.0.10:41000".parse().unwrap(),
+                "10.244.0.20:31337".parse().unwrap(),
+                "10.244.0.20:15008".parse().unwrap(),
+                crate::state::workload::OutboundProtocol::HBONE,
+                true,
+            );
+            let watcher = guard
+                .watcher()
+                .expect("strict mesh outbound flow must be drainable");
+            flow_started_tx
+                .send(())
+                .expect("test must observe the registered outbound flow");
+            drop(
+                tokio::time::timeout(Duration::from_secs(1), watcher.wait_for_drain())
+                    .await
+                    .expect("stale xDS must cancel the protected outbound flow"),
+            );
+            drop(guard);
+        });
+
+        flow_started_rx
+            .await
+            .expect("protected flow must start before xDS becomes stale");
+        assert_eq!(manager.protected_outbound_connections().len(), 1);
+
+        gate.mark_stale(first_generation);
+        assert!(
+            !gate.is_open(),
+            "stale xDS must close admission immediately"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), flow)
+            .await
+            .expect("PolicyWatcher must cancel the active protected flow")
+            .expect("outbound flow task should finish after its drain signal");
+        assert!(manager.protected_outbound_connections().is_empty());
+        assert!(
+            !gate.is_open(),
+            "stale session must remain closed after its old flows drain"
+        );
+
+        let replacement_generation = gate.begin_session();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.snapshot().drained_generation < replacement_generation
+                || gate.snapshot().pending_drains != 0
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("PolicyWatcher must acknowledge the replacement-generation drain");
+        assert!(
+            !gate.is_open(),
+            "draining alone cannot reopen admission without a complete snapshot"
+        );
+        gate.mark_snapshot_ready(replacement_generation);
+        assert!(
+            gate.is_open(),
+            "admission reopens only after flow drain and fresh snapshot"
+        );
+
+        stop_tx
+            .start_drain_and_wait(drain::DrainMode::Immediate)
+            .await;
+        watcher_task
+            .await
+            .expect("PolicyWatcher must stop cleanly after the regression test");
     }
 
     // small helper to assert that the Watches are working in a timely manner

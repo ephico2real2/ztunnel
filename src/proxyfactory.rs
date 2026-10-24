@@ -22,7 +22,7 @@ use tracing::error;
 use crate::dns;
 use crate::drain::DrainWatcher;
 
-use crate::proxy::connection_manager::ConnectionManager;
+use crate::proxy::connection_manager::{ConnectionManager, PolicyWatcher};
 use crate::proxy::{DefaultSocketFactory, Proxy, inbound::Inbound};
 use crate::proxy::{Error, LocalWorkloadInformation, Metrics};
 
@@ -180,7 +180,7 @@ impl ProxyFactory {
     /// This is distinct from the main inbound listener which handles traffic for other workloads proxied by ztunnel.
     pub async fn create_ztunnel_self_proxy_listener(
         &self,
-    ) -> Result<Option<crate::proxy::inbound::Inbound>, Error> {
+    ) -> Result<Option<(crate::proxy::inbound::Inbound, PolicyWatcher)>, Error> {
         if self.config.proxy_mode != config::ProxyMode::Shared {
             return Ok(None);
         }
@@ -217,7 +217,8 @@ impl ProxyFactory {
             );
 
             let inbound = Inbound::new(pi, self.drain.clone()).await?;
-            Ok(Some(inbound))
+            let policy_watcher = PolicyWatcher::new(self.state.clone(), self.drain.clone(), cm);
+            Ok(Some((inbound, policy_watcher)))
         } else {
             Ok(None)
         }

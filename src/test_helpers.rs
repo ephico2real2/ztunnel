@@ -435,8 +435,10 @@ pub fn new_proxy_state(
     let updater = ProxyStateUpdater::new_no_fetch(state.clone());
 
     for w in xds_workloads {
+        // Display names are not resource keys and may be empty or collide.
+        let resource_name = &w.uid;
         let res = XdsResource {
-            name: w.name.as_str().into(),
+            name: resource_name.as_str().into(),
             resource: XdsAddress {
                 r#type: Some(address::Type::Workload(w.clone())),
             },
@@ -446,9 +448,12 @@ pub fn new_proxy_state(
             .handle(Box::new(&mut vec![XdsUpdate::Update(res)].into_iter()))
             .unwrap();
     }
-    for s in xds_services {
+    for (index, s) in xds_services.iter().enumerate() {
+        // Service names are metadata, not opaque xDS resource keys; multiple
+        // services in a fixture may legitimately have an empty display name.
+        let resource_name = format!("test-service-{index}");
         let res = XdsResource {
-            name: s.name.as_str().into(),
+            name: resource_name.into(),
             resource: XdsAddress {
                 r#type: Some(address::Type::Service(s.clone())),
             },

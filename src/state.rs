@@ -176,6 +176,12 @@ impl fmt::Display for ProxyRbacContext {
 pub struct ProxyState {
     pub workloads: WorkloadStore,
 
+    /// Maps opaque Address xDS resource names to local workload UIDs.
+    pub(crate) workload_xds_names: HashMap<Strng, Strng>,
+
+    /// Maps opaque Address xDS resource names to Service store keys.
+    pub(crate) service_xds_names: HashMap<Strng, NamespacedHostname>,
+
     pub services: ServiceStore,
 
     pub policies: PolicyStore,
@@ -235,6 +241,8 @@ impl ProxyState {
     pub fn new(local_node: Option<Strng>) -> ProxyState {
         ProxyState {
             workloads: WorkloadStore::new(local_node),
+            workload_xds_names: HashMap::new(),
+            service_xds_names: HashMap::new(),
             services: Default::default(),
             policies: Default::default(),
         }
@@ -491,6 +499,10 @@ pub struct DemandProxyState {
     /// Immutable process requirement; cannot disappear during an xDS resync.
     #[serde(skip_serializing)]
     require_inbound_mtls: bool,
+    /// Tracks whether strict-mode authorization data belongs to the current,
+    /// fully accepted xDS snapshot and whether old inbound streams were drained.
+    #[serde(skip_serializing)]
+    xds_session: Option<crate::xds::XdsSessionGate>,
     #[serde(flatten)]
     state: Arc<RwLock<ProxyState>>,
 
@@ -531,6 +543,7 @@ impl DemandProxyState {
         let dns_resolver = rb.build();
         Self {
             require_inbound_mtls: false,
+            xds_session: None,
             state,
             demand,
             dns_resolver,
@@ -541,6 +554,21 @@ impl DemandProxyState {
     pub(crate) fn with_require_inbound_mtls(mut self, required: bool) -> Self {
         self.require_inbound_mtls = required;
         self
+    }
+
+    pub(crate) fn with_xds_session(mut self, session: Option<crate::xds::XdsSessionGate>) -> Self {
+        self.xds_session = session;
+        self
+    }
+
+    pub(crate) fn xds_session(&self) -> Option<crate::xds::XdsSessionGate> {
+        self.xds_session.clone()
+    }
+
+    pub(crate) fn xds_snapshot_generation(&self) -> Option<u64> {
+        self.xds_session
+            .as_ref()
+            .and_then(crate::xds::XdsSessionGate::open_generation)
     }
 
     pub fn read(&self) -> RwLockReadGuard<'_, ProxyState> {
@@ -559,6 +587,18 @@ impl DemandProxyState {
                 "verified TLS peer required"
             );
             return Err(proxy::AuthorizationRejectionError::AuthenticationRequired);
+        }
+        if self.require_inbound_mtls
+            && self
+                .xds_session
+                .as_ref()
+                .is_none_or(|session| !session.is_open())
+        {
+            authpol_log!(
+                reason = "xds-session-unavailable",
+                "current authorization snapshot is unavailable"
+            );
+            return Err(proxy::AuthorizationRejectionError::XdsSessionUnavailable);
         }
         let state = self.read();
         if self.require_inbound_mtls {
@@ -644,6 +684,13 @@ impl DemandProxyState {
         }
         // "If there are no ALLOW policies for the workload, allow the request."
         if allow.is_empty() {
+            if self.require_inbound_mtls {
+                authpol_log!(
+                    reason = "no-effective-allow-policy",
+                    "protected workload has no effective ALLOW policy"
+                );
+                return Err(proxy::AuthorizationRejectionError::NoEffectiveAllowPolicy);
+            }
             authpol_log!("no allow policies, allow");
             return Ok(());
         }
@@ -1132,13 +1179,21 @@ impl ProxyStateManager {
         let state: Arc<RwLock<ProxyState>> = Arc::new(RwLock::new(ProxyState::new(
             config.local_node.as_ref().map(strng::new),
         )));
+        let xds_session = (config.require_inbound_mtls || config.require_mesh_hbone)
+            .then(crate::xds::XdsSessionGate::new);
         let xds_client = if config.xds_address.is_some() {
             let updater = ProxyStateUpdater::new(state.clone(), cert_fetcher.clone());
             let tls_client_fetcher = Box::new(tls::ControlPlaneAuthentication::RootCert(
                 config.xds_root_cert.clone(),
             ));
+            let xds_config = xds::Config::new(config.clone(), tls_client_fetcher);
+            let xds_config = if let Some(session) = &xds_session {
+                xds_config.with_session_gate(session.clone())
+            } else {
+                xds_config
+            };
             Some(
-                xds::Config::new(config.clone(), tls_client_fetcher)
+                xds_config
                     .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, updater.clone())
                     .with_watched_handler::<XdsAuthorization>(xds::AUTHORIZATION_TYPE, updater)
                     .build(xds_metrics, awaiting_ready),
@@ -1165,7 +1220,8 @@ impl ProxyStateManager {
                 config.dns_resolver_opts.clone(),
                 proxy_metrics,
             )
-            .with_require_inbound_mtls(config.require_inbound_mtls),
+            .with_require_inbound_mtls(config.require_inbound_mtls)
+            .with_xds_session(xds_session),
         })
     }
 
@@ -1515,12 +1571,33 @@ mod tests {
         )
     }
 
+    fn open_xds_session() -> crate::xds::XdsSessionGate {
+        let session = crate::xds::XdsSessionGate::new();
+        let generation = session.begin_session();
+        session.mark_snapshot_ready(generation);
+        session
+    }
+
     #[tokio::test]
     async fn required_mtls_rejects_plaintext_without_dynamic_policies() {
         let mut state = ProxyState::new(None);
         state.workloads.insert(Arc::new(create_workload(1)));
-        let strict = create_state(state).with_require_inbound_mtls(true);
+        let strict = create_state(state)
+            .with_require_inbound_mtls(true)
+            .with_xds_session(Some(open_xds_session()));
         let mut ctx = get_rbac_context(&strict, 1, "client");
+        assert_eq!(
+            strict.assert_rbac(&ctx).await,
+            Err(proxy::AuthorizationRejectionError::NoEffectiveAllowPolicy)
+        );
+        let mut allow = create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Allow);
+        allow.dry_run = false;
+        strict
+            .state
+            .write()
+            .unwrap()
+            .policies
+            .insert("ns1/wildcard".into(), allow);
         assert!(strict.assert_rbac(&ctx).await.is_ok());
         ctx.conn.src_identity = None;
         for port in [1, 80, 8080, 9443, 65535] {
@@ -1537,15 +1614,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn required_mtls_needs_effective_allow_and_recovers_after_policy_updates() {
+        let mut state = ProxyState::new(None);
+        state.workloads.insert(Arc::new(create_workload(1)));
+        let strict = create_state(state)
+            .with_require_inbound_mtls(true)
+            .with_xds_session(Some(open_xds_session()));
+        let ctx = get_rbac_context(&strict, 1, "client");
+
+        assert_eq!(
+            strict.assert_rbac(&ctx).await,
+            Err(proxy::AuthorizationRejectionError::NoEffectiveAllowPolicy),
+            "an authenticated identity alone must not authorize a workload"
+        );
+
+        let dry_run_allow = create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Allow);
+        strict
+            .state
+            .write()
+            .unwrap()
+            .policies
+            .insert("ns1/wildcard".into(), dry_run_allow);
+        assert_eq!(
+            strict.assert_rbac(&ctx).await,
+            Err(proxy::AuthorizationRejectionError::NoEffectiveAllowPolicy),
+            "dry-run ALLOW policies are not enforcement"
+        );
+
+        let mut matching_deny = create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Deny);
+        matching_deny.dry_run = false;
+        strict
+            .state
+            .write()
+            .unwrap()
+            .policies
+            .insert("ns1/matching-deny".into(), matching_deny);
+        assert_eq!(
+            strict.assert_rbac(&ctx).await,
+            Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
+                "ns1".into(),
+                "wildcard".into()
+            )),
+            "a matching enforced DENY takes precedence over default deny"
+        );
+
+        let nonmatching_deny = rbac::Authorization {
+            action: rbac::RbacAction::Deny,
+            namespace: "ns1".into(),
+            name: "nonmatching-deny".into(),
+            rules: vec![vec![vec![rbac::RbacMatch {
+                principals: vec![StringMatch::Exact(
+                    "cluster.local/ns/default/sa/other".into(),
+                )],
+                ..Default::default()
+            }]]],
+            scope: rbac::RbacScope::Namespace,
+            dry_run: false,
+        };
+        {
+            let mut state = strict.state.write().unwrap();
+            state.policies = PolicyStore::default();
+            state
+                .policies
+                .insert("ns1/nonmatching-deny".into(), nonmatching_deny);
+        }
+        assert_eq!(
+            strict.assert_rbac(&ctx).await,
+            Err(proxy::AuthorizationRejectionError::NoEffectiveAllowPolicy),
+            "a nonmatching DENY is not an ALLOW"
+        );
+
+        let mut enforced_allow = create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Allow);
+        enforced_allow.dry_run = false;
+        strict
+            .state
+            .write()
+            .unwrap()
+            .policies
+            .insert("ns1/wildcard".into(), enforced_allow);
+        assert!(
+            strict.assert_rbac(&ctx).await.is_ok(),
+            "matching enforced ALLOW recovers access"
+        );
+
+        strict
+            .state
+            .write()
+            .unwrap()
+            .policies
+            .remove("ns1/wildcard".into());
+        assert_eq!(
+            strict.assert_rbac(&ctx).await,
+            Err(proxy::AuthorizationRejectionError::NoEffectiveAllowPolicy),
+            "removing the final enforced ALLOW must revoke access immediately"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_mtls_denies_when_xds_session_is_stale_or_not_drained() {
+        let mut state = ProxyState::new(None);
+        state.workloads.insert(Arc::new(create_workload(1)));
+        let mut allow = create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Allow);
+        allow.dry_run = false;
+        state.policies.insert("ns1/wildcard".into(), allow);
+        let session = crate::xds::XdsSessionGate::new();
+        let strict = create_state(state)
+            .with_require_inbound_mtls(true)
+            .with_xds_session(Some(session.clone()));
+        let ctx = get_rbac_context(&strict, 1, "client");
+
+        assert_eq!(
+            strict.assert_rbac(&ctx).await,
+            Err(proxy::AuthorizationRejectionError::XdsSessionUnavailable)
+        );
+        let generation = session.begin_session();
+        let drain_participant = session.register_drain_participant();
+        session.mark_snapshot_ready(generation);
+        assert_eq!(
+            strict.assert_rbac(&ctx).await,
+            Err(proxy::AuthorizationRejectionError::XdsSessionUnavailable)
+        );
+        session.mark_drained(generation, drain_participant);
+        assert!(strict.assert_rbac(&ctx).await.is_ok());
+
+        session.mark_stale(generation);
+        assert_eq!(
+            strict.assert_rbac(&ctx).await,
+            Err(proxy::AuthorizationRejectionError::XdsSessionUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn required_mtls_denies_when_xds_session_gate_is_missing() {
+        let mut state = ProxyState::new(None);
+        state.workloads.insert(Arc::new(create_workload(1)));
+        let strict = create_state(state).with_require_inbound_mtls(true);
+        let ctx = get_rbac_context(&strict, 1, "client");
+
+        assert_eq!(
+            strict.assert_rbac(&ctx).await,
+            Err(proxy::AuthorizationRejectionError::XdsSessionUnavailable)
+        );
+    }
+
+    #[tokio::test]
     async fn required_mtls_survives_allow_policy_and_policy_cache_loss() {
         let mut state = ProxyState::new(None);
         state.workloads.insert(Arc::new(create_workload(1)));
         let mut allow = create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Allow);
         allow.dry_run = false;
         state.policies.insert("ns1/wildcard".into(), allow);
-        let strict = create_state(state).with_require_inbound_mtls(true);
+        let strict = create_state(state)
+            .with_require_inbound_mtls(true)
+            .with_xds_session(Some(open_xds_session()));
         let mut ctx = get_rbac_context(&strict, 1, "client");
         assert!(strict.assert_rbac(&ctx).await.is_ok());
+        strict.state.write().unwrap().policies = PolicyStore::default();
+        assert_eq!(
+            strict.assert_rbac(&ctx).await,
+            Err(proxy::AuthorizationRejectionError::NoEffectiveAllowPolicy)
+        );
         ctx.conn.src_identity = None;
         assert_eq!(
             strict.assert_rbac(&ctx).await,
@@ -1564,7 +1792,9 @@ mod tests {
         let mut workload = create_workload(1);
         workload.authorization_policies = vec!["ns1/wildcard".into()];
         state.workloads.insert(Arc::new(workload));
-        let strict = create_state(state).with_require_inbound_mtls(true);
+        let strict = create_state(state)
+            .with_require_inbound_mtls(true)
+            .with_xds_session(Some(open_xds_session()));
         let ctx = get_rbac_context(&strict, 1, "client");
         let missing = Err(proxy::AuthorizationRejectionError::MissingPolicy(
             "ns1/wildcard".into(),
