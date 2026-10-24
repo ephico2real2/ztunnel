@@ -29,10 +29,12 @@ use crate::strng::Strng;
 
 use crate::proxy::metrics::Reporter;
 use crate::proxy::{
+    AuthorizationRejectionError, ConnectionOpen, ConnectionResultBuilder, DerivedWorkload, metrics,
+};
+use crate::proxy::{
     BAGGAGE_HEADER, Error, HboneAddress, ProxyInputs, TRACEPARENT_HEADER, TraceParent,
     X_FORWARDED_NETWORK_HEADER, util,
 };
-use crate::proxy::{ConnectionOpen, ConnectionResultBuilder, DerivedWorkload, metrics};
 
 use crate::baggage::{self, Baggage};
 use crate::drain::DrainWatcher;
@@ -120,14 +122,17 @@ impl Outbound {
                                 _ = force_shutdown.changed() => {
                                     debug!(component="outbound", "connection forcefully terminated");
                                 }
-                                _ = oc.proxy(stream) => {}
+                                // The xDS drain watcher composes another branch into the
+                                // per-connection proxy future. Keep the spawned task's stack
+                                // bounded without weakening the existing size assertion.
+                                _ = Box::pin(oc.proxy(stream)) => {}
                             }
                             // Mark we are done with the connection, so drain can complete
                             drop(drain);
                             debug!(component="outbound", dur=?start.elapsed(), "connection completed");
                         }.instrument(span);
 
-                        assertions::size_between_ref(1000, 2100, &serve_outbound_connection);
+                        assertions::size_between_ref(256, 1750, &serve_outbound_connection);
                         tokio::spawn(serve_outbound_connection);
                     }
                     Err(e) => {
@@ -204,12 +209,19 @@ impl OutboundConnection {
             }
         };
         // TODO: should we use the original address or the actual address? Both seems nice!
-        let _conn_guard = self.pi.connection_manager.track_outbound(
+        let mut conn_guard = self.pi.connection_manager.track_outbound(
             source_addr,
             dest_addr,
             req.actual_destination,
             req.protocol,
+            req.protected_mesh,
         );
+        if let Err(err) =
+            validate_request_xds_generation(&req, self.pi.state.xds_snapshot_generation())
+        {
+            metrics::log_early_deny(source_addr, dest_addr, Reporter::source, err);
+            return;
+        }
 
         let metrics = self.pi.metrics.clone();
         let hbone_target = req.hbone_target_destination.clone();
@@ -222,26 +234,38 @@ impl OutboundConnection {
             metrics,
         ));
 
-        match req.protocol {
-            OutboundProtocol::DOUBLEHBONE => {
-                // We box this since its not a common path and it would make the future really big.
-                Box::pin(self.proxy_to_double_hbone(
-                    source_stream,
-                    source_addr,
-                    &req,
-                    connection_result_builder,
-                ))
-                .await
-            }
-            OutboundProtocol::HBONE => {
-                self.proxy_to_hbone(source_stream, source_addr, &req, connection_result_builder)
+        let proxy = async {
+            match req.protocol {
+                OutboundProtocol::DOUBLEHBONE => {
+                    // We box this since its not a common path and it would make the future really big.
+                    Box::pin(self.proxy_to_double_hbone(
+                        source_stream,
+                        source_addr,
+                        &req,
+                        connection_result_builder,
+                    ))
                     .await
-            }
-            OutboundProtocol::TCP => {
-                self.proxy_to_tcp(source_stream, &req, connection_result_builder)
-                    .await
+                }
+                OutboundProtocol::HBONE => {
+                    self.proxy_to_hbone(source_stream, source_addr, &req, connection_result_builder)
+                        .await
+                }
+                OutboundProtocol::TCP => {
+                    self.proxy_to_tcp(source_stream, &req, connection_result_builder)
+                        .await
+                }
             }
         };
+        if let Some(watch) = conn_guard.watcher() {
+            tokio::select! {
+                _drained = watch.wait_for_drain() => {
+                    info!(component = "outbound", destination = %dest_addr, "protected outbound connection closed for xDS session refresh");
+                }
+                _ = proxy => {}
+            }
+        } else {
+            proxy.await;
+        }
     }
 
     async fn proxy_to_double_hbone(
@@ -517,6 +541,14 @@ impl OutboundConnection {
         service: &Service,
         target: SocketAddr,
     ) -> Result<Request, Error> {
+        if self.pi.cfg.require_mesh_hbone {
+            // The current remote workload feed does not carry a verified cluster binding and
+            // final workload identity through this gateway path. Until that provenance is
+            // available, an outer HBONE hop alone is not end-to-end workload authentication.
+            return Err(Error::AuthorizationPolicyRejection(
+                AuthorizationRejectionError::ProtectedWaypointUnsupported(target),
+            ));
+        }
         if let Some(gateway) = &upstream.workload.network_gateway {
             let gateway_upstream = self
                 .pi
@@ -547,6 +579,8 @@ impl OutboundConnection {
                 // the configuration. So for the final destination credentials
                 // (final_sans) we use the upstream workload credentials.
                 final_sans: upstream.service_sans(),
+                protected_mesh: false,
+                xds_generation: None,
             })
         } else {
             // Do not try to send cross-network traffic without network gateway.
@@ -565,10 +599,17 @@ impl OutboundConnection {
         target: SocketAddr,
     ) -> Result<Request, Error> {
         let state = &self.pi.state;
+        let strict_mesh = self.pi.cfg.require_mesh_hbone;
+        // Bind every subsequent xDS lookup to the snapshot that was current
+        // before the first cache lookup. A later generation cannot authorize
+        // data fetched from an earlier snapshot.
+        let xds_generation_at_start = if strict_mesh {
+            state.xds_snapshot_generation()
+        } else {
+            None
+        };
 
-        // If this is to-service traffic check for a service waypoint
-        // Capture result of whether this is svc addressed
-        let service = if let Some(Address::Service(target_service)) = state
+        let resolved_address = state
             .fetch_address(
                 &NetworkAddress {
                     network: self.pi.cfg.network.clone(),
@@ -576,13 +617,54 @@ impl OutboundConnection {
                 },
                 Some(&source_workload.namespace),
             )
-            .await
-        {
+            .await;
+        let (service, known_workload) = match resolved_address {
+            Some(Address::Service(service)) => (Some(service), None),
+            Some(Address::Workload(workload)) => (None, Some(workload)),
+            None => (None, None),
+        };
+        let protected_by_cidr = self
+            .pi
+            .cfg
+            .mesh_egress
+            .protected_cluster_for_ip(target.ip())
+            .is_some();
+
+        let mut protected_generation = None;
+        if strict_mesh {
+            if protected_by_cidr || service.is_some() || known_workload.is_some() {
+                protected_generation = Some(self.require_mesh_generation(xds_generation_at_start)?);
+            }
+            if service.is_some()
+                && self
+                    .pi
+                    .cfg
+                    .mesh_egress
+                    .service_cluster_for_ip(target.ip())
+                    .is_none()
+            {
+                return Err(self.untrusted_mesh_workload(
+                    "xDS service VIP is outside every configured service CIDR".into(),
+                ));
+            }
+            if let Some(workload) = &known_workload {
+                self.verify_mesh_workload(workload, target.ip())?;
+            }
+        }
+
+        // If this is to-service traffic check for a service waypoint
+        // Capture result of whether this is svc addressed
+        let service = if let Some(target_service) = service {
             // if we have a waypoint for this svc, use it; otherwise route traffic normally
             if let Some(waypoint) = state
                 .fetch_service_waypoint(&target_service, &source_workload, target)
                 .await?
             {
+                if strict_mesh {
+                    return Err(Error::AuthorizationPolicyRejection(
+                        AuthorizationRejectionError::ProtectedWaypointUnsupported(target),
+                    ));
+                }
                 if waypoint.workload.network != source_workload.network {
                     debug!("picked a waypoint on remote network");
                     return self
@@ -612,6 +694,8 @@ impl OutboundConnection {
                     actual_destination,
                     upstream_sans,
                     final_sans: vec![],
+                    protected_mesh: false,
+                    xds_generation: None,
                 });
             }
             // this was service addressed but we did not find a waypoint
@@ -630,16 +714,34 @@ impl OutboundConnection {
             )
             .await?
         else {
-            if let Some(service) = service
-                && service.
-                load_balancer.
-                as_ref().
-                // If we are not a passthrough service, we should have an upstream
-                map(|lb| lb.mode != LoadBalancerMode::Passthrough).
-                // If the service had no lb, we should have an upstream
-                unwrap_or(true)
-            {
+            if service.as_ref().is_some_and(|service| {
+                service
+                    .load_balancer
+                    .as_ref()
+                    // If we are not a passthrough service, we should have an upstream.
+                    .map(|lb| lb.mode != LoadBalancerMode::Passthrough)
+                    // If the service had no lb, we should have an upstream.
+                    .unwrap_or(true)
+            }) {
                 return Err(Error::NoHealthyUpstream(target));
+            }
+            if strict_mesh {
+                if service.is_some() || known_workload.is_some() || protected_by_cidr {
+                    return Err(Error::AuthorizationPolicyRejection(
+                        AuthorizationRejectionError::UnknownProtectedDestination(target),
+                    ));
+                }
+                if self
+                    .pi
+                    .cfg
+                    .mesh_egress
+                    .exception_for(target.ip(), target.port())
+                    .is_none()
+                {
+                    return Err(Error::AuthorizationPolicyRejection(
+                        AuthorizationRejectionError::UnclassifiedEgress(target),
+                    ));
+                }
             }
             debug!("built request as passthrough; no upstream found");
             return Ok(Request {
@@ -651,6 +753,8 @@ impl OutboundConnection {
                 actual_destination: target,
                 upstream_sans: vec![],
                 final_sans: vec![],
+                protected_mesh: false,
+                xds_generation: None,
             });
         };
 
@@ -672,6 +776,12 @@ impl OutboundConnection {
                 "workload on remote network is not service addressed"
             );
             debug!("picked a workload on remote network");
+            if strict_mesh {
+                self.require_mesh_generation(protected_generation.or(xds_generation_at_start))?;
+                return Err(Error::AuthorizationPolicyRejection(
+                    AuthorizationRejectionError::ProtectedWaypointUnsupported(target),
+                ));
+            }
             let service = service.as_ref().ok_or(Error::NoService(target))?;
             return self
                 .build_request_through_gateway(source_workload.clone(), us, service, target)
@@ -696,6 +806,11 @@ impl OutboundConnection {
                 .fetch_workload_waypoint(&us.workload, &source_workload, target)
                 .await?;
             if let Some(waypoint) = waypoint {
+                if strict_mesh {
+                    return Err(Error::AuthorizationPolicyRejection(
+                        AuthorizationRejectionError::ProtectedWaypointUnsupported(target),
+                    ));
+                }
                 let actual_destination =
                     waypoint
                         .workload_socket_addr()
@@ -715,6 +830,8 @@ impl OutboundConnection {
                     actual_destination,
                     upstream_sans,
                     final_sans: vec![],
+                    protected_mesh: false,
+                    xds_generation: None,
                 });
             }
             // Workload doesn't have a waypoint; send directly
@@ -723,6 +840,20 @@ impl OutboundConnection {
         let selected_workload_ip = us
             .selected_workload_ip
             .ok_or(Error::NoValidDestination(Box::new((*us.workload).clone())))?;
+
+        let request_generation = if strict_mesh {
+            let generation =
+                self.require_mesh_generation(protected_generation.or(xds_generation_at_start))?;
+            self.verify_mesh_workload(&us.workload, selected_workload_ip)?;
+            if us.workload.protocol != InboundProtocol::HBONE {
+                return Err(Error::AuthorizationPolicyRejection(
+                    AuthorizationRejectionError::ProtectedWorkloadNotHbone(us.workload.uid.clone()),
+                ));
+            }
+            Some(generation)
+        } else {
+            None
+        };
 
         // only change the port if we're sending HBONE
         let actual_destination = match us.workload.protocol {
@@ -751,7 +882,41 @@ impl OutboundConnection {
             actual_destination,
             upstream_sans,
             final_sans,
+            protected_mesh: request_generation.is_some(),
+            xds_generation: request_generation,
         })
+    }
+
+    fn require_mesh_generation(&self, expected: Option<u64>) -> Result<u64, Error> {
+        let Some(expected) = expected else {
+            return Err(Error::AuthorizationPolicyRejection(
+                AuthorizationRejectionError::XdsSessionUnavailable,
+            ));
+        };
+        if self.pi.state.xds_snapshot_generation() != Some(expected) {
+            return Err(Error::AuthorizationPolicyRejection(
+                AuthorizationRejectionError::XdsSessionUnavailable,
+            ));
+        }
+        Ok(expected)
+    }
+
+    fn verify_mesh_workload(&self, workload: &Workload, ip: IpAddr) -> Result<(), Error> {
+        if !self.pi.cfg.require_mesh_hbone {
+            return Ok(());
+        }
+        self.pi
+            .cfg
+            .mesh_egress
+            .cluster_for_workload_ip(&workload.cluster_id, &workload.trust_domain, ip)
+            .map(|_| ())
+            .map_err(|reason| self.untrusted_mesh_workload(reason.into()))
+    }
+
+    fn untrusted_mesh_workload(&self, reason: Strng) -> Error {
+        Error::AuthorizationPolicyRejection(AuthorizationRejectionError::UntrustedMeshWorkload(
+            reason,
+        ))
     }
 }
 
@@ -770,8 +935,29 @@ fn baggage(r: &Request) -> String {
     baggage::baggage_header_val(&r.source.baggage(), &r.source.workload_type)
 }
 
+fn validate_request_xds_generation(
+    request: &Request,
+    current_generation: Option<u64>,
+) -> Result<(), Error> {
+    if !request.protected_mesh {
+        return Ok(());
+    }
+    if request.xds_generation.is_some() && request.xds_generation == current_generation {
+        return Ok(());
+    }
+    Err(Error::AuthorizationPolicyRejection(
+        AuthorizationRejectionError::XdsSessionUnavailable,
+    ))
+}
+
 #[derive(Debug)]
 struct Request {
+    /// True only when the request depends on the current, complete xDS session.
+    protected_mesh: bool,
+    /// The complete xDS snapshot generation used to authorize a protected
+    /// mesh request. Checked again after the connection is registered for
+    /// draining and immediately before forwarding starts.
+    xds_generation: Option<u64>,
     protocol: OutboundProtocol,
     // Source workload sending the request
     source: Arc<Workload>,
@@ -809,6 +995,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
+    use crate::config::{MeshClusterRanges, MeshEgressConfig, MeshEgressException};
     use crate::proxy::connection_manager::ConnectionManager;
     use crate::proxy::{LocalWorkloadInformation, pool::WorkloadHBONEPool};
     use crate::state::WorkloadInfo;
@@ -839,10 +1026,45 @@ mod tests {
         xds: Vec<XdsAddressType>,
         expect: Option<ExpectedRequest<'_>>,
     ) -> Option<Request> {
-        let cfg = Arc::new(Config {
+        let cfg = Config {
             local_node: Some("local-node".to_string()),
             ..crate::config::parse_config().unwrap()
-        });
+        };
+        let result = build_request_result(from, to, xds, cfg, None).await;
+        let req = match result {
+            Ok(req) => Some(req),
+            Err(err) if expect.is_some() => {
+                panic!("expected an outbound request, but build_request failed: {err:?}")
+            }
+            Err(_) => None,
+        };
+        if let Some(ref r) = req {
+            assert_eq!(
+                expect,
+                Some(ExpectedRequest {
+                    protocol: r.protocol,
+                    hbone_destination: &r
+                        .hbone_target_destination
+                        .as_ref()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default(),
+                    destination: &r.actual_destination.to_string(),
+                })
+            );
+        } else {
+            assert_eq!(expect, None);
+        }
+        req
+    }
+
+    async fn build_request_result(
+        from: &str,
+        to: &str,
+        xds: Vec<XdsAddressType>,
+        config: Config,
+        session: Option<crate::xds::XdsSessionGate>,
+    ) -> Result<Request, Error> {
+        let cfg = Arc::new(config);
         let source = XdsWorkload {
             uid: "cluster1//v1/Pod/ns/source-workload".to_string(),
             name: "source-workload".to_string(),
@@ -883,7 +1105,10 @@ mod tests {
                 XdsAddressType::Service(svc) => services.push(svc),
             };
         }
-        let state = new_proxy_state(&workloads, &services, &[]);
+        let mut state = new_proxy_state(&workloads, &services, &[]);
+        if let Some(session) = session {
+            state = state.with_xds_session(Some(session));
+        }
 
         let sock_fact = std::sync::Arc::new(crate::proxy::DefaultSocketFactory::default());
 
@@ -927,27 +1152,16 @@ mod tests {
             .get_workload()
             .await
             .unwrap();
-        let req = outbound
+        outbound
             .build_request(local, from.parse().unwrap(), to.parse().unwrap())
             .await
-            .ok();
-        if let Some(ref r) = req {
-            assert_eq!(
-                expect,
-                Some(ExpectedRequest {
-                    protocol: r.protocol,
-                    hbone_destination: &r
-                        .hbone_target_destination
-                        .as_ref()
-                        .map(|s| s.to_string())
-                        .unwrap_or_default(),
-                    destination: &r.actual_destination.to_string(),
-                })
-            );
-        } else {
-            assert_eq!(expect, None);
-        }
-        req
+    }
+
+    fn open_xds_session() -> crate::xds::XdsSessionGate {
+        let session = crate::xds::XdsSessionGate::new();
+        let generation = session.begin_session();
+        session.mark_snapshot_ready(generation);
+        session
     }
 
     #[tokio::test]
@@ -967,6 +1181,258 @@ mod tests {
             }),
         )
         .await;
+    }
+
+    fn strict_mesh_config() -> Config {
+        let mut config = crate::config::parse_config().unwrap();
+        config.require_mesh_hbone = true;
+        config.mesh_egress = MeshEgressConfig {
+            clusters: vec![MeshClusterRanges {
+                cluster_id: "cluster-alpha".to_string(),
+                trust_domain: "alpha.mesh.example".to_string(),
+                pod_cidrs: vec!["10.244.0.0/16".parse().unwrap()],
+                service_cidrs: vec!["10.96.0.0/12".parse().unwrap()],
+                gateway_cidrs: vec![],
+            }],
+            exceptions: vec![MeshEgressException {
+                cidr: "192.0.2.10/32".parse().unwrap(),
+                ports: vec![443],
+                reason: "pinned test control-plane endpoint".to_string(),
+            }],
+        };
+        config
+    }
+
+    fn protected_workload(ip: [u8; 4], protocol: XdsProtocol) -> XdsWorkload {
+        XdsWorkload {
+            uid: "cluster-alpha//v1/Pod/ns/server".to_string(),
+            name: "server".to_string(),
+            namespace: "ns".to_string(),
+            service_account: "api".to_string(),
+            trust_domain: "alpha.mesh.example".to_string(),
+            cluster_id: "cluster-alpha".to_string(),
+            addresses: vec![Bytes::copy_from_slice(&ip)],
+            tunnel_protocol: protocol as i32,
+            node: "remote-node".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_mesh_egress_requires_current_snapshot_and_never_falls_back_on_protected_cidrs()
+    {
+        for port in [80, 8080, 31337, 49152, 65535] {
+            let result = build_request_result(
+                "127.0.0.1",
+                &format!("10.244.200.9:{port}"),
+                vec![],
+                strict_mesh_config(),
+                Some(open_xds_session()),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(Error::AuthorizationPolicyRejection(
+                    AuthorizationRejectionError::UnknownProtectedDestination(_)
+                ))
+            ));
+        }
+
+        let stale = build_request_result(
+            "127.0.0.1",
+            "10.244.200.9:8080",
+            vec![],
+            strict_mesh_config(),
+            None,
+        )
+        .await;
+        assert!(matches!(
+            stale,
+            Err(Error::AuthorizationPolicyRejection(
+                AuthorizationRejectionError::XdsSessionUnavailable
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn protected_request_cannot_be_admitted_under_a_replacement_xds_generation() {
+        let session = open_xds_session();
+        let original_generation = session.open_generation().unwrap();
+        let request = build_request_result(
+            "127.0.0.1",
+            "10.244.0.20:8080",
+            vec![XdsAddressType::Workload(protected_workload(
+                [10, 244, 0, 20],
+                XdsProtocol::Hbone,
+            ))],
+            strict_mesh_config(),
+            Some(session.clone()),
+        )
+        .await
+        .expect("complete current xDS state should build a protected request");
+
+        assert!(request.protected_mesh);
+        assert_eq!(request.xds_generation, Some(original_generation));
+        assert!(validate_request_xds_generation(&request, session.open_generation()).is_ok());
+
+        session.mark_stale(original_generation);
+        assert!(matches!(
+            validate_request_xds_generation(&request, session.open_generation()),
+            Err(Error::AuthorizationPolicyRejection(
+                AuthorizationRejectionError::XdsSessionUnavailable
+            ))
+        ));
+
+        let replacement_generation = session.begin_session();
+        session.mark_snapshot_ready(replacement_generation);
+        assert_ne!(replacement_generation, original_generation);
+        assert!(matches!(
+            validate_request_xds_generation(&request, session.open_generation()),
+            Err(Error::AuthorizationPolicyRejection(
+                AuthorizationRejectionError::XdsSessionUnavailable
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn strict_mesh_egress_rejects_unclassified_and_protects_only_explicit_exception_ports() {
+        let exception = build_request_result(
+            "127.0.0.1",
+            "192.0.2.10:443",
+            vec![],
+            strict_mesh_config(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(exception.protocol, OutboundProtocol::TCP);
+        assert!(!exception.protected_mesh);
+
+        for destination in ["192.0.2.10:8443", "192.0.2.11:443", "203.0.113.7:8080"] {
+            let result =
+                build_request_result("127.0.0.1", destination, vec![], strict_mesh_config(), None)
+                    .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::AuthorizationPolicyRejection(
+                        AuthorizationRejectionError::UnclassifiedEgress(_)
+                    ))
+                ),
+                "destination {destination} must not use the raw TCP fallback"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_mesh_egress_rejects_tcp_workloads_and_recovers_with_verified_hbone() {
+        let tcp = build_request_result(
+            "127.0.0.1",
+            "10.244.0.2:8080",
+            vec![XdsAddressType::Workload(protected_workload(
+                [10, 244, 0, 2],
+                XdsProtocol::None,
+            ))],
+            strict_mesh_config(),
+            Some(open_xds_session()),
+        )
+        .await;
+        assert!(matches!(
+            tcp,
+            Err(Error::AuthorizationPolicyRejection(
+                AuthorizationRejectionError::ProtectedWorkloadNotHbone(_)
+            ))
+        ));
+
+        let mut wrong_identity = protected_workload([10, 244, 0, 2], XdsProtocol::Hbone);
+        wrong_identity.trust_domain = "attacker.mesh.example".to_string();
+        let wrong_identity = build_request_result(
+            "127.0.0.1",
+            "10.244.0.2:31337",
+            vec![XdsAddressType::Workload(wrong_identity)],
+            strict_mesh_config(),
+            Some(open_xds_session()),
+        )
+        .await;
+        assert!(matches!(
+            wrong_identity,
+            Err(Error::AuthorizationPolicyRejection(
+                AuthorizationRejectionError::UntrustedMeshWorkload(_)
+            ))
+        ));
+
+        let request = build_request_result(
+            "127.0.0.1",
+            "10.244.0.2:31337",
+            vec![XdsAddressType::Workload(protected_workload(
+                [10, 244, 0, 2],
+                XdsProtocol::Hbone,
+            ))],
+            strict_mesh_config(),
+            Some(open_xds_session()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(request.protocol, OutboundProtocol::HBONE);
+        assert_eq!(
+            request.actual_destination,
+            "10.244.0.2:15008".parse().unwrap()
+        );
+        assert_eq!(
+            request.hbone_target_destination.unwrap().to_string(),
+            "10.244.0.2:31337"
+        );
+        assert!(request.protected_mesh);
+    }
+
+    #[tokio::test]
+    async fn strict_mesh_egress_rejects_passthrough_service_inside_service_cidr() {
+        for (length, target) in [(None, "10.96.0.10:8080"), (Some(24), "10.96.0.11:8080")] {
+            for current_snapshot in [false, true] {
+                let service = XdsAddressType::Service(XdsService {
+                    hostname: "external.example".to_string(),
+                    load_balancing: Some(LoadBalancing {
+                        mode: xds::istio::workload::load_balancing::Mode::Passthrough.into(),
+                        ..Default::default()
+                    }),
+                    addresses: vec![XdsNetworkAddress {
+                        network: "".to_string(),
+                        address: vec![10, 96, 0, 10],
+                        length,
+                    }],
+                    ports: vec![Port {
+                        service_port: 8080,
+                        target_port: 8080,
+                        app_protocol: 0,
+                    }],
+                    ..Default::default()
+                });
+                let result = build_request_result(
+                    "127.0.0.1",
+                    target,
+                    vec![service],
+                    strict_mesh_config(),
+                    current_snapshot.then(open_xds_session),
+                )
+                .await;
+
+                if current_snapshot {
+                    assert!(matches!(
+                        result,
+                        Err(Error::AuthorizationPolicyRejection(
+                            AuthorizationRejectionError::UnknownProtectedDestination(_)
+                        ))
+                    ));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(Error::AuthorizationPolicyRejection(
+                            AuthorizationRejectionError::XdsSessionUnavailable
+                        ))
+                    ));
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -2092,6 +2558,8 @@ mod tests {
 
         // Create a minimal test request with required fields
         let req = Request {
+            protected_mesh: false,
+            xds_generation: None,
             protocol: OutboundProtocol::HBONE,
             source: source_workload,
             hbone_target_destination: Some(HboneAddress::SocketAddr(

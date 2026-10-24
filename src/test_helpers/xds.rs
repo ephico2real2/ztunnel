@@ -63,6 +63,18 @@ impl AdsServer {
         DemandProxyState,
         tokio::sync::watch::Receiver<()>,
     ) {
+        Self::spawn_with_session_gate(xds_on_demand, None).await
+    }
+
+    pub(crate) async fn spawn_with_session_gate(
+        xds_on_demand: bool,
+        session_gate: Option<crate::xds::XdsSessionGate>,
+    ) -> (
+        mpsc::Receiver<AdsConnection>,
+        AdsClient,
+        DemandProxyState,
+        tokio::sync::watch::Receiver<()>,
+    ) {
         let (tx, rx) = mpsc::channel(100);
 
         let server = AdsServer { tx };
@@ -108,6 +120,7 @@ impl AdsServer {
             None,
         );
         cfg.xds_on_demand = xds_on_demand;
+        cfg.require_inbound_mtls = session_gate.is_some();
 
         let proxy_metrics = Arc::new(crate::proxy::Metrics::new(&mut registry));
         let state: Arc<RwLock<ProxyState>> = Arc::new(RwLock::new(ProxyState::new(None)));
@@ -117,12 +130,20 @@ impl AdsServer {
             ResolverConfig::default(),
             ResolverOpts::default(),
             proxy_metrics,
-        );
+        )
+        .with_require_inbound_mtls(cfg.require_inbound_mtls)
+        .with_xds_session(session_gate.clone());
         let store_updater = ProxyStateUpdater::new_no_fetch(state);
         let tls_client_fetcher = Box::new(tls::ControlPlaneAuthentication::RootCert(
             cfg.xds_root_cert.clone(),
         ));
-        let xds_client = xds::Config::new(Arc::new(cfg), tls_client_fetcher)
+        let xds_config = xds::Config::new(Arc::new(cfg), tls_client_fetcher);
+        let xds_config = if let Some(gate) = session_gate {
+            xds_config.with_session_gate(gate)
+        } else {
+            xds_config
+        };
+        let xds_client = xds_config
             .with_watched_handler::<XdsAddress>(xds::ADDRESS_TYPE, store_updater.clone())
             .with_watched_handler::<XdsAuthorization>(xds::AUTHORIZATION_TYPE, store_updater)
             .build(metrics, block_tx);
@@ -169,7 +190,9 @@ impl AggregatedDiscoveryService for AdsServer {
                             Some(Ok(req)) => {
                                 info!("received request...",);
                                 debug!(" request {:?}...", req);
-                                req_tx.send(req).await.unwrap();
+                                if req_tx.send(req).await.is_err() {
+                                    return;
+                                }
                             }
                             Some(Err(e)) => {
                                 info!("ads_server: stream over - {:?}", e);

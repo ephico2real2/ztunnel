@@ -374,6 +374,15 @@ pub struct Addresses {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthorizationRejectionError {
+    AuthenticationRequired,
+    XdsSessionUnavailable,
+    UnclassifiedEgress(SocketAddr),
+    UnknownProtectedDestination(SocketAddr),
+    ProtectedWorkloadNotHbone(Strng),
+    UntrustedMeshWorkload(Strng),
+    ProtectedWaypointUnsupported(SocketAddr),
+    MissingPolicy(Strng),
+    NoEffectiveAllowPolicy,
     NoWorkload,
     WorkloadMismatch,
     ExplicitlyDenied(Strng, Strng),
@@ -382,6 +391,46 @@ pub enum AuthorizationRejectionError {
 impl fmt::Display for AuthorizationRejectionError {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AuthenticationRequired => write!(fmt, "verified TLS peer required"),
+            Self::XdsSessionUnavailable => {
+                write!(fmt, "current xDS authorization snapshot unavailable")
+            }
+            Self::UnclassifiedEgress(destination) => {
+                write!(
+                    fmt,
+                    "strict mesh egress has no explicit classification for {destination}"
+                )
+            }
+            Self::UnknownProtectedDestination(destination) => {
+                write!(
+                    fmt,
+                    "protected mesh destination has no verified xDS workload: {destination}"
+                )
+            }
+            Self::ProtectedWorkloadNotHbone(workload) => {
+                write!(
+                    fmt,
+                    "protected workload is not configured for HBONE: {workload}"
+                )
+            }
+            Self::UntrustedMeshWorkload(reason) => {
+                write!(
+                    fmt,
+                    "protected workload identity or cluster binding is invalid: {reason}"
+                )
+            }
+            Self::ProtectedWaypointUnsupported(destination) => {
+                write!(
+                    fmt,
+                    "strict mesh egress cannot yet verify end-to-end waypoint identity for {destination}"
+                )
+            }
+            Self::MissingPolicy(policy) => {
+                write!(fmt, "required authorization unavailable: {policy}")
+            }
+            Self::NoEffectiveAllowPolicy => {
+                write!(fmt, "no effective ALLOW policy for protected workload")
+            }
             Self::NoWorkload => write!(fmt, "workload not found"),
             Self::WorkloadMismatch => write!(fmt, "workload mismatch"),
             Self::ExplicitlyDenied(a, b) => write!(fmt, "explicitly denied by: {a}/{b}"),

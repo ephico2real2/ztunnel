@@ -27,6 +27,12 @@ use tracing::{debug, error, info};
 pub trait CertFetcher: Send + Sync {
     fn prefetch_cert(&self, w: &Workload);
     fn clear_cert(&self, w: &Workload);
+
+    /// SPIRE certificates are cached per workload UID, whereas the default CA
+    /// shares certificates between workloads with the same identity.
+    fn certs_are_workload_scoped(&self) -> bool {
+        false
+    }
 }
 
 /// A no-op implementation of [CertFetcher].
@@ -125,6 +131,10 @@ impl CertFetcherImpl {
 }
 
 impl CertFetcher for CertFetcherImpl {
+    fn certs_are_workload_scoped(&self) -> bool {
+        self.spire_enabled
+    }
+
     fn prefetch_cert(&self, w: &Workload) {
         if self.should_prefetch_certificate(w)
             && let Err(e) = self.tx.try_send(PrefetchRequest::Fetch(w.identity()))

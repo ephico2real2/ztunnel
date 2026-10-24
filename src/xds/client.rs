@@ -22,7 +22,6 @@ use prost::{DecodeError, EncodeError};
 use prost_types::value::Kind;
 use prost_types::{Struct, Value};
 use serde_json;
-use split_iter::Splittable;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -31,10 +30,12 @@ use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::metrics::{IncrementRecorder, Recorder};
 use crate::strng::Strng;
+use crate::xds::XdsSessionGate;
 use crate::xds::metrics::{ConnectionTerminationReason, Metrics};
 use crate::xds::service::discovery::v3::Resource as ProtoResource;
 use crate::xds::service::discovery::v3::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::service::discovery::v3::*;
+use crate::xds::{ADDRESS_TYPE, AUTHORIZATION_TYPE};
 use crate::{identity, strng, tls};
 
 use super::Error;
@@ -124,6 +125,8 @@ trait RawHandler: Send + Sync + 'static {
         state: &mut State,
         res: DeltaDiscoveryResponse,
     ) -> Result<(), Vec<RejectedConfig>>;
+
+    fn clear(&self, state: &mut State, type_url: &Strng) -> Result<(), Vec<RejectedConfig>>;
 }
 
 // HandlerWrapper is responsible for implementing RawHandler the provided handler.
@@ -138,47 +141,46 @@ impl<T: 'static + fmt::Debug + prost::Message + Default> RawHandler for HandlerW
         res: DeltaDiscoveryResponse,
     ) -> Result<(), Vec<RejectedConfig>> {
         let type_url = strng::new(res.type_url);
-        let removes = &res.removed_resources;
-
-        // Keep track of any failures but keep going
-        let (decode_failures, updates) = res
-            .resources
-            .iter()
-            .map(|raw| {
-                decode_proto::<T>(raw).map_err(|err| RejectedConfig {
+        let mut updates = Vec::with_capacity(res.resources.len() + res.removed_resources.len());
+        let mut decode_failures = Vec::new();
+        for raw in &res.resources {
+            match decode_proto::<T>(raw) {
+                Ok(update) => updates.push(XdsUpdate::Update(update)),
+                Err(err) => decode_failures.push(RejectedConfig {
                     name: raw.name.as_str().into(),
                     reason: err.into(),
-                })
-            })
-            .split(|i| i.is_ok());
+                }),
+            }
+        }
+        // A malformed response is rejected before any valid resource or removal can
+        // mutate proxy state. Applying the valid subset and then NACKing made the
+        // cached state disagree with the response status.
+        if !decode_failures.is_empty() {
+            return Err(decode_failures);
+        }
+        updates.extend(
+            res.removed_resources
+                .iter()
+                .cloned()
+                .map(|name| XdsUpdate::Remove(name.into())),
+        );
 
-        let mut updates = updates
-            // We already filtered to ok
-            .map(|r| r.expect("must be ok"))
-            .map(XdsUpdate::Update)
-            .chain(removes.iter().cloned().map(|s| XdsUpdate::Remove(s.into())));
+        // The handler must apply the complete decoded update before the client
+        // records names or wakes on-demand waiters. Some typed handlers also
+        // validate their whole batch before committing it.
+        let mut updates = updates.into_iter();
+        self.h.handle(Box::new(&mut updates))?;
 
-        // First, call handlers that update the proxy state.
-        // other wise on-demand notifications might observe a cache without their resource
-        let updates: Box<&mut dyn Iterator<Item = XdsUpdate<T>>> = Box::new(&mut updates);
-        let result = self.h.handle(updates);
-
-        // Collecting after handle() is important, as the split() will cache the side we use last.
-        // Updates >>> Errors (hopefully), so we want this one to do the allocations.
-        let decode_failures: Vec<_> = decode_failures
-            .map(|r| r.expect_err("must be err"))
-            .collect();
-
-        // Resources we rejected must not be recorded as retained: on reconnect the server
-        // would otherwise see a matching version and never re-send (so never retry) them.
-        let rejected_names: HashSet<Strng> = decode_failures
-            .iter()
-            .chain(result.as_ref().err().into_iter().flatten())
-            .map(|reject| reject.name.clone())
-            .collect();
-
-        // after we update the proxy cache, we can update our xds cache. it's important that we do this after
-        // as we make on demand notifications here, so the proxy cache must be updated first.
+        // Update the local xDS cache only after proxy state accepted the response.
+        // Match handler order: additions first, removals last.
+        for r in res.resources {
+            let key = ResourceKey {
+                name: r.name.into(),
+                type_url: type_url.clone(),
+            };
+            state.notify_on_demand(&key);
+            state.add_resource(key.type_url, key.name, r.version.into());
+        }
         for name in res.removed_resources {
             let k = ResourceKey {
                 name: name.into(),
@@ -191,27 +193,35 @@ impl<T: 'static + fmt::Debug + prost::Message + Default> RawHandler for HandlerW
             state.notify_on_demand(&k);
         }
 
-        for r in res.resources {
-            let key = ResourceKey {
-                name: r.name.into(),
-                type_url: type_url.clone(),
-            };
-            state.notify_on_demand(&key);
-            if !rejected_names.contains(&key.name) {
-                state.add_resource(key.type_url, key.name, r.version.into());
-            }
+        Ok(())
+    }
+
+    fn clear(&self, state: &mut State, type_url: &Strng) -> Result<(), Vec<RejectedConfig>> {
+        let names = state
+            .known_resources
+            .get(type_url)
+            .map(|resources| resources.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if names.is_empty() {
+            state.known_resources.remove(type_url);
+            return Ok(());
         }
 
-        // Either can fail. Merge the results
-        match (result, decode_failures.is_empty()) {
-            (Ok(()), true) => Ok(()),
-            (Ok(_), false) => Err(decode_failures),
-            (r @ Err(_), true) => r,
-            (Err(mut rejects), false) => {
-                rejects.extend(decode_failures);
-                Err(rejects)
-            }
+        let updates = names
+            .iter()
+            .cloned()
+            .map(XdsUpdate::Remove)
+            .collect::<Vec<_>>();
+        let mut updates = updates.into_iter();
+        self.h.handle(Box::new(&mut updates))?;
+        state.known_resources.remove(type_url);
+        for name in names {
+            state.notify_on_demand(&ResourceKey {
+                name,
+                type_url: type_url.clone(),
+            });
         }
+        Ok(())
     }
 }
 
@@ -223,6 +233,7 @@ pub struct Config {
     handlers: HashMap<Strng, Box<dyn RawHandler>>,
     initial_requests: Vec<DeltaDiscoveryRequest>,
     on_demand: bool,
+    session_gate: Option<XdsSessionGate>,
 
     /// alt_hostname provides an alternative accepted SAN for the control plane TLS verification
     alt_hostname: Option<String>,
@@ -285,6 +296,7 @@ impl Config {
             handlers: HashMap::new(),
             initial_requests: Vec::new(),
             on_demand: config.xds_on_demand,
+            session_gate: None,
             proxy_metadata: config.proxy_metadata.clone(),
             alt_hostname: config.alt_xds_hostname.clone(),
             xds_headers: config.xds_headers.vec.clone(),
@@ -298,6 +310,11 @@ impl Config {
         let no_on_demand = f.no_on_demand();
         self.with_handler(type_url.clone(), f)
             .watch(type_url, no_on_demand)
+    }
+
+    pub(crate) fn with_session_gate(mut self, gate: XdsSessionGate) -> Self {
+        self.session_gate = Some(gate);
+        self
     }
 
     fn with_handler<F>(mut self, type_url: Strng, f: impl Handler<F>) -> Config
@@ -442,6 +459,8 @@ pub struct AdsClient {
 
     connection_id: u32,
     types_to_expect: HashSet<String>,
+    session_gate: Option<XdsSessionGate>,
+    session_generation: u64,
 }
 
 /// Demanded allows awaiting for an on-demand XDS resource
@@ -514,6 +533,7 @@ impl AdsClient {
             .filter(|e| !Self::is_initial_request_on_demand(e)) // is_empty implies not ondemand
             .map(|e| e.type_url.clone())
             .collect();
+        let session_gate = config.session_gate.clone();
         AdsClient {
             config,
             state,
@@ -521,6 +541,8 @@ impl AdsClient {
             block_ready: Some(block_ready),
             connection_id: 0,
             types_to_expect,
+            session_gate,
+            session_generation: 0,
         }
     }
 
@@ -536,7 +558,30 @@ impl AdsClient {
     }
 
     async fn run_loop(&mut self, backoff: Duration) -> Duration {
-        match self.run_internal().await {
+        self.types_to_expect = self
+            .config
+            .initial_requests
+            .iter()
+            .filter(|e| !Self::is_initial_request_on_demand(e))
+            .map(|e| e.type_url.clone())
+            .collect();
+        if let Some(gate) = &self.session_gate {
+            self.session_generation = gate.begin_session();
+        }
+        let result = if self.session_gate.is_some() {
+            self.clear_xds_state()
+        } else {
+            Ok(())
+        };
+        let result = match result {
+            Ok(()) => self.run_internal().await,
+            Err(err) => Err(err),
+        };
+        if let Some(gate) = &self.session_gate {
+            gate.mark_stale(self.session_generation);
+        }
+
+        match result {
             Err(e @ Error::Connection(_, _)) => {
                 // For connection errors, we add backoff
                 let backoff = std::cmp::min(MAX_BACKOFF, backoff * 2);
@@ -578,6 +623,23 @@ impl AdsClient {
                 tokio::time::sleep(backoff).await;
                 backoff
             }
+            Err(e @ Error::RejectedResponse(_)) => {
+                let backoff = std::cmp::min(MAX_BACKOFF, backoff * 2);
+                warn!("xDS state rejected, reconnecting in {:?}: {}", backoff, e);
+                self.metrics.increment(&ConnectionTerminationReason::Error);
+                tokio::time::sleep(backoff).await;
+                backoff
+            }
+            Err(e @ Error::Reset(_)) => {
+                let backoff = std::cmp::min(MAX_BACKOFF, backoff * 2);
+                warn!(
+                    "failed to reset stale xDS state, retrying in {:?}: {}",
+                    backoff, e
+                );
+                self.metrics.increment(&ConnectionTerminationReason::Error);
+                tokio::time::sleep(backoff).await;
+                backoff
+            }
             Err(e) => {
                 // For other errors, we connect immediately
                 // TODO: we may need more nuance here; if we fail due to invalid initial request we may overload
@@ -595,6 +657,28 @@ impl AdsClient {
                 INITIAL_BACKOFF
             }
         }
+    }
+
+    fn clear_xds_state(&mut self) -> Result<(), Error> {
+        let type_urls = self.config.handlers.keys().cloned().collect::<Vec<_>>();
+        for type_url in type_urls {
+            let Some(handler) = self.config.handlers.get(&type_url) else {
+                continue;
+            };
+            handler
+                .clear(&mut self.state, &type_url)
+                .map_err(|rejected| {
+                    Error::Reset(
+                        rejected
+                            .into_iter()
+                            .map(|r| r.to_string())
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    )
+                })?;
+        }
+        self.state.known_resources.clear();
+        Ok(())
     }
 
     pub async fn run(mut self) -> Result<(), Error> {
@@ -696,17 +780,62 @@ impl AdsClient {
                         // This could be an explicit OK response, or if the stream is reset without a gRPC status.
                         return Ok(());
                     };
-                    let mut received_type = None;
-                    if !self.types_to_expect.is_empty() {
-                        received_type = Some(msg.type_url.clone())
+                    // Strict mode accepts one complete initial response for
+                    // each required type. Any later security delta forces a
+                    // reconnect and a fresh full snapshot; applying one type
+                    // while the other remains from an older snapshot could
+                    // briefly authorize against mixed state.
+                    if let Some(gate) = &self.session_gate {
+                        let is_security_type = msg.type_url == ADDRESS_TYPE.to_string()
+                            || msg.type_url == AUTHORIZATION_TYPE.to_string();
+                        if is_security_type && !self.types_to_expect.contains(&msg.type_url) {
+                            gate.mark_stale(self.session_generation);
+                            warn!(
+                                generation = self.session_generation,
+                                type_url = %msg.type_url,
+                                reason = "full_snapshot_resync",
+                                "strict xDS update revoked the session before application"
+                            );
+                            return Err(Error::RejectedResponse(
+                                "strict xDS update requires full snapshot resync".to_string(),
+                            ));
+                        }
+                        if !self.config.handlers.contains_key(&strng::new(&msg.type_url)) {
+                            gate.mark_stale(self.session_generation);
+                            warn!(
+                                generation = self.session_generation,
+                                type_url = %msg.type_url,
+                                reason = "unsupported_type",
+                                "strict xDS session rejected an unsupported response type"
+                            );
+                            return Err(Error::RejectedResponse(
+                                "strict xDS session received an unsupported response type".to_string(),
+                            ));
+                        }
                     }
-                    if let XdsSignal::Ack = self.handle_stream_event(msg, &discovery_req_tx).await?
-                        && let Some(received_type) = received_type {
-                            self.types_to_expect.remove(&received_type);
-                            if self.types_to_expect.is_empty() {
-                                mem::drop(mem::take(&mut self.block_ready));
+                    let received_type = (!self.types_to_expect.is_empty())
+                        .then(|| msg.type_url.clone());
+                    let signal = self.handle_stream_event(msg, &discovery_req_tx).await?;
+                    if let XdsSignal::Nack = signal {
+                        if self.session_gate.is_some() {
+                            return Err(Error::RejectedResponse(
+                                received_type.unwrap_or_else(|| "unknown type".to_string()),
+                            ));
+                        }
+                        // Ungated clients retain their last accepted versions
+                        // and allow corrected responses on the same stream.
+                        // A NACK must not satisfy initial readiness.
+                        continue;
+                    }
+                    if let Some(received_type) = received_type {
+                        self.types_to_expect.remove(&received_type);
+                        if self.types_to_expect.is_empty() {
+                            mem::drop(mem::take(&mut self.block_ready));
+                            if let Some(gate) = &self.session_gate {
+                                gate.mark_snapshot_ready(self.session_generation);
                             }
-                        };
+                        }
+                    }
                 }
             }
         }
@@ -729,6 +858,10 @@ impl AdsClient {
         let handler_response: Result<(), Vec<RejectedConfig>> =
             match self.config.handlers.get(&strng::new(&type_url)) {
                 Some(h) => h.handle(&mut self.state, response),
+                None if self.session_gate.is_some() => Err(vec![RejectedConfig::new(
+                    strng::new(type_url.clone()),
+                    anyhow::anyhow!("unsupported xDS response type in fail-closed session"),
+                )]),
                 None => {
                     error!(%type_url, "unknown type");
                     // TODO: this will just send another discovery request, to server. We should
@@ -736,6 +869,14 @@ impl AdsClient {
                     Ok(())
                 }
             };
+
+        if handler_response.is_err()
+            && let Some(gate) = &self.session_gate
+        {
+            // Revoke synchronously before the bounded outbound channel can
+            // block while enqueueing the NACK.
+            gate.mark_stale(self.session_generation);
+        }
 
         let (response_type, error) = match handler_response {
             Err(rejects) => {
@@ -852,6 +993,11 @@ pub enum AdsError {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr},
+        str::FromStr,
+        sync::{
+            Arc, RwLock,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::SystemTime,
     };
 
@@ -861,15 +1007,18 @@ mod tests {
     use tokio::time::sleep;
 
     use crate::xds::ADDRESS_TYPE;
+    use crate::xds::ProxyStateUpdater;
     use crate::xds::istio::security::Authorization as XdsAuthorization;
     use crate::xds::istio::workload::Address as XdsAddress;
+    use crate::xds::istio::workload::NetworkAddress as XdsNetworkAddress;
+    use crate::xds::istio::workload::Service as XdsService;
     use crate::xds::istio::workload::Workload as XdsWorkload;
     use crate::xds::istio::workload::WorkloadType;
     use crate::xds::{AUTHORIZATION_TYPE, istio::workload::address::Type as XdsType};
     use workload::Workload;
 
-    use crate::state::workload::NetworkAddress;
-    use crate::state::{DemandProxyState, workload};
+    use crate::state::workload::{NamespacedHostname, NetworkAddress};
+    use crate::state::{DemandProxyState, ProxyState, workload};
     use crate::test_helpers::{
         helpers::{self},
         test_default_workload,
@@ -906,6 +1055,10 @@ mod tests {
             let wl = source.fetch_workload_by_address(&ip_network_addr);
             matched = wl.await.as_deref() == converted.as_ref(); // Option<Workload> is Ok to compare without needing to unwrap
         }
+        assert!(
+            matched,
+            "workload lookup for {ip} did not reach expected state: {converted:?}"
+        );
     }
 
     fn get_auth(i: usize) -> ProtoResource {
@@ -960,7 +1113,7 @@ mod tests {
         };
 
         ProtoResource {
-            name: format!("foo{i}"),
+            name: format!("default/foo{i}"),
             aliases: vec![],
             version: "0.0.1".to_string(),
             resource: Some(Any {
@@ -970,6 +1123,598 @@ mod tests {
             ttl: None,
             cache_control: None,
         }
+    }
+
+    fn get_address_with_uid_resource_name(i: usize, addr: std::net::IpAddr) -> ProtoResource {
+        let mut resource = get_address(i, addr);
+        resource.name = format!("default/foo{i}");
+        resource
+    }
+
+    struct CountingAuthorizationHandler(Arc<AtomicUsize>);
+
+    impl Handler<XdsAuthorization> for CountingAuthorizationHandler {
+        fn handle(
+            &self,
+            updates: Box<&mut dyn Iterator<Item = XdsUpdate<XdsAuthorization>>>,
+        ) -> Result<(), Vec<RejectedConfig>> {
+            self.0.fetch_add(updates.count(), Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn malformed_response_does_not_apply_valid_updates_or_removals() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let wrapper = HandlerWrapper::<XdsAuthorization> {
+            h: Box::new(CountingAuthorizationHandler(calls.clone())),
+        };
+        let (demand_tx, demand) = mpsc::channel(1);
+        let stale_name = strng::new("stale");
+        let type_url = strng::new(AUTHORIZATION_TYPE);
+        let key = ResourceKey {
+            name: stale_name.clone(),
+            type_url: type_url.clone(),
+        };
+        let (pending_tx, _pending_rx) = oneshot::channel();
+        let mut state = State {
+            known_resources: HashMap::from([(
+                type_url.clone(),
+                HashMap::from([(stale_name.clone(), strng::new("0.0.1"))]),
+            )]),
+            pending: HashMap::from([(key.clone(), pending_tx)]),
+            demand,
+            demand_tx,
+        };
+        let malformed = ProtoResource {
+            name: "malformed".to_string(),
+            aliases: vec![],
+            version: "0.0.1".to_string(),
+            resource: Some(Any {
+                type_url: AUTHORIZATION_TYPE.to_string(),
+                value: vec![0xff],
+            }),
+            ttl: None,
+            cache_control: None,
+        };
+        let response = DeltaDiscoveryResponse {
+            resources: vec![get_auth(0), malformed],
+            removed_resources: vec![stale_name.to_string()],
+            type_url: AUTHORIZATION_TYPE.to_string(),
+            nonce: "malformed-batch".to_string(),
+            ..Default::default()
+        };
+
+        let result = wrapper.handle(&mut state, response);
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(state.known_resources[&type_url].contains_key(&stale_name));
+        assert!(state.pending.contains_key(&key));
+    }
+
+    #[test]
+    fn update_then_remove_does_not_retain_version_and_retry_recovers() {
+        let proxy_state = Arc::new(RwLock::new(ProxyState::new(None)));
+        let wrapper = HandlerWrapper::<XdsAddress> {
+            h: Box::new(ProxyStateUpdater::new_no_fetch(proxy_state.clone())),
+        };
+        let (demand_tx, demand) = mpsc::channel(1);
+        let mut state = State {
+            known_resources: HashMap::new(),
+            pending: HashMap::new(),
+            demand,
+            demand_tx,
+        };
+        let resource = get_address(0, "10.0.0.8".parse().unwrap());
+        let resource_name = strng::new(&resource.name);
+        let type_url = strng::new(ADDRESS_TYPE);
+
+        wrapper
+            .handle(
+                &mut state,
+                DeltaDiscoveryResponse {
+                    resources: vec![resource.clone()],
+                    removed_resources: vec![resource.name.clone()],
+                    type_url: ADDRESS_TYPE.to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!state.known_resources[&type_url].contains_key(&resource_name));
+        assert!(
+            proxy_state
+                .read()
+                .unwrap()
+                .workloads
+                .find_uid(&resource_name)
+                .is_none()
+        );
+
+        wrapper
+            .handle(
+                &mut state,
+                DeltaDiscoveryResponse {
+                    resources: vec![resource],
+                    type_url: ADDRESS_TYPE.to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            state.known_resources[&type_url][&resource_name],
+            strng::new("0.0.1")
+        );
+        assert!(
+            proxy_state
+                .read()
+                .unwrap()
+                .workloads
+                .find_uid(&resource_name)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn typed_rejection_preserves_proxy_versions_and_waiters_until_corrected_retry() {
+        let proxy_state = Arc::new(RwLock::new(ProxyState::new(None)));
+        let wrapper = HandlerWrapper::<XdsAddress> {
+            h: Box::new(ProxyStateUpdater::new_no_fetch(proxy_state.clone())),
+        };
+        let (demand_tx, demand) = mpsc::channel(1);
+        let mut state = State {
+            known_resources: HashMap::new(),
+            pending: HashMap::new(),
+            demand,
+            demand_tx,
+        };
+        let old = get_address(0, "10.0.0.8".parse().unwrap());
+        let old_name = strng::new(&old.name);
+        let replacement = get_address(1, "10.0.0.9".parse().unwrap());
+        let new_name = strng::new(&replacement.name);
+        let type_url = strng::new(ADDRESS_TYPE);
+        wrapper
+            .handle(
+                &mut state,
+                DeltaDiscoveryResponse {
+                    resources: vec![old],
+                    type_url: ADDRESS_TYPE.to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let key = ResourceKey {
+            name: new_name.clone(),
+            type_url: type_url.clone(),
+        };
+        let (pending_tx, mut pending_rx) = oneshot::channel();
+        state.pending.insert(key.clone(), pending_tx);
+        let invalid = ProtoResource {
+            name: "invalid-address".to_string(),
+            version: "2".to_string(),
+            resource: Some(Any {
+                type_url: ADDRESS_TYPE.to_string(),
+                value: XdsAddress { r#type: None }.encode_to_vec(),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            wrapper
+                .handle(
+                    &mut state,
+                    DeltaDiscoveryResponse {
+                        resources: vec![replacement.clone(), invalid],
+                        removed_resources: vec![old_name.to_string()],
+                        type_url: ADDRESS_TYPE.to_string(),
+                        ..Default::default()
+                    }
+                )
+                .is_err()
+        );
+        assert!(
+            proxy_state
+                .read()
+                .unwrap()
+                .workloads
+                .find_uid(&old_name)
+                .is_some()
+        );
+        assert!(
+            proxy_state
+                .read()
+                .unwrap()
+                .workloads
+                .find_uid(&new_name)
+                .is_none()
+        );
+        assert_eq!(state.known_resources[&type_url].len(), 1);
+        assert!(state.known_resources[&type_url].contains_key(&old_name));
+        assert!(state.pending.contains_key(&key));
+
+        wrapper
+            .handle(
+                &mut state,
+                DeltaDiscoveryResponse {
+                    resources: vec![replacement],
+                    removed_resources: vec![old_name.to_string()],
+                    type_url: ADDRESS_TYPE.to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            proxy_state
+                .read()
+                .unwrap()
+                .workloads
+                .find_uid(&old_name)
+                .is_none()
+        );
+        assert!(
+            proxy_state
+                .read()
+                .unwrap()
+                .workloads
+                .find_uid(&new_name)
+                .is_some()
+        );
+        assert_eq!(state.known_resources[&type_url].len(), 1);
+        assert!(state.known_resources[&type_url].contains_key(&new_name));
+        assert!(!state.pending.contains_key(&key));
+        assert!(pending_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn stale_session_reset_removes_accepted_resources_and_versions() {
+        let proxy_state = Arc::new(RwLock::new(ProxyState::new(None)));
+        let updater = ProxyStateUpdater::new_no_fetch(proxy_state.clone());
+        let wrapper = HandlerWrapper::<XdsAddress> {
+            h: Box::new(updater.clone()),
+        };
+        let name = "default/pod-1";
+        let resource_name = "workload-resource";
+        let service_resource_name = "service-resource";
+        let resources = vec![
+            XdsUpdate::Update(XdsResource {
+                name: resource_name.into(),
+                resource: XdsAddress {
+                    r#type: Some(XdsType::Workload(XdsWorkload {
+                        uid: name.to_string(),
+                        name: "pod-1".to_string(),
+                        namespace: "default".to_string(),
+                        addresses: vec![Ipv4Addr::new(10, 0, 0, 1).octets().to_vec().into()],
+                        tunnel_protocol: 0,
+                        trust_domain: "mesh.example.com".to_string(),
+                        service_account: "api".to_string(),
+                        workload_type: WorkloadType::Deployment.into(),
+                        ..Default::default()
+                    })),
+                },
+            }),
+            XdsUpdate::Update(XdsResource {
+                name: service_resource_name.into(),
+                resource: XdsAddress {
+                    r#type: Some(XdsType::Service(XdsService {
+                        name: "api".to_string(),
+                        namespace: "default".to_string(),
+                        hostname: "api.example".to_string(),
+                        addresses: vec![XdsNetworkAddress {
+                            network: String::new(),
+                            address: Ipv4Addr::new(10, 96, 0, 1).octets().to_vec(),
+                            length: None,
+                        }],
+                        ..Default::default()
+                    })),
+                },
+            }),
+        ];
+        let mut accepted = resources.into_iter();
+        <ProxyStateUpdater as Handler<XdsAddress>>::handle(&updater, Box::new(&mut accepted))
+            .expect("valid initial resource should be accepted");
+
+        {
+            let state = proxy_state.read().unwrap();
+            assert!(state.workloads.find_uid(&strng::new(name)).is_some());
+            assert!(
+                state
+                    .services
+                    .get_by_namespaced_host(
+                        &NamespacedHostname::from_str("default/api.example").unwrap()
+                    )
+                    .is_some()
+            );
+        }
+
+        let (demand_tx, demand) = mpsc::channel(1);
+        let type_url = strng::new(ADDRESS_TYPE);
+        let resource_name = strng::new(resource_name);
+        let mut state = State {
+            known_resources: HashMap::from([(
+                type_url.clone(),
+                HashMap::from([
+                    (resource_name.clone(), strng::new("0.0.1")),
+                    (strng::new(service_resource_name), strng::new("0.0.1")),
+                ]),
+            )]),
+            pending: HashMap::new(),
+            demand,
+            demand_tx,
+        };
+
+        wrapper
+            .clear(&mut state, &type_url)
+            .expect("clearing known resources should succeed");
+
+        assert!(!state.known_resources.contains_key(&type_url));
+        let proxy_state = proxy_state.read().unwrap();
+        assert!(
+            proxy_state.workloads.find_uid(&strng::new(name)).is_none(),
+            "actual workload UID must be removed before a reconnect snapshot is accepted"
+        );
+        assert!(proxy_state.workload_xds_names.is_empty());
+        assert!(proxy_state.service_xds_names.is_empty());
+        assert!(
+            proxy_state
+                .services
+                .get_by_namespaced_host(
+                    &NamespacedHostname::from_str("default/api.example").unwrap()
+                )
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconnect_requires_fresh_snapshot_and_empty_resource_versions() {
+        helpers::initialize_telemetry();
+        let gate = XdsSessionGate::new();
+        let drain_participant = gate.register_drain_participant();
+        let (mut connections, client, state, _) =
+            AdsServer::spawn_with_session_gate(false, Some(gate.clone())).await;
+        let client_task = tokio::spawn(client.run());
+        let ip = Ipv4Addr::new(10, 0, 0, 8);
+
+        let mut first = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+            .await
+            .expect("first ADS stream should connect")
+            .expect("first ADS stream should be available");
+        for expected_type in [ADDRESS_TYPE, AUTHORIZATION_TYPE] {
+            let request = first.rx.recv().await.expect("initial watch request");
+            assert_eq!(request.type_url, expected_type);
+            assert!(request.initial_resource_versions.is_empty());
+        }
+        first
+            .tx
+            .send(Ok(DeltaDiscoveryResponse {
+                resources: vec![get_address_with_uid_resource_name(0, ip.into())],
+                type_url: ADDRESS_TYPE.to_string(),
+                nonce: "initial-address".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(!gate.is_open(), "one type cannot complete the snapshot");
+        first
+            .tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: AUTHORIZATION_TYPE.to_string(),
+                nonce: "initial-authorization".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !gate.snapshot().ready {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("both initial resource types should be accepted");
+        let first_generation = gate.snapshot().generation;
+        gate.mark_drained(first_generation, drain_participant);
+        assert!(gate.is_open());
+        assert!(
+            state
+                .read()
+                .find_address(
+                    &NetworkAddress {
+                        network: strng::EMPTY,
+                        address: ip.into(),
+                    },
+                    None
+                )
+                .is_some()
+        );
+
+        for expected_nonce in ["initial-address", "initial-authorization"] {
+            let ack = tokio::time::timeout(Duration::from_secs(1), first.rx.recv())
+                .await
+                .expect("initial xDS response should be acknowledged")
+                .expect("initial ADS stream should remain open");
+            assert_eq!(ack.response_nonce, expected_nonce);
+        }
+
+        let late_ip = Ipv4Addr::new(10, 0, 0, 9);
+        first
+            .tx
+            .send(Ok(DeltaDiscoveryResponse {
+                resources: vec![get_address_with_uid_resource_name(1, late_ip.into())],
+                type_url: ADDRESS_TYPE.to_string(),
+                nonce: "live-address-update".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.is_open() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a live security delta must close strict inbound authorization");
+        assert!(
+            state
+                .read()
+                .find_address(
+                    &NetworkAddress {
+                        network: strng::EMPTY,
+                        address: late_ip.into(),
+                    },
+                    None
+                )
+                .is_none(),
+            "a live delta must not be applied under the previous snapshot generation"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), first.rx.recv())
+                .await
+                .expect("strict client must terminate the old ADS stream")
+                .is_none(),
+            "a live delta must not be ACKed; the client must reconnect for a full snapshot"
+        );
+
+        let mut second = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+            .await
+            .expect("client should reconnect")
+            .expect("reconnected ADS stream should be available");
+        assert!(
+            state
+                .read()
+                .find_address(
+                    &NetworkAddress {
+                        network: strng::EMPTY,
+                        address: ip.into(),
+                    },
+                    None
+                )
+                .is_none(),
+            "stale workload must be cleared before reconnect"
+        );
+        for expected_type in [ADDRESS_TYPE, AUTHORIZATION_TYPE] {
+            let request = second.rx.recv().await.expect("resubscribe request");
+            assert_eq!(request.type_url, expected_type);
+            assert!(
+                request.initial_resource_versions.is_empty(),
+                "reconnect must request a fresh snapshot, not retain old versions"
+            );
+        }
+        second
+            .tx
+            .send(Ok(DeltaDiscoveryResponse {
+                resources: vec![get_address_with_uid_resource_name(0, ip.into())],
+                type_url: ADDRESS_TYPE.to_string(),
+                nonce: "resync-address".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(!gate.is_open(), "fresh Address data alone is insufficient");
+        second
+            .tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: AUTHORIZATION_TYPE.to_string(),
+                nonce: "resync-authorization".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !gate.snapshot().ready {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("fresh snapshot should become locally ready");
+        let second_generation = gate.snapshot().generation;
+        assert!(!gate.is_open(), "gate waits for the generation drain ack");
+        gate.mark_drained(second_generation, drain_participant);
+        assert!(gate.is_open());
+
+        client_task.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_type_is_nacked_and_revokes_strict_session() {
+        helpers::initialize_telemetry();
+        let gate = XdsSessionGate::new();
+        let participant = gate.register_drain_participant();
+        let (_connections, mut client, _, _) =
+            AdsServer::spawn_with_session_gate(false, Some(gate.clone())).await;
+        client.session_generation = gate.begin_session();
+        gate.mark_snapshot_ready(client.session_generation);
+        gate.mark_drained(client.session_generation, participant);
+        assert!(gate.is_open());
+
+        let response = DeltaDiscoveryResponse {
+            type_url: "type.googleapis.com/example.Unhandled".to_string(),
+            nonce: "unknown-type-nonce".to_string(),
+            ..Default::default()
+        };
+        let (send, mut receive) = mpsc::channel(1);
+        let result = client.handle_stream_event(response, &send).await.unwrap();
+
+        assert!(matches!(result, XdsSignal::Nack));
+        assert!(
+            !gate.is_open(),
+            "an unknown resource must revoke strict readiness"
+        );
+        let nack = receive.recv().await.expect("unknown response NACK");
+        assert!(nack.error_detail.is_some());
+        assert_eq!(nack.response_nonce, "unknown-type-nonce");
+    }
+
+    #[tokio::test]
+    async fn rejected_response_revokes_session_before_nack_queue_unblocks() {
+        helpers::initialize_telemetry();
+        let gate = XdsSessionGate::new();
+        let drain_participant = gate.register_drain_participant();
+        let (_connections, mut client, _, _) =
+            AdsServer::spawn_with_session_gate(false, Some(gate.clone())).await;
+        client.session_generation = gate.begin_session();
+        gate.mark_snapshot_ready(client.session_generation);
+        gate.mark_drained(client.session_generation, drain_participant);
+        assert!(gate.is_open());
+
+        let invalid_address = XdsAddress { r#type: None };
+        let response = DeltaDiscoveryResponse {
+            resources: vec![ProtoResource {
+                name: "invalid".to_string(),
+                resource: Some(Any {
+                    type_url: ADDRESS_TYPE.to_string(),
+                    value: invalid_address.encode_to_vec(),
+                }),
+                ..Default::default()
+            }],
+            type_url: ADDRESS_TYPE.to_string(),
+            nonce: "invalid-address".to_string(),
+            ..Default::default()
+        };
+        let (send, mut receive) = mpsc::channel(1);
+        send.send(DeltaDiscoveryRequest::default())
+            .await
+            .expect("fill the bounded outbound queue before handling the rejection");
+
+        let handling =
+            tokio::spawn(async move { client.handle_stream_event(response, &send).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.is_open() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a rejected response must revoke before waiting to enqueue its NACK");
+        assert!(
+            !handling.is_finished(),
+            "the full outbound queue should keep NACK handling blocked"
+        );
+
+        receive.recv().await.expect("release the outbound queue");
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), handling)
+                .await
+                .expect("NACK handler should finish once the queue has space")
+                .expect("handler task should complete"),
+            Ok(XdsSignal::Nack)
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1133,8 +1878,21 @@ mod tests {
             assert!(req.initial_resource_versions.is_empty());
         }
 
-        // Send one valid address and one undecodable one. The response is NACKed, but the
-        // valid resource is still retained.
+        // First accept one address, then reject a different response atomically.
+        // Reconnect must retain only the previously accepted resource version.
+        conn.tx
+            .send(Ok(DeltaDiscoveryResponse {
+                resources: vec![get_address(0, "1.2.3.4".parse().unwrap())],
+                nonce: "accepted-address".to_string(),
+                type_url: ADDRESS_TYPE.to_string(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let ack = conn.rx.recv().await.unwrap();
+        assert_eq!(ack.response_nonce, "accepted-address");
+        assert!(ack.error_detail.is_none());
+
         let malformed = ProtoResource {
             name: "bad".to_string(),
             aliases: vec![],
@@ -1147,11 +1905,11 @@ mod tests {
             cache_control: None,
         };
         let response = Ok(DeltaDiscoveryResponse {
-            resources: vec![get_address(0, "1.2.3.4".parse().unwrap()), malformed],
+            resources: vec![get_address(1, "1.2.3.5".parse().unwrap()), malformed],
             nonce: TextNonce::new().to_string(),
             system_version_info: "1.0.0".to_string(),
             type_url: ADDRESS_TYPE.to_string(),
-            removed_resources: vec![],
+            removed_resources: vec!["default/foo0".to_string()],
         });
         conn.tx.send(response).await.unwrap();
 
@@ -1181,7 +1939,7 @@ mod tests {
             if req.type_url == ADDRESS_TYPE {
                 assert_eq!(
                     req.initial_resource_versions,
-                    HashMap::from([("foo0".to_string(), "0.0.1".to_string())])
+                    HashMap::from([("default/foo0".to_string(), "0.0.1".to_string())])
                 );
                 addr_seen = true;
             } else if req.type_url == AUTHORIZATION_TYPE {
@@ -1207,7 +1965,7 @@ mod tests {
                 info!("workload manager: {}", e);
             }
         });
-        let result = demander.demand(ADDRESS_TYPE, "foo0".into()).await;
+        let result = demander.demand(ADDRESS_TYPE, "default/foo0".into()).await;
 
         let mut conn = conn_receiver.recv().await.unwrap();
 
@@ -1225,7 +1983,8 @@ mod tests {
             };
 
             info!("received request: {:?}", req);
-            if req.type_url == ADDRESS_TYPE && req.resource_names_subscribe == vec!["foo0"] {
+            if req.type_url == ADDRESS_TYPE && req.resource_names_subscribe == vec!["default/foo0"]
+            {
                 let mut resources = vec![];
 
                 // send back a big response, to expose the timing issue.
@@ -1274,7 +2033,8 @@ mod tests {
         let mut resources = vec![];
         let addresses = vec![XdsAddress {
             r#type: Some(XdsType::Workload(XdsWorkload {
-                name: "1.1.1.1".to_string(),
+                uid: "pod-1".to_string(),
+                name: "test-workload".to_string(),
                 namespace: "default".to_string(),
                 addresses: vec![ip.octets().to_vec().into()],
                 tunnel_protocol: 0,
@@ -1290,7 +2050,7 @@ mod tests {
         for addr in addresses.clone().iter() {
             match &addr.r#type {
                 Some(XdsType::Workload(w)) => resources.push(ProtoResource {
-                    name: w.name.clone(),
+                    name: w.uid.clone(),
                     aliases: vec![],
                     version: "0.0.1".to_string(),
                     resource: Some(Any {
@@ -1321,7 +2081,7 @@ mod tests {
                 nonce: TextNonce::new().to_string(),
                 system_version_info: "1.0.0".to_string(),
                 type_url: ADDRESS_TYPE.to_string(),
-                removed_resources: vec!["127.0.0.1".into()],
+                removed_resources: vec!["pod-1".into()],
             });
 
         // Setup fake xds server

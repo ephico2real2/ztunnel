@@ -28,6 +28,7 @@ use bytes::Bytes;
 use hickory_resolver::config::{LookupIpStrategy, ResolverConfig, ResolverOpts};
 use hyper::Uri;
 use hyper::http::uri::InvalidUri;
+use ipnet::IpNet;
 
 use crate::strng::Strng;
 use crate::{identity, state};
@@ -35,6 +36,9 @@ use crate::{identity, state};
 use {crate::test_helpers::MpscAckReceiver, crate::xds::LocalConfig, tokio::sync::Mutex};
 
 const ENABLE_PROXY: &str = "ENABLE_PROXY";
+const REQUIRE_INBOUND_MTLS: &str = "REQUIRE_INBOUND_MTLS";
+const REQUIRE_MESH_HBONE: &str = "REQUIRE_MESH_HBONE";
+const MESH_EGRESS_CONFIG: &str = "MESH_EGRESS_CONFIG";
 const KUBERNETES_SERVICE_HOST: &str = "KUBERNETES_SERVICE_HOST";
 const NETWORK: &str = "NETWORK";
 const NODE_NAME: &str = "NODE_NAME";
@@ -213,6 +217,14 @@ impl serde::Serialize for MetadataVector {
 pub struct Config {
     /// If true, the HBONE proxy will be used.
     pub proxy: bool,
+    /// Require a verified TLS peer before inbound authorization, independently
+    /// of dynamic policy delivery. Missing required policy references deny.
+    pub require_inbound_mtls: bool,
+    /// Require every non-exempt workload destination to use HBONE and a current xDS snapshot.
+    pub require_mesh_hbone: bool,
+    /// Static mesh CIDRs and narrow, explicit non-mesh exceptions used by strict egress mode.
+    /// This is a lab/bootstrap input; production requires an authenticated, live Cilium inventory.
+    pub mesh_egress: MeshEgressConfig,
     /// If true, a DNS proxy will be used.
     pub dns_proxy: bool,
 
@@ -349,6 +361,293 @@ pub struct Config {
     pub spire_timeout: Duration,
     pub spire_admin_socket: String,
     pub container_runtime_sock_path: String,
+}
+
+/// CIDR inventory used to classify destinations when `require_mesh_hbone` is enabled.
+#[derive(Clone, Debug, Default, serde::Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshEgressConfig {
+    pub clusters: Vec<MeshClusterRanges>,
+    pub exceptions: Vec<MeshEgressException>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MeshClusterRanges {
+    pub cluster_id: String,
+    pub trust_domain: String,
+    pub pod_cidrs: Vec<IpNet>,
+    pub service_cidrs: Vec<IpNet>,
+    #[serde(default)]
+    pub gateway_cidrs: Vec<IpNet>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MeshEgressException {
+    pub cidr: IpNet,
+    /// Exceptions are deliberately narrow. Workload enforcement never depends on ports.
+    pub ports: Vec<u16>,
+    pub reason: String,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MeshEgressConfigInput {
+    #[serde(default)]
+    clusters: Vec<MeshClusterRangesInput>,
+    #[serde(default)]
+    exceptions: Vec<MeshEgressExceptionInput>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MeshClusterRangesInput {
+    cluster_id: String,
+    trust_domain: String,
+    #[serde(default)]
+    pod_cidrs: Vec<String>,
+    #[serde(default)]
+    service_cidrs: Vec<String>,
+    #[serde(default)]
+    gateway_cidrs: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MeshEgressExceptionInput {
+    cidr: String,
+    #[serde(default)]
+    ports: Vec<u16>,
+    reason: String,
+}
+
+impl MeshEgressConfig {
+    pub fn protected_cluster_for_ip(&self, ip: IpAddr) -> Option<&MeshClusterRanges> {
+        self.clusters.iter().find(|cluster| {
+            cluster
+                .pod_cidrs
+                .iter()
+                .chain(&cluster.service_cidrs)
+                .chain(&cluster.gateway_cidrs)
+                .any(|cidr| cidr.contains(&ip))
+        })
+    }
+
+    pub fn exception_for(&self, ip: IpAddr, port: u16) -> Option<&MeshEgressException> {
+        self.exceptions
+            .iter()
+            .find(|rule| rule.cidr.contains(&ip) && rule.ports.contains(&port))
+    }
+
+    pub fn service_cluster_for_ip(&self, ip: IpAddr) -> Option<&MeshClusterRanges> {
+        self.clusters
+            .iter()
+            .find(|cluster| cluster.service_cidrs.iter().any(|cidr| cidr.contains(&ip)))
+    }
+
+    pub fn cluster_for_workload_ip(
+        &self,
+        cluster_id: &str,
+        trust_domain: &str,
+        ip: IpAddr,
+    ) -> Result<&MeshClusterRanges, String> {
+        let cluster = self
+            .clusters
+            .iter()
+            .find(|cluster| cluster.cluster_id == cluster_id)
+            .ok_or_else(|| format!("workload cluster {cluster_id:?} is not trusted"))?;
+        if cluster.trust_domain != trust_domain {
+            return Err(format!(
+                "workload trust domain {trust_domain:?} does not match cluster {cluster_id:?}"
+            ));
+        }
+        if !cluster
+            .pod_cidrs
+            .iter()
+            .chain(&cluster.gateway_cidrs)
+            .any(|cidr| cidr.contains(&ip))
+        {
+            return Err(format!(
+                "workload address {ip} is outside the pod and gateway ranges for cluster {cluster_id:?}"
+            ));
+        }
+        Ok(cluster)
+    }
+
+    pub fn cluster_for_workload_identity(
+        &self,
+        cluster_id: &str,
+        trust_domain: &str,
+    ) -> Result<&MeshClusterRanges, String> {
+        let cluster = self
+            .clusters
+            .iter()
+            .find(|cluster| cluster.cluster_id == cluster_id)
+            .ok_or_else(|| format!("workload cluster {cluster_id:?} is not trusted"))?;
+        if cluster.trust_domain != trust_domain {
+            return Err(format!(
+                "workload trust domain {trust_domain:?} does not match cluster {cluster_id:?}"
+            ));
+        }
+        Ok(cluster)
+    }
+}
+
+fn cidr_overlaps(left: IpNet, right: IpNet) -> bool {
+    left.addr().is_ipv4() == right.addr().is_ipv4()
+        && (left.contains(&right.network()) || right.contains(&left.network()))
+}
+
+fn parse_mesh_egress_config(raw: &str) -> Result<MeshEgressConfig, Error> {
+    if raw.trim().is_empty() {
+        return Ok(MeshEgressConfig::default());
+    }
+    let parsed: MeshEgressConfigInput = serde_yaml::from_str(raw)
+        .map_err(|err| Error::InvalidState(format!("invalid {MESH_EGRESS_CONFIG}: {err}")))?;
+    let parse_ranges = |ranges: Vec<String>, field: &str| -> Result<Vec<IpNet>, Error> {
+        ranges
+            .into_iter()
+            .map(|range| {
+                range.parse::<IpNet>().map_err(|err| {
+                    Error::InvalidState(format!(
+                        "invalid {MESH_EGRESS_CONFIG} {field} CIDR {range:?}: {err}"
+                    ))
+                })
+            })
+            .collect()
+    };
+
+    let clusters = parsed
+        .clusters
+        .into_iter()
+        .map(|cluster| {
+            Ok(MeshClusterRanges {
+                cluster_id: cluster.cluster_id,
+                trust_domain: cluster.trust_domain,
+                pod_cidrs: parse_ranges(cluster.pod_cidrs, "podCidrs")?,
+                service_cidrs: parse_ranges(cluster.service_cidrs, "serviceCidrs")?,
+                gateway_cidrs: parse_ranges(cluster.gateway_cidrs, "gatewayCidrs")?,
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    let exceptions = parsed
+        .exceptions
+        .into_iter()
+        .map(|rule| {
+            let cidr = rule.cidr.parse::<IpNet>().map_err(|err| {
+                Error::InvalidState(format!(
+                    "invalid {MESH_EGRESS_CONFIG} exception CIDR {:?}: {err}",
+                    rule.cidr
+                ))
+            })?;
+            Ok(MeshEgressException {
+                cidr,
+                ports: rule.ports,
+                reason: rule.reason,
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    Ok(MeshEgressConfig {
+        clusters,
+        exceptions,
+    })
+}
+
+fn validate_mesh_egress_config(config: &MeshEgressConfig, required: bool) -> Result<(), Error> {
+    if required && config.clusters.is_empty() {
+        return Err(Error::InvalidState(format!(
+            "{REQUIRE_MESH_HBONE}=true requires at least one cluster in {MESH_EGRESS_CONFIG}"
+        )));
+    }
+    let mut cluster_ids = HashSet::new();
+    let mut protected_ranges = Vec::new();
+    let mut trust_domains = HashSet::new();
+    for cluster in &config.clusters {
+        if cluster.cluster_id.trim().is_empty() {
+            return Err(Error::InvalidState(format!(
+                "{MESH_EGRESS_CONFIG} clusterId must not be empty"
+            )));
+        }
+        if !cluster_ids.insert(cluster.cluster_id.as_str()) {
+            return Err(Error::InvalidState(format!(
+                "{MESH_EGRESS_CONFIG} contains duplicate clusterId {:?}",
+                cluster.cluster_id
+            )));
+        }
+        spiffe::TrustDomain::new(&cluster.trust_domain).map_err(|err| {
+            Error::InvalidState(format!(
+                "{MESH_EGRESS_CONFIG} has invalid trustDomain {:?}: {err}",
+                cluster.trust_domain
+            ))
+        })?;
+        if !trust_domains.insert(cluster.trust_domain.as_str()) {
+            return Err(Error::InvalidState(format!(
+                "{MESH_EGRESS_CONFIG} trustDomain values must be unique per cluster"
+            )));
+        }
+        if required && (cluster.pod_cidrs.is_empty() || cluster.service_cidrs.is_empty()) {
+            return Err(Error::InvalidState(format!(
+                "{REQUIRE_MESH_HBONE}=true requires podCidrs and serviceCidrs for cluster {:?}",
+                cluster.cluster_id
+            )));
+        }
+        protected_ranges.extend(
+            cluster
+                .pod_cidrs
+                .iter()
+                .chain(&cluster.service_cidrs)
+                .chain(&cluster.gateway_cidrs)
+                .map(|cidr| (cluster.cluster_id.as_str(), *cidr)),
+        );
+    }
+    for (idx, (left_cluster, left)) in protected_ranges.iter().enumerate() {
+        if protected_ranges[idx + 1..]
+            .iter()
+            .any(|(right_cluster, right)| {
+                left_cluster != right_cluster && cidr_overlaps(*left, *right)
+            })
+        {
+            return Err(Error::InvalidState(format!(
+                "{MESH_EGRESS_CONFIG} protected CIDRs from different clusters must not overlap"
+            )));
+        }
+    }
+    for (idx, rule) in config.exceptions.iter().enumerate() {
+        if rule.reason.trim().is_empty() || rule.ports.is_empty() {
+            return Err(Error::InvalidState(format!(
+                "{MESH_EGRESS_CONFIG} exceptions require a reason and at least one explicit port"
+            )));
+        }
+        let mut ports = HashSet::new();
+        if rule
+            .ports
+            .iter()
+            .any(|port| *port == 0 || !ports.insert(*port))
+        {
+            return Err(Error::InvalidState(format!(
+                "{MESH_EGRESS_CONFIG} exception ports must be nonzero and unique"
+            )));
+        }
+        if protected_ranges
+            .iter()
+            .any(|(_, protected)| cidr_overlaps(rule.cidr, *protected))
+        {
+            return Err(Error::InvalidState(format!(
+                "{MESH_EGRESS_CONFIG} exception CIDR {} overlaps a protected mesh CIDR",
+                rule.cidr
+            )));
+        }
+        if config.exceptions[..idx]
+            .iter()
+            .any(|previous| cidr_overlaps(rule.cidr, previous.cidr))
+        {
+            return Err(Error::InvalidState(format!(
+                "{MESH_EGRESS_CONFIG} exception CIDRs must not overlap"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(serde::Serialize, Clone, Copy, Debug)]
@@ -790,8 +1089,15 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         _ => (None, None),
     };
 
+    let require_mesh_hbone = parse_default(REQUIRE_MESH_HBONE, false)?;
+    let mesh_egress =
+        parse_mesh_egress_config(&parse_default::<String>(MESH_EGRESS_CONFIG, String::new())?)?;
+
     validate_config(Config {
         proxy: parse_default(ENABLE_PROXY, true)?,
+        require_inbound_mtls: parse_default(REQUIRE_INBOUND_MTLS, false)?,
+        require_mesh_hbone,
+        mesh_egress,
         // Enable by default; running the server is not an issue, clients still need to opt-in to sending their
         // DNS requests to Ztunnel.
         dns_proxy: pc
@@ -979,9 +1285,35 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
 }
 
 fn validate_config(cfg: Config) -> Result<Config, Error> {
+    validate_mesh_egress_config(&cfg.mesh_egress, cfg.require_mesh_hbone)?;
+
     if cfg.dns_proxy && cfg.xds_on_demand {
         return Err(Error::ProxyConfig(anyhow!(
             "DNS proxy does not currently support on-demand mode"
+        )));
+    }
+
+    if cfg.require_inbound_mtls && cfg.xds_on_demand {
+        return Err(Error::ProxyConfig(anyhow!(
+            "strict inbound mTLS requires a complete xDS snapshot; on-demand mode is unsupported"
+        )));
+    }
+
+    if cfg.require_mesh_hbone && cfg.xds_on_demand {
+        return Err(Error::ProxyConfig(anyhow!(
+            "strict mesh egress requires a complete xDS snapshot; on-demand mode is unsupported"
+        )));
+    }
+
+    if cfg.require_inbound_mtls && cfg.xds_address.is_none() {
+        return Err(Error::ProxyConfig(anyhow!(
+            "strict inbound mTLS requires an authoritative remote xDS source"
+        )));
+    }
+
+    if cfg.require_mesh_hbone && cfg.xds_address.is_none() {
+        return Err(Error::ProxyConfig(anyhow!(
+            "strict mesh egress requires an authoritative remote xDS source"
         )));
     }
 
@@ -1193,6 +1525,149 @@ impl Address {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    const VALID_MESH_EGRESS: &str = r#"
+clusters:
+  - clusterId: cluster-alpha
+    trustDomain: alpha.mesh.example
+    podCidrs: [10.244.0.0/16]
+    serviceCidrs: [10.96.0.0/12]
+    gatewayCidrs: []
+exceptions:
+  - cidr: 192.0.2.10/32
+    ports: [443]
+    reason: control-plane endpoint
+"#;
+
+    #[test]
+    fn strict_inbound_mtls_rejects_on_demand_xds() {
+        let mut config =
+            construct_config(ProxyConfig::default()).expect("default proxy config should be valid");
+        config.dns_proxy = false;
+        config.require_inbound_mtls = true;
+        config.xds_on_demand = true;
+
+        let error = validate_config(config).expect_err("strict mode needs a full xDS snapshot");
+        assert!(error.to_string().contains("complete xDS snapshot"));
+    }
+
+    #[test]
+    fn strict_inbound_mtls_requires_authoritative_xds_source() {
+        let mut config =
+            construct_config(ProxyConfig::default()).expect("default proxy config should be valid");
+        config.dns_proxy = false;
+        config.require_inbound_mtls = true;
+        config.xds_on_demand = false;
+        config.xds_address = None;
+
+        let error = validate_config(config).expect_err("strict mode needs an xDS source");
+        assert!(
+            error
+                .to_string()
+                .contains("authoritative remote xDS source")
+        );
+    }
+
+    #[test]
+    fn mesh_egress_config_requires_complete_unique_cluster_inventory() {
+        let config = parse_mesh_egress_config(VALID_MESH_EGRESS).unwrap();
+        validate_mesh_egress_config(&config, true).unwrap();
+        assert!(
+            config
+                .protected_cluster_for_ip("10.244.7.8".parse().unwrap())
+                .is_some()
+        );
+        assert!(
+            config
+                .protected_cluster_for_ip("10.96.3.4".parse().unwrap())
+                .is_some()
+        );
+        assert!(
+            config
+                .exception_for("192.0.2.10".parse().unwrap(), 443)
+                .is_some()
+        );
+        assert!(
+            config
+                .exception_for("192.0.2.10".parse().unwrap(), 8080)
+                .is_none()
+        );
+
+        let invalid_cidr = VALID_MESH_EGRESS.replace("10.244.0.0/16", "10.244.invalid");
+        assert!(parse_mesh_egress_config(&invalid_cidr).is_err());
+
+        let empty = MeshEgressConfig::default();
+        assert!(validate_mesh_egress_config(&empty, true).is_err());
+        validate_mesh_egress_config(&empty, false).unwrap();
+
+        let missing_service = parse_mesh_egress_config(
+            "clusters:\n  - clusterId: alpha\n    trustDomain: alpha.mesh.example\n    podCidrs: [10.244.0.0/16]\n",
+        )
+        .unwrap();
+        assert!(validate_mesh_egress_config(&missing_service, true).is_err());
+    }
+
+    #[test]
+    fn mesh_egress_config_rejects_ambiguous_cluster_and_exception_ranges() {
+        let overlapping_clusters = parse_mesh_egress_config(
+            "clusters:\n  - clusterId: alpha\n    trustDomain: alpha.mesh.example\n    podCidrs: [10.244.0.0/16]\n    serviceCidrs: [10.96.0.0/12]\n  - clusterId: beta\n    trustDomain: beta.mesh.example\n    podCidrs: [10.244.128.0/17]\n    serviceCidrs: [10.100.0.0/16]\n",
+        )
+        .unwrap();
+        assert!(validate_mesh_egress_config(&overlapping_clusters, true).is_err());
+
+        let overlapping_exception = parse_mesh_egress_config(
+            "clusters:\n  - clusterId: alpha\n    trustDomain: alpha.mesh.example\n    podCidrs: [10.244.0.0/16]\n    serviceCidrs: [10.96.0.0/12]\nexceptions:\n  - cidr: 10.96.0.10/32\n    ports: [443]\n    reason: overlapping service exception\n",
+        )
+        .unwrap();
+        assert!(validate_mesh_egress_config(&overlapping_exception, true).is_err());
+
+        let invalid_exception = parse_mesh_egress_config(
+            "clusters:\n  - clusterId: alpha\n    trustDomain: alpha.mesh.example\n    podCidrs: [10.244.0.0/16]\n    serviceCidrs: [10.96.0.0/12]\nexceptions:\n  - cidr: 192.0.2.10/32\n    ports: []\n    reason: missing port scope\n",
+        )
+        .unwrap();
+        assert!(validate_mesh_egress_config(&invalid_exception, true).is_err());
+    }
+
+    #[test]
+    fn mesh_egress_workload_requires_cluster_trust_domain_and_address_binding() {
+        let config = parse_mesh_egress_config(VALID_MESH_EGRESS).unwrap();
+        assert!(
+            config
+                .cluster_for_workload_ip(
+                    "cluster-alpha",
+                    "alpha.mesh.example",
+                    "10.244.1.2".parse().unwrap()
+                )
+                .is_ok()
+        );
+        assert!(
+            config
+                .cluster_for_workload_ip(
+                    "cluster-alpha",
+                    "beta.mesh.example",
+                    "10.244.1.2".parse().unwrap()
+                )
+                .is_err()
+        );
+        assert!(
+            config
+                .cluster_for_workload_ip(
+                    "untrusted-cluster",
+                    "alpha.mesh.example",
+                    "10.244.1.2".parse().unwrap()
+                )
+                .is_err()
+        );
+        assert!(
+            config
+                .cluster_for_workload_ip(
+                    "cluster-alpha",
+                    "alpha.mesh.example",
+                    "10.245.1.2".parse().unwrap()
+                )
+                .is_err()
+        );
+    }
 
     #[test]
     fn config_from_proxyconfig() {

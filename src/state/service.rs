@@ -369,6 +369,9 @@ impl TryFrom<&XdsService> for Service {
             let network = strng::new(&addr.network);
             let max_prefix: u32 = if ip.is_ipv4() { 32 } else { 128 };
             match addr.length {
+                Some(pl) if pl > max_prefix => {
+                    return Err(WorkloadError::PrefixParse(ipnet::PrefixLenError));
+                }
                 Some(pl) if pl != max_prefix => {
                     let cidr = IpNet::new(ip, pl as u8)?;
                     cidr_vips.push(network_cidr(network, cidr));
@@ -942,6 +945,45 @@ mod tests {
     use crate::state::workload::{NetworkCidr, network_cidr};
     use ipnet::IpNet;
     use std::net::{Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn xds_service_prefix_bounds_and_recovery() {
+        use crate::xds::istio::workload::NetworkAddress as XdsNetworkAddress;
+
+        for (address, max_prefix) in [
+            (vec![10, 96, 0, 1], 32u32),
+            (Ipv6Addr::LOCALHOST.octets().to_vec(), 128u32),
+        ] {
+            let mut input = XdsService {
+                addresses: vec![XdsNetworkAddress {
+                    network: "network".to_string(),
+                    address,
+                    length: None,
+                }],
+                ..Default::default()
+            };
+            for prefix in [max_prefix + 1, 255, 256, 256 + max_prefix, u32::MAX] {
+                input.addresses[0].length = Some(prefix);
+                assert!(
+                    Service::try_from(&input).is_err(),
+                    "accepted /{prefix} for max /{max_prefix}"
+                );
+            }
+            for prefix in [0, max_prefix - 8] {
+                input.addresses[0].length = Some(prefix);
+                let service = Service::try_from(&input).unwrap();
+                assert!(service.vips.is_empty());
+                assert_eq!(service.cidr_vips.len(), 1);
+                assert_eq!(u32::from(service.cidr_vips[0].cidr.prefix_len()), prefix);
+            }
+            for prefix in [None, Some(max_prefix)] {
+                input.addresses[0].length = prefix;
+                let recovered = Service::try_from(&input).unwrap();
+                assert_eq!(recovered.vips.len(), 1);
+                assert!(recovered.cidr_vips.is_empty());
+            }
+        }
+    }
 
     fn nw(ip: IpAddr) -> NetworkAddress {
         NetworkAddress {

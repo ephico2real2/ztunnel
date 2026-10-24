@@ -304,16 +304,13 @@ mod tests {
                         // Filter by label selector
                         let labels_match =
                             filter.label_selector.iter().all(|(key, expected_value)| {
-                                sandbox
-                                    .labels
-                                    .get(key)
-                                    .map_or(false, |actual_value| actual_value == expected_value)
+                                sandbox.labels.get(key) == Some(expected_value)
                             });
                         // Filter by state if specified
                         let state_match = filter
                             .state
                             .as_ref()
-                            .map_or(true, |state_filter| sandbox.state == state_filter.state);
+                            .is_none_or(|state_filter| sandbox.state == state_filter.state);
                         labels_match && state_match
                     })
                     .collect()
@@ -347,7 +344,7 @@ mod tests {
                         let state_match = filter
                             .state
                             .as_ref()
-                            .map_or(true, |state_filter| container.state == state_filter.state);
+                            .is_none_or(|state_filter| container.state == state_filter.state);
                         sandbox_match && state_match
                     })
                     .collect()

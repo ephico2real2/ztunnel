@@ -20,7 +20,6 @@ use tracing::{info, warn};
 use ztunnel::*;
 
 #[cfg(feature = "jemalloc")]
-#[cfg(feature = "jemalloc")]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -53,8 +52,11 @@ fn main() -> anyhow::Result<()> {
     let _log_flush = telemetry::setup_logging();
 
     // For now we don't need a complex CLI, so rather than pull in dependencies just use basic argv[1]
-    match std::env::args().nth(1).as_deref() {
-        None | Some("proxy") => (),
+    let require_inbound_mtls = match std::env::args().nth(1).as_deref() {
+        None | Some("proxy") => false,
+        // A distinct command makes older proxy images fail startup instead of
+        // silently ignoring an unknown security environment setting.
+        Some("proxy-mtls") => true,
         Some("version") => return version(),
         Some("help") => return help(),
         Some(unknown) => {
@@ -69,8 +71,9 @@ fn main() -> anyhow::Result<()> {
         .build()
         .unwrap()
         .block_on(async move {
-            let config = Arc::new(config::parse_config()?);
-            proxy(config).await
+            let mut config = config::parse_config()?;
+            config.require_inbound_mtls |= require_inbound_mtls;
+            proxy(Arc::new(config)).await
         })
 }
 
@@ -82,6 +85,7 @@ Istio Ztunnel ({version})
 
 Commands:
 proxy (default) - Start the ztunnel proxy
+proxy-mtls      - Require verified inbound TLS peers and all referenced policies
 version         - Print the version of ztunnel
 help            - Print commands and version of ztunnel"
     );

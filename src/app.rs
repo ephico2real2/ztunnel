@@ -141,7 +141,9 @@ pub async fn build_with_cert(
         tracing::info!("shared proxy mode - in-pod mode enabled");
 
         // Create ztunnel inbound listener only if its specific identity and workload info are configured.
-        if let Some(inbound) = proxy_gen.create_ztunnel_self_proxy_listener().await? {
+        if let Some((inbound, policy_watcher)) =
+            proxy_gen.create_ztunnel_self_proxy_listener().await?
+        {
             // Run the inbound listener in the data plane worker pool
             let mut xds_rx_for_inbound = xds_rx.clone();
             data_plane_pool.send(DataPlaneTask {
@@ -150,7 +152,10 @@ pub async fn build_with_cert(
                     tracing::info!("Starting ztunnel inbound listener task");
                     let _ = xds_rx_for_inbound.changed().await;
                     tokio::task::spawn(async move {
-                        inbound.run().in_current_span().await;
+                        tokio::join!(
+                            inbound.run().in_current_span(),
+                            policy_watcher.run().in_current_span(),
+                        );
                     })
                     .await?;
                     Ok(())
