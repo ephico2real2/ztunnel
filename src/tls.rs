@@ -16,6 +16,7 @@ mod certificate;
 mod control;
 pub mod crl;
 pub mod csr;
+pub mod domain_anchors;
 mod lib;
 #[cfg(any(test, feature = "testing"))]
 pub mod mock;
