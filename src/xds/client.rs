@@ -881,6 +881,10 @@ mod tests {
             let wl = source.fetch_workload_by_address(&ip_network_addr);
             matched = wl.await.as_deref() == converted.as_ref(); // Option<Workload> is Ok to compare without needing to unwrap
         }
+        assert!(
+            matched,
+            "workload lookup for {ip} did not reach expected state: {converted:?}"
+        );
     }
 
     fn get_auth(i: usize) -> ProtoResource {
@@ -1166,7 +1170,8 @@ mod tests {
         let mut resources = vec![];
         let addresses = vec![XdsAddress {
             r#type: Some(XdsType::Workload(XdsWorkload {
-                name: "1.1.1.1".to_string(),
+                uid: "pod-1".to_string(),
+                name: "test-workload".to_string(),
                 namespace: "default".to_string(),
                 addresses: vec![ip.octets().to_vec().into()],
                 tunnel_protocol: 0,
@@ -1182,7 +1187,7 @@ mod tests {
         for addr in addresses.clone().iter() {
             match &addr.r#type {
                 Some(XdsType::Workload(w)) => resources.push(ProtoResource {
-                    name: w.name.clone(),
+                    name: w.uid.clone(),
                     aliases: vec![],
                     version: "0.0.1".to_string(),
                     resource: Some(Any {
@@ -1213,7 +1218,7 @@ mod tests {
                 nonce: TextNonce::new().to_string(),
                 system_version_info: "1.0.0".to_string(),
                 type_url: ADDRESS_TYPE.to_string(),
-                removed_resources: vec!["127.0.0.1".into()],
+                removed_resources: vec!["pod-1".into()],
             });
 
         // Setup fake xds server
