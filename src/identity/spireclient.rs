@@ -829,7 +829,7 @@ pub mod spire_tests {
         let mut set = spiffe::X509BundleSet::new();
         set.add_bundle(bundle);
 
-        return set;
+        set
     }
 
     fn mock_stream_svid_success_response(
@@ -982,13 +982,11 @@ pub mod spire_tests {
         let mut cert_chain = leaf_cert_der.clone();
         cert_chain.extend_from_slice(&ca_cert_der);
 
-        let svid = X509Svid::parse_from_der(&cert_chain, &leaf_key_der)
+        X509Svid::parse_from_der(&cert_chain, &leaf_key_der)
             .map_err(|e| {
                 tracing::error!("Failed to parse SVID: {}", e);
                 e
             })
-            .unwrap();
-
-        svid
+            .unwrap()
     }
 }
