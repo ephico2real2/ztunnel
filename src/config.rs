@@ -35,6 +35,7 @@ use crate::{identity, state};
 use {crate::test_helpers::MpscAckReceiver, crate::xds::LocalConfig, tokio::sync::Mutex};
 
 const ENABLE_PROXY: &str = "ENABLE_PROXY";
+const REQUIRE_INBOUND_MTLS: &str = "REQUIRE_INBOUND_MTLS";
 const KUBERNETES_SERVICE_HOST: &str = "KUBERNETES_SERVICE_HOST";
 const NETWORK: &str = "NETWORK";
 const NODE_NAME: &str = "NODE_NAME";
@@ -200,6 +201,9 @@ impl serde::Serialize for MetadataVector {
 pub struct Config {
     /// If true, the HBONE proxy will be used.
     pub proxy: bool,
+    /// Require a verified TLS peer before inbound authorization, independently
+    /// of dynamic policy delivery. Missing required policy references deny.
+    pub require_inbound_mtls: bool,
     /// If true, a DNS proxy will be used.
     pub dns_proxy: bool,
 
@@ -730,6 +734,7 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
 
     validate_config(Config {
         proxy: parse_default(ENABLE_PROXY, true)?,
+        require_inbound_mtls: parse_default(REQUIRE_INBOUND_MTLS, false)?,
         // Enable by default; running the server is not an issue, clients still need to opt-in to sending their
         // DNS requests to Ztunnel.
         dns_proxy: pc

@@ -377,6 +377,8 @@ pub struct Addresses {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthorizationRejectionError {
+    AuthenticationRequired,
+    MissingPolicy(Strng),
     NoWorkload,
     WorkloadMismatch,
     ExplicitlyDenied(Strng, Strng),
@@ -385,6 +387,10 @@ pub enum AuthorizationRejectionError {
 impl fmt::Display for AuthorizationRejectionError {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AuthenticationRequired => write!(fmt, "verified TLS peer required"),
+            Self::MissingPolicy(policy) => {
+                write!(fmt, "required authorization unavailable: {policy}")
+            }
             Self::NoWorkload => write!(fmt, "workload not found"),
             Self::WorkloadMismatch => write!(fmt, "workload mismatch"),
             Self::ExplicitlyDenied(a, b) => write!(fmt, "explicitly denied by: {a}/{b}"),

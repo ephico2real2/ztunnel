@@ -488,6 +488,9 @@ impl ProxyState {
 /// on-demand.
 #[derive(serde::Serialize, Clone)]
 pub struct DemandProxyState {
+    /// Immutable process requirement; cannot disappear during an xDS resync.
+    #[serde(skip_serializing)]
+    require_inbound_mtls: bool,
     #[serde(flatten)]
     state: Arc<RwLock<ProxyState>>,
 
@@ -527,11 +530,17 @@ impl DemandProxyState {
         *rb.options_mut() = dns_resolver_opts;
         let dns_resolver = rb.build();
         Self {
+            require_inbound_mtls: false,
             state,
             demand,
             dns_resolver,
             metrics,
         }
+    }
+
+    pub(crate) fn with_require_inbound_mtls(mut self, required: bool) -> Self {
+        self.require_inbound_mtls = required;
+        self
     }
 
     pub fn read(&self) -> RwLockReadGuard<'_, ProxyState> {
@@ -544,7 +553,28 @@ impl DemandProxyState {
     ) -> Result<(), proxy::AuthorizationRejectionError> {
         let wl = &ctx.dest_workload;
         let conn = &ctx.conn;
+        if self.require_inbound_mtls && conn.src_identity.is_none() {
+            authpol_log!(
+                reason = "authentication-required",
+                "verified TLS peer required"
+            );
+            return Err(proxy::AuthorizationRejectionError::AuthenticationRequired);
+        }
         let state = self.read();
+        if self.require_inbound_mtls {
+            for required in &wl.authorization_policies {
+                if state.policies.get(required).is_none() {
+                    authpol_log!(
+                        policy = required.as_str(),
+                        reason = "required-policy-missing",
+                        "required authorization unavailable"
+                    );
+                    return Err(proxy::AuthorizationRejectionError::MissingPolicy(
+                        required.clone(),
+                    ));
+                }
+            }
+        }
 
         // We can get policies from namespace, global, and workload...
         let ns = state.policies.get_by_namespace(&wl.namespace);
@@ -1134,7 +1164,8 @@ impl ProxyStateManager {
                 config.dns_resolver_cfg.clone(),
                 config.dns_resolver_opts.clone(),
                 proxy_metrics,
-            ),
+            )
+            .with_require_inbound_mtls(config.require_inbound_mtls),
         })
     }
 
@@ -1482,6 +1513,94 @@ mod tests {
             ResolverOpts::default(),
             metrics,
         )
+    }
+
+    #[tokio::test]
+    async fn required_mtls_rejects_plaintext_without_dynamic_policies() {
+        let mut state = ProxyState::new(None);
+        state.workloads.insert(Arc::new(create_workload(1)));
+        let strict = create_state(state).with_require_inbound_mtls(true);
+        let mut ctx = get_rbac_context(&strict, 1, "client");
+        assert!(strict.assert_rbac(&ctx).await.is_ok());
+        ctx.conn.src_identity = None;
+        for port in [1, 80, 8080, 9443, 65535] {
+            ctx.conn.dst.set_port(port);
+            assert_eq!(
+                strict.assert_rbac(&ctx).await,
+                Err(proxy::AuthorizationRejectionError::AuthenticationRequired)
+            );
+        }
+        // The compatibility default retains the upstream permissive behavior.
+        let permissive = strict.clone().with_require_inbound_mtls(false);
+        assert!(permissive.assert_rbac(&ctx).await.is_ok());
+        assert!(strict.require_inbound_mtls);
+    }
+
+    #[tokio::test]
+    async fn required_mtls_survives_allow_policy_and_policy_cache_loss() {
+        let mut state = ProxyState::new(None);
+        state.workloads.insert(Arc::new(create_workload(1)));
+        let mut allow = create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Allow);
+        allow.dry_run = false;
+        state.policies.insert("ns1/wildcard".into(), allow);
+        let strict = create_state(state).with_require_inbound_mtls(true);
+        let mut ctx = get_rbac_context(&strict, 1, "client");
+        assert!(strict.assert_rbac(&ctx).await.is_ok());
+        ctx.conn.src_identity = None;
+        assert_eq!(
+            strict.assert_rbac(&ctx).await,
+            Err(proxy::AuthorizationRejectionError::AuthenticationRequired)
+        );
+        strict.state.write().unwrap().policies = PolicyStore::default();
+        assert_eq!(
+            strict.assert_rbac(&ctx).await,
+            Err(proxy::AuthorizationRejectionError::AuthenticationRequired)
+        );
+    }
+
+    #[tokio::test]
+    async fn required_mtls_holds_missing_references_and_preserves_explicit_denies() {
+        let mut state = ProxyState::new(None);
+        let mut workload = create_workload(1);
+        workload.authorization_policies = vec!["ns1/wildcard".into()];
+        state.workloads.insert(Arc::new(workload));
+        let strict = create_state(state).with_require_inbound_mtls(true);
+        let ctx = get_rbac_context(&strict, 1, "client");
+        let missing = Err(proxy::AuthorizationRejectionError::MissingPolicy(
+            "ns1/wildcard".into(),
+        ));
+        assert_eq!(strict.assert_rbac(&ctx).await, missing);
+        let mut allow = create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Allow);
+        allow.dry_run = false;
+        strict
+            .state
+            .write()
+            .unwrap()
+            .policies
+            .insert("ns1/wildcard".into(), allow);
+        assert!(strict.assert_rbac(&ctx).await.is_ok());
+        strict
+            .state
+            .write()
+            .unwrap()
+            .policies
+            .remove("ns1/wildcard".into());
+        assert_eq!(strict.assert_rbac(&ctx).await, missing);
+        let mut deny = create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Deny);
+        deny.dry_run = false;
+        strict
+            .state
+            .write()
+            .unwrap()
+            .policies
+            .insert("ns1/wildcard".into(), deny);
+        assert_eq!(
+            strict.assert_rbac(&ctx).await,
+            Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(
+                "ns1".into(),
+                "wildcard".into()
+            ))
+        );
     }
 
     fn create_dry_run_wildcard_rbac_policy(action: rbac::RbacAction) -> rbac::Authorization {
