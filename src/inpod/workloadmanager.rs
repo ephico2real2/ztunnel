@@ -300,6 +300,7 @@ impl<'a> WorkloadProxyManagerProcessor<'a> {
     }
 
     pub async fn process(&mut self, mut processor: WorkloadStreamProcessor) -> Result<(), Error> {
+        processor.set_proxy_epoch(self.state.proxy_epoch());
         processor
             .send_hello()
             .await
@@ -326,8 +327,27 @@ impl<'a> WorkloadProxyManagerProcessor<'a> {
 
             debug!("received message: {:?}", msg);
 
-            // send ack:
-            match self.state.process_msg(msg).await {
+            // A typed drain has a distinct correlated response. Generic ACKs
+            // never carry native membership-retirement authority.
+            let result = match msg {
+                super::WorkloadMessage::Drain(req) => {
+                    match self.state.process_bound_drain(req).await {
+                        Ok(receipt) => {
+                            processor
+                                .send_drained(receipt)
+                                .await
+                                .map_err(|e| Error::SendAckError(e.to_string()))?;
+                            continue;
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                super::WorkloadMessage::BoundAdd(data, binding) => {
+                    self.state.process_bound_add(data, binding).await
+                }
+                legacy => self.state.process_msg(legacy).await,
+            };
+            match result {
                 Ok(()) => {
                     self.check_ready();
                     processor
@@ -632,5 +652,484 @@ pub(crate) mod tests {
         assert!(readiness.ready.pending().is_empty());
 
         state.drain().await;
+    }
+    fn receipt_packet_pair() -> (UnixStream, UnixStream) {
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+        let (a, b) = socketpair(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            None,
+            SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        (
+            UnixStream::from_std(std::os::unix::net::UnixStream::from(a)).unwrap(),
+            UnixStream::from_std(std::os::unix::net::UnixStream::from(b)).unwrap(),
+        )
+    }
+    async fn write_native_request(s: &mut UnixStream, payload: zds::workload_request::Payload) {
+        use prost::Message;
+        let bytes = zds::WorkloadRequest {
+            payload: Some(payload),
+        }
+        .encode_to_vec();
+        s.write_all(&bytes).await.unwrap();
+    }
+    async fn send_bound_add(
+        s: &mut UnixStream,
+        binding: zds::WorkloadBinding,
+        fd: &std::os::fd::OwnedFd,
+    ) {
+        use prost::Message;
+        use std::os::fd::AsRawFd;
+        let fds = [fd.as_raw_fd()];
+        let rights = [nix::sys::socket::ControlMessage::ScmRights(&fds)];
+        let bytes = zds::WorkloadRequest {
+            payload: Some(zds::workload_request::Payload::Add(zds::AddWorkload {
+                uid: binding.pod_uid.clone(),
+                workload_info: workload_info(),
+                binding: Some(binding),
+            })),
+        }
+        .encode_to_vec();
+        let iov = [std::io::IoSlice::new(&bytes)];
+        let count = s
+            .async_io(tokio::io::Interest::WRITABLE, || {
+                nix::sys::socket::sendmsg::<()>(
+                    s.as_raw_fd(),
+                    &iov,
+                    &rights,
+                    nix::sys::socket::MsgFlags::empty(),
+                    None,
+                )
+                .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+            })
+            .await
+            .unwrap();
+        assert_eq!(count, bytes.len());
+    }
+    #[tokio::test]
+    async fn typed_native_seqpacket_add_wrong_incarnation_nack_and_original_execution_recovery() {
+        // This is an explicitly privileged test: lack of the required private
+        // Linux netns capability must fail, not count as skipped acceptance.
+        assert!(crate::test_helpers::can_run_privilged_test());
+        let f = test_helpers::Fixture::default();
+        let mut state = WorkloadProxyManagerState::new(
+            f.proxy_factory,
+            f.ipc,
+            f.inpod_metrics,
+            Default::default(),
+        );
+        let epoch = state.proxy_epoch();
+        let fd = new_netns();
+        let stat = nix::sys::stat::fstat(&fd).unwrap();
+        let binding = zds::WorkloadBinding {
+            version: 1,
+            source_epoch: "source-execution".into(),
+            cluster_id: 1,
+            namespace_uid: "namespace-uid".into(),
+            pod_uid: "pod-uid".into(),
+            endpoint_id: 17,
+            incarnation: 1,
+            capture_generation: 7,
+            netns_dev: stat.st_dev,
+            netns_ino: stat.st_ino,
+            proxy_epoch: epoch.to_vec(),
+        };
+        let (a, mut b) = receipt_packet_pair();
+        let original = binding.clone();
+        let peer = tokio::spawn(async move {
+            let hello = read_hello(&mut b).await;
+            assert_eq!(hello.version, zds::Version::V2Drain as i32);
+            assert_eq!(hello.proxy_epoch, epoch);
+            send_bound_add(&mut b, original.clone(), &fd).await;
+            assert!(
+                matches!(read_msg(&mut b).await.payload,Some(zds::workload_response::Payload::Ack(a)) if a.error.is_empty())
+            );
+            // A wrong incarnation must NACK without stopping the live original.
+            let mut bad = original;
+            bad.incarnation += 1;
+            write_native_request(
+                &mut b,
+                zds::workload_request::Payload::Drain(zds::DrainWorkload {
+                    binding: Some(bad),
+                    drain_generation: 9,
+                    nonce: vec![4; 32],
+                }),
+            )
+            .await;
+            let reply = read_msg(&mut b).await;
+            assert!(
+                matches!(reply.payload,Some(zds::workload_response::Payload::Ack(a)) if !a.error.is_empty())
+            );
+        });
+        let mut readiness = WorkloadProxyReadinessHandler::new(readiness::Ready::new(), None);
+        let mut dispatch = WorkloadProxyManagerProcessor::new(&mut state, &mut readiness);
+        assert!(
+            dispatch
+                .process(WorkloadStreamProcessor::new(a, f.drain_rx.clone()))
+                .await
+                .is_err()
+        );
+        peer.await.unwrap();
+        assert_eq!(state.workload_states().len(), 1);
+
+        // Add a real held socket to the actual native owner's retained task set.
+        // The typed wire dispatcher must not reply until that socket task joins.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut socket_peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (owned_socket, _) = listener.accept().await.unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        state.append_owned_receipt_test_task(
+            &super::super::WorkloadUid::new(binding.pod_uid.clone()),
+            tokio::spawn(async move {
+                release_rx.await.unwrap();
+                drop(owned_socket);
+                Ok(())
+            }),
+        );
+        // Reconnect the SAME proxy execution. It retains original ADD ownership.
+        let (a, mut b) = receipt_packet_pair();
+        let original = binding.clone();
+        let peer = tokio::spawn(async move {
+            assert_eq!(read_hello(&mut b).await.proxy_epoch, epoch);
+            let req = zds::DrainWorkload {
+                binding: Some(original),
+                drain_generation: 9,
+                nonce: vec![5; 32],
+            };
+            write_native_request(&mut b, zds::workload_request::Payload::Drain(req.clone())).await;
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(30), read_msg(&mut b))
+                    .await
+                    .is_err(),
+                "native receipt escaped before actual owned socket task joined"
+            );
+            let mut byte = [0];
+            assert!(
+                matches!(socket_peer.try_read(&mut byte),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock)
+            );
+            release_tx.send(()).unwrap();
+            use tokio::io::AsyncReadExt;
+            assert_eq!(socket_peer.read(&mut byte).await.unwrap(), 0);
+            let reply = read_msg(&mut b).await;
+            match reply.payload.unwrap() {
+                zds::workload_response::Payload::Drained(got) => {
+                    assert_eq!(got.binding, req.binding);
+                    assert_eq!(got.drain_generation, 9);
+                    assert_eq!(got.nonce, req.nonce);
+                }
+                _ => panic!("generic ACK cannot qualify drain"),
+            }
+        });
+        let mut dispatch = WorkloadProxyManagerProcessor::new(&mut state, &mut readiness);
+        assert_end_stream(
+            dispatch
+                .process(WorkloadStreamProcessor::new(a, f.drain_rx.clone()))
+                .await,
+        );
+        peer.await.unwrap();
+        assert!(state.workload_states().is_empty());
+        state.drain().await;
+    }
+    #[tokio::test]
+    async fn typed_native_ack_loss_refreshes_same_owner_and_rejects_old_capture_generation() {
+        assert!(crate::test_helpers::can_run_privilged_test());
+        let f = test_helpers::Fixture::default();
+        let mut state = WorkloadProxyManagerState::new(
+            f.proxy_factory,
+            f.ipc,
+            f.inpod_metrics,
+            Default::default(),
+        );
+        let epoch = state.proxy_epoch();
+        let fd = new_netns();
+        let stat = nix::sys::stat::fstat(&fd).unwrap();
+        let original = zds::WorkloadBinding {
+            version: 1,
+            source_epoch: "ack-loss-source".into(),
+            cluster_id: 1,
+            namespace_uid: "namespace-uid".into(),
+            pod_uid: "ack-loss-pod".into(),
+            endpoint_id: 18,
+            incarnation: 1,
+            capture_generation: 7,
+            netns_dev: stat.st_dev,
+            netns_ino: stat.st_ino,
+            proxy_epoch: epoch.to_vec(),
+        };
+        let (a, mut b) = receipt_packet_pair();
+        let first = original.clone();
+        let first_fd = fd.try_clone().unwrap();
+        let peer = tokio::spawn(async move {
+            assert_eq!(read_hello(&mut b).await.proxy_epoch, epoch);
+            send_bound_add(&mut b, first, &first_fd).await;
+            // The kernel queued a real ADD+FD, but the source loses the stream
+            // without observing the ACK. Original native task ownership remains.
+            drop(b);
+        });
+        let mut readiness = WorkloadProxyReadinessHandler::new(readiness::Ready::new(), None);
+        let mut dispatch = WorkloadProxyManagerProcessor::new(&mut state, &mut readiness);
+        let result = dispatch
+            .process(WorkloadStreamProcessor::new(a, f.drain_rx.clone()))
+            .await;
+        assert!(matches!(result, Ok(()) | Err(Error::SendAckError(_))));
+        peer.await.unwrap();
+        assert_eq!(state.workload_states().len(), 1);
+        // The source performs fresh API/sandbox checks and a new capture
+        // generation; the SAME proxy execution refreshes its original owner.
+        let mut fresh = original.clone();
+        fresh.capture_generation += 1;
+        let (a, mut b) = receipt_packet_pair();
+        let next = fresh.clone();
+        let peer = tokio::spawn(async move {
+            assert_eq!(read_hello(&mut b).await.proxy_epoch, epoch);
+            send_bound_add(&mut b, next, &fd).await;
+            assert!(
+                matches!(read_msg(&mut b).await.payload,Some(zds::workload_response::Payload::Ack(a)) if a.error.is_empty())
+            );
+            write_native_request(
+                &mut b,
+                zds::workload_request::Payload::Drain(zds::DrainWorkload {
+                    binding: Some(original),
+                    drain_generation: 10,
+                    nonce: vec![6; 32],
+                }),
+            )
+            .await;
+            assert!(
+                matches!(read_msg(&mut b).await.payload,Some(zds::workload_response::Payload::Ack(a)) if !a.error.is_empty())
+            );
+        });
+        let mut dispatch = WorkloadProxyManagerProcessor::new(&mut state, &mut readiness);
+        assert!(matches!(
+            dispatch
+                .process(WorkloadStreamProcessor::new(a, f.drain_rx.clone()))
+                .await,
+            Err(Error::DrainRequestError(_))
+        ));
+        peer.await.unwrap();
+        assert_eq!(state.workload_states().len(), 1);
+        let (a, mut b) = receipt_packet_pair();
+        let peer = tokio::spawn(async move {
+            assert_eq!(read_hello(&mut b).await.proxy_epoch, epoch);
+            let req = zds::DrainWorkload {
+                binding: Some(fresh),
+                drain_generation: 10,
+                nonce: vec![7; 32],
+            };
+            write_native_request(&mut b, zds::workload_request::Payload::Drain(req.clone())).await;
+            match read_msg(&mut b).await.payload.unwrap() {
+                zds::workload_response::Payload::Drained(got) => {
+                    assert_eq!(got.binding, req.binding);
+                    assert_eq!(got.nonce, req.nonce);
+                    assert_eq!(got.drain_generation, 10);
+                }
+                _ => panic!("native typed receipt required"),
+            }
+        });
+        let mut dispatch = WorkloadProxyManagerProcessor::new(&mut state, &mut readiness);
+        assert_end_stream(
+            dispatch
+                .process(WorkloadStreamProcessor::new(a, f.drain_rx.clone()))
+                .await,
+        );
+        peer.await.unwrap();
+        assert!(state.workload_states().is_empty());
+        state.drain().await;
+    }
+
+    #[tokio::test]
+    async fn typed_native_unknown_or_restarted_execution_never_returns_empty_drain_receipt() {
+        assert!(crate::test_helpers::can_run_privilged_test());
+        let f = test_helpers::Fixture::default();
+        let mut state = WorkloadProxyManagerState::new(
+            f.proxy_factory,
+            f.ipc,
+            f.inpod_metrics,
+            Default::default(),
+        );
+        let epoch = state.proxy_epoch();
+        let mut readiness = WorkloadProxyReadinessHandler::new(readiness::Ready::new(), None);
+        for stale_execution in [true, false] {
+            let (a, mut b) = receipt_packet_pair();
+            let peer = tokio::spawn(async move {
+                assert_eq!(read_hello(&mut b).await.proxy_epoch, epoch);
+                let mut presented_epoch = epoch;
+                if stale_execution {
+                    presented_epoch[0] ^= 1;
+                }
+                let binding = zds::WorkloadBinding {
+                    version: 1,
+                    source_epoch: "old-source".into(),
+                    cluster_id: 1,
+                    namespace_uid: "namespace-uid".into(),
+                    pod_uid: "old-pod".into(),
+                    endpoint_id: 19,
+                    incarnation: 1,
+                    capture_generation: 7,
+                    netns_dev: 1,
+                    netns_ino: 2,
+                    proxy_epoch: presented_epoch.to_vec(),
+                };
+                write_native_request(
+                    &mut b,
+                    zds::workload_request::Payload::Drain(zds::DrainWorkload {
+                        binding: Some(binding),
+                        drain_generation: 11,
+                        nonce: vec![9; 32],
+                    }),
+                )
+                .await;
+                let reply = read_msg(&mut b).await;
+                match reply.payload.unwrap() {
+                    zds::workload_response::Payload::Ack(nack) => {
+                        assert!(nack.error.contains(if stale_execution {
+                            "proxy execution"
+                        } else {
+                            "no such ADD owner"
+                        }))
+                    }
+                    _ => panic!("unknown/restarted owner must NACK, never claim an empty drain"),
+                }
+            });
+            let mut dispatch = WorkloadProxyManagerProcessor::new(&mut state, &mut readiness);
+            assert!(matches!(
+                dispatch
+                    .process(WorkloadStreamProcessor::new(a, f.drain_rx.clone()))
+                    .await,
+                Err(Error::DrainRequestError(_))
+            ));
+            peer.await.unwrap();
+            assert!(state.workload_states().is_empty());
+        }
+        state.drain().await;
+    }
+    #[tokio::test]
+    async fn typed_native_outer_manager_preserves_owner_through_request_rejection_and_reconnect() {
+        assert!(crate::test_helpers::can_run_privilged_test());
+        let f = test_helpers::Fixture::default();
+        let state = WorkloadProxyManagerState::new(
+            f.proxy_factory,
+            f.ipc,
+            f.inpod_metrics,
+            Default::default(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native-drain.sock");
+        let listener = crate::inpod::packet::bind(&path).unwrap();
+        let (stop, watch) = crate::drain::new();
+        let manager = WorkloadProxyManager::new(path, state, readiness::Ready::new()).unwrap();
+        let running = tokio::spawn(manager.run(watch));
+        let (mut peer, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let hello = read_hello(&mut peer).await;
+        assert_eq!(hello.version, zds::Version::V2Drain as i32);
+        assert_eq!(hello.proxy_epoch.len(), 32);
+        let fd = new_netns();
+        let stat = nix::sys::stat::fstat(&fd).unwrap();
+        let binding = zds::WorkloadBinding {
+            version: 1,
+            source_epoch: "outer-manager-source".into(),
+            cluster_id: 1,
+            namespace_uid: "namespace-uid".into(),
+            pod_uid: "outer-manager-pod".into(),
+            endpoint_id: 20,
+            incarnation: 1,
+            capture_generation: 7,
+            netns_dev: stat.st_dev,
+            netns_ino: stat.st_ino,
+            proxy_epoch: hello.proxy_epoch.clone(),
+        };
+        send_bound_add(&mut peer, binding.clone(), &fd).await;
+        assert!(
+            matches!(read_msg(&mut peer).await.payload,Some(zds::workload_response::Payload::Ack(a)) if a.error.is_empty())
+        );
+        send_snap_sent(&mut peer).await;
+        assert!(
+            matches!(read_msg(&mut peer).await.payload,Some(zds::workload_response::Payload::Ack(a)) if a.error.is_empty())
+        );
+        let mut wrong = binding.clone();
+        wrong.namespace_uid = "replacement-namespace".into();
+        write_native_request(
+            &mut peer,
+            zds::workload_request::Payload::Drain(zds::DrainWorkload {
+                binding: Some(wrong),
+                drain_generation: 12,
+                nonce: vec![10; 32],
+            }),
+        )
+        .await;
+        assert!(
+            matches!(read_msg(&mut peer).await.payload,Some(zds::workload_response::Payload::Ack(a)) if !a.error.is_empty())
+        );
+        drop(peer);
+        // This goes through run_internal, not a manually constructed second
+        // processor. A fatal ProtocolError would end the real manager here.
+        let (mut peer, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        let renewed = read_hello(&mut peer).await;
+        assert_eq!(renewed.proxy_epoch, hello.proxy_epoch);
+        assert!(!running.is_finished());
+        // Resetting snapshot readiness must retain the original immutable owner.
+        // First reject an unacknowledged same-UID/new-sandbox replacement.
+        let another_fd = new_netns();
+        let another = nix::sys::stat::fstat(&another_fd).unwrap();
+        let mut replacement = binding.clone();
+        replacement.netns_dev = another.st_dev;
+        replacement.netns_ino = another.st_ino;
+        replacement.incarnation += 1;
+        send_bound_add(&mut peer, replacement, &another_fd).await;
+        assert!(
+            matches!(read_msg(&mut peer).await.payload,Some(zds::workload_response::Payload::Ack(a)) if !a.error.is_empty())
+        );
+        drop(peer);
+        let (mut peer, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(read_hello(&mut peer).await.proxy_epoch, hello.proxy_epoch);
+        let req = zds::DrainWorkload {
+            binding: Some(binding),
+            drain_generation: 12,
+            nonce: vec![11; 32],
+        };
+        write_native_request(
+            &mut peer,
+            zds::workload_request::Payload::Drain(req.clone()),
+        )
+        .await;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(3), read_msg(&mut peer))
+            .await
+            .unwrap();
+        match response.payload.unwrap() {
+            zds::workload_response::Payload::Drained(receipt) => {
+                assert_eq!(receipt.binding, req.binding);
+                assert_eq!(receipt.drain_generation, req.drain_generation);
+                assert_eq!(receipt.nonce, req.nonce);
+            }
+            _ => panic!("only an exact original-owner drain receipt qualifies"),
+        }
+        drop(peer);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            stop.start_drain_and_wait(crate::drain::DrainMode::Immediate),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 }

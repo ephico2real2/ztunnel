@@ -174,6 +174,7 @@ pub async fn send_workload_added(
     let r = WorkloadRequest {
         payload: Some(crate::inpod::istio::zds::workload_request::Payload::Add(
             crate::inpod::istio::zds::AddWorkload {
+                binding: None,
                 uid: uid.into_string(),
                 workload_info: info,
             },

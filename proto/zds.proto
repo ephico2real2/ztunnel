@@ -9,10 +9,12 @@ option go_package="pkg/zdsapi";
 enum Version {
   NOT_USED = 0;
   V1 = 1;
+  V2_DRAIN = 2;
 }
 
 message ZdsHello {
   Version version = 1;
+  bytes proxy_epoch = 2; // Fresh random 32 bytes per proxy process, stable across connections.
 }
 
 message WorkloadInfo {
@@ -28,6 +30,7 @@ message WorkloadInfo {
 message AddWorkload {
   string uid = 1;
   WorkloadInfo workload_info = 2;
+  WorkloadBinding binding = 3; // Required for strict Cilium membership, absent only in legacy mode.
 }
 
 // Keep workload that we can't find in the fd cache. This can only be sent before SnapshotSent is sent
@@ -69,6 +72,7 @@ message WorkloadRequest {
     KeepWorkload keep = 5;
     DelWorkload del = 2;
     SnapshotSent snapshot_sent = 3;
+    DrainWorkload drain = 6;
   }
 }
 
@@ -76,5 +80,31 @@ message WorkloadRequest {
 message WorkloadResponse {
   oneof payload {
     Ack ack = 1;
+    WorkloadDrained drained = 2;
   }
+}
+
+// Versioned identity of the original ADD and the namespace FD actually passed.
+message WorkloadBinding {
+  uint32 version = 1;
+  string source_epoch = 2;
+  uint32 cluster_id = 3;
+  string namespace_uid = 4;
+  string pod_uid = 5;
+  uint32 endpoint_id = 6;
+  uint64 incarnation = 7;
+  uint64 capture_generation = 8;
+  uint64 netns_dev = 9;
+  uint64 netns_ino = 10;
+  bytes proxy_epoch = 11;
+}
+message DrainWorkload {
+  WorkloadBinding binding = 1;
+  uint64 drain_generation = 2;
+  bytes nonce = 3;
+}
+message WorkloadDrained {
+  WorkloadBinding binding = 1;
+  uint64 drain_generation = 2;
+  bytes nonce = 3;
 }

@@ -24,6 +24,7 @@ use self::config::InPodConfig;
 
 pub mod admin;
 mod config;
+mod drain_receipt;
 pub mod metrics;
 pub mod netns;
 pub mod packet;
@@ -50,6 +51,8 @@ pub enum Error {
     SendAckError(String),
     #[error("error sending nack: {0}")]
     SendNackError(String),
+    #[error("native workload request rejected: {0}")]
+    DrainRequestError(String),
     #[error("protocol error: {0}")]
     ProtocolError(String),
     #[error("announce error: {0}")]
@@ -78,6 +81,8 @@ pub struct WorkloadData {
 #[derive(Debug)]
 pub enum WorkloadMessage {
     AddWorkload(WorkloadData),
+    BoundAdd(WorkloadData, istio::zds::WorkloadBinding),
+    Drain(istio::zds::DrainWorkload),
     KeepWorkload(WorkloadUid),
     WorkloadSnapshotSent,
     DelWorkload(WorkloadUid),

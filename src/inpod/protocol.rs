@@ -29,19 +29,38 @@ use zds::workload_request::Payload;
 pub struct WorkloadStreamProcessor {
     stream: UnixStream,
     drain: DrainWatcher,
+    proxy_epoch: [u8; 32],
 }
 
 #[allow(dead_code)]
 impl WorkloadStreamProcessor {
     pub fn new(stream: UnixStream, drain: DrainWatcher) -> Self {
-        WorkloadStreamProcessor { stream, drain }
+        WorkloadStreamProcessor {
+            stream,
+            drain,
+            proxy_epoch: rand::random(),
+        }
     }
 
+    pub(super) fn set_proxy_epoch(&mut self, epoch: [u8; 32]) {
+        self.proxy_epoch = epoch;
+    }
     pub async fn send_hello(&mut self) -> std::io::Result<()> {
         let r = ZdsHello {
-            version: Version::V1 as i32,
+            version: Version::V2Drain as i32,
+            proxy_epoch: self.proxy_epoch.to_vec(),
         };
         self.send_msg(r).await
+    }
+
+    pub(super) async fn send_drained(
+        &mut self,
+        receipt: zds::WorkloadDrained,
+    ) -> std::io::Result<()> {
+        self.send_msg(WorkloadResponse {
+            payload: Some(zds::workload_response::Payload::Drained(receipt)),
+        })
+        .await
     }
 
     pub async fn send_ack(&mut self) -> std::io::Result<()> {
@@ -155,11 +174,15 @@ fn get_workload_data(
     match (payload, maybe_our_fd) {
         (Payload::Add(a), Some(our_netns)) => {
             let uid = a.uid;
-            Ok(WorkloadMessage::AddWorkload(WorkloadData {
+            let data = WorkloadData {
                 netns: our_netns,
                 workload_uid: super::WorkloadUid::new(uid),
                 workload_info: a.workload_info,
-            }))
+            };
+            Ok(match a.binding {
+                Some(binding) => WorkloadMessage::BoundAdd(data, binding),
+                None => WorkloadMessage::AddWorkload(data),
+            })
         }
         (Payload::Add(_), None) => Err(anyhow::anyhow!("No control message")),
         // anything other than Add shouldn't have FDs
@@ -167,6 +190,7 @@ fn get_workload_data(
         (Payload::Keep(k), None) => Ok(WorkloadMessage::KeepWorkload(super::WorkloadUid::new(
             k.uid,
         ))),
+        (Payload::Drain(d), None) => Ok(WorkloadMessage::Drain(d)),
         (Payload::Del(d), None) => Ok(WorkloadMessage::DelWorkload(super::WorkloadUid::new(d.uid))),
         (Payload::SnapshotSent(_), None) => Ok(WorkloadMessage::WorkloadSnapshotSent),
     }
@@ -270,6 +294,7 @@ mod tests {
         let flags = MsgFlags::empty();
         let data = prep_request(zds::workload_request::Payload::Add(
             istio::zds::AddWorkload {
+                binding: None,
                 uid: uid(0).into_string(),
                 ..Default::default()
             },
@@ -292,6 +317,7 @@ mod tests {
         let uid = uid(0);
         let data = prep_request(zds::workload_request::Payload::Add(
             istio::zds::AddWorkload {
+                binding: None,
                 uid: uid.clone().into_string(),
                 workload_info: Some(wi.clone()),
             },
