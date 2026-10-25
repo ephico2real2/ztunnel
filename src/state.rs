@@ -2067,6 +2067,62 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn native_quarantine_cannot_be_bypassed_by_global_allow_or_old_workload_reference() {
+        let mut state = ProxyState::new(None);
+        let mut workload = create_workload(1);
+        workload.authorization_policies = vec!["ns1/cilium_l4_quarantine_incarnation".into()];
+        state.workloads.insert(Arc::new(workload));
+        let mut allow = create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Allow);
+        allow.dry_run = false;
+        allow.scope = rbac::RbacScope::Global;
+        allow.namespace = "".into();
+        allow.name = "global-allow".into();
+        state.policies.insert("/global-allow".into(), allow);
+        let mut quarantine = create_dry_run_wildcard_rbac_policy(rbac::RbacAction::Deny);
+        quarantine.dry_run = false;
+        quarantine.scope = rbac::RbacScope::WorkloadSelector;
+        quarantine.name = "cilium_l4_quarantine_incarnation".into();
+        state
+            .policies
+            .insert("ns1/cilium_l4_quarantine_incarnation".into(), quarantine);
+        let strict = create_state(state)
+            .with_require_inbound_mtls(true)
+            .with_xds_session(Some(open_xds_session()));
+        let mut ctx = get_rbac_context(&strict, 1, "client");
+        for port in [1, 80, 8080, 31337, 65535] {
+            ctx.conn.dst.set_port(port);
+            assert!(matches!(
+                strict.assert_rbac(&ctx).await,
+                Err(proxy::AuthorizationRejectionError::ExplicitlyDenied(_, _))
+            ));
+        }
+        strict
+            .state
+            .write()
+            .unwrap()
+            .policies
+            .remove(strng::new("ns1/cilium_l4_quarantine_incarnation"));
+        assert!(
+            matches!(
+                strict.assert_rbac(&ctx).await,
+                Err(proxy::AuthorizationRejectionError::MissingPolicy(_))
+            ),
+            "deletion cannot fall through to the global ALLOW"
+        );
+        let mut replacement = (*ctx.dest_workload).clone();
+        replacement.uid = "recreated-workload".into();
+        replacement.authorization_policies = vec!["ns1/cilium_l4_quarantine_recreated".into()];
+        ctx.dest_workload = Arc::new(replacement);
+        assert!(
+            matches!(
+                strict.assert_rbac(&ctx).await,
+                Err(proxy::AuthorizationRejectionError::MissingPolicy(_))
+            ),
+            "old policy incarnation cannot release a recreated workload"
+        );
+    }
+
     fn create_dry_run_wildcard_rbac_policy(action: rbac::RbacAction) -> rbac::Authorization {
         rbac::Authorization {
             action,

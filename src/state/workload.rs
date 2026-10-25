@@ -1116,6 +1116,8 @@ impl WorkloadStore {
 #[allow(clippy::enum_variant_names)]
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum WorkloadError {
+    #[error("invalid authorization restriction: {0}")]
+    InvalidAuthorization(String),
     #[error("failed to parse namespaced hostname: {0}")]
     NamespacedHostnameParse(String),
     #[error("failed to parse address: {0}")]

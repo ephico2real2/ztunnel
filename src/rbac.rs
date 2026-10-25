@@ -340,6 +340,11 @@ impl TryFrom<XdsRbac> for Authorization {
     type Error = WorkloadError;
 
     fn try_from(resource: XdsRbac) -> Result<Self, Self::Error> {
+        if !resource.extensions.is_empty() {
+            return Err(WorkloadError::InvalidAuthorization(
+                "unsupported Authorization extension".into(),
+            ));
+        }
         let rules = resource
             .rules
             .into_iter()
@@ -366,70 +371,103 @@ impl TryFrom<XdsRbac> for Authorization {
     }
 }
 
+fn strict_service_accounts(
+    values: &[XdsServiceAccountMatch],
+) -> Result<Vec<ServiceAccountMatch>, WorkloadError> {
+    fn label(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 63
+            && value.as_bytes()[0].is_ascii_alphanumeric()
+            && value.as_bytes()[value.len() - 1].is_ascii_alphanumeric()
+            && value
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+    }
+    values
+        .iter()
+        .map(|value| {
+            if !label(&value.namespace)
+                || value.service_account.len() > 253
+                || !value.service_account.split('.').all(label)
+            {
+                return Err(WorkloadError::InvalidAuthorization(
+                    "noncanonical namespace/service account".into(),
+                ));
+            }
+            Ok(ServiceAccountMatch::from(value))
+        })
+        .collect()
+}
+
+fn strict_strings(values: &[XdsStringMatch]) -> Result<Vec<StringMatch>, WorkloadError> {
+    values
+        .iter()
+        .map(|value| {
+            Option::<StringMatch>::from(value).ok_or_else(|| {
+                WorkloadError::InvalidAuthorization("StringMatch has no match_type".into())
+            })
+        })
+        .collect()
+}
+fn strict_ports(values: &[u32]) -> Result<Vec<u16>, WorkloadError> {
+    values
+        .iter()
+        .map(|port| {
+            u16::try_from(*port)
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| {
+                    WorkloadError::InvalidAuthorization("TCP policy port must be 1..65535".into())
+                })
+        })
+        .collect()
+}
 impl TryFrom<&Match> for RbacMatch {
     type Error = WorkloadError;
-
     fn try_from(resource: &Match) -> Result<Self, Self::Error> {
+        if !resource.extensions.is_empty() {
+            return Err(WorkloadError::InvalidAuthorization(
+                "unsupported Match extension".into(),
+            ));
+        }
         Ok(RbacMatch {
-            namespaces: resource.namespaces.iter().filter_map(From::from).collect(),
-            not_namespaces: resource
-                .not_namespaces
-                .iter()
-                .filter_map(From::from)
-                .collect(),
-            service_accounts: resource.service_accounts.iter().map(From::from).collect(),
-            not_service_accounts: resource
-                .not_service_accounts
-                .iter()
-                .map(From::from)
-                .collect(),
-            principals: resource.principals.iter().filter_map(From::from).collect(),
-            not_principals: resource
-                .not_principals
-                .iter()
-                .filter_map(From::from)
-                .collect(),
+            namespaces: strict_strings(&resource.namespaces)?,
+            not_namespaces: strict_strings(&resource.not_namespaces)?,
+            service_accounts: strict_service_accounts(&resource.service_accounts)?,
+            not_service_accounts: strict_service_accounts(&resource.not_service_accounts)?,
+            principals: strict_strings(&resource.principals)?,
+            not_principals: strict_strings(&resource.not_principals)?,
             source_ips: resource
                 .source_ips
                 .iter()
-                .filter_map(|a| a.try_into().ok())
-                .collect(),
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
             not_source_ips: resource
                 .not_source_ips
                 .iter()
-                .filter_map(|a| a.try_into().ok())
-                .collect(),
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
             destination_ips: resource
                 .destination_ips
                 .iter()
-                .filter_map(|a| a.try_into().ok())
-                .collect(),
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
             not_destination_ips: resource
                 .not_destination_ips
                 .iter()
-                .filter_map(|a| a.try_into().ok())
-                .collect(),
-            destination_ports: resource
-                .destination_ports
-                .iter()
-                .map(|p| *p as u16)
-                .collect(),
-            not_destination_ports: resource
-                .not_destination_ports
-                .iter()
-                .map(|p| *p as u16)
-                .collect(),
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+            destination_ports: strict_ports(&resource.destination_ports)?,
+            not_destination_ports: strict_ports(&resource.not_destination_ports)?,
         })
     }
 }
-
 impl TryFrom<&XdsAddress> for IpNet {
     type Error = WorkloadError;
     fn try_from(resource: &XdsAddress) -> Result<Self, Self::Error> {
-        Ok(IpNet::new(
-            byte_to_ip(&resource.address)?,
-            resource.length as u8,
-        )?)
+        let prefix = u8::try_from(resource.length)
+            .map_err(|_| WorkloadError::InvalidAuthorization("CIDR prefix overflow".into()))?;
+        Ok(IpNet::new(byte_to_ip(&resource.address)?, prefix)?)
     }
 }
 
@@ -737,5 +775,202 @@ mod tests {
     #[test_case(StringMatch::Presence(), "", false; "presence mismatch")]
     fn string_match(matcher: StringMatch, matchee: &str, expect: bool) {
         assert_eq!(matcher.matches(matchee), expect)
+    }
+}
+#[cfg(test)]
+mod strict_wire_tests {
+    use super::*;
+    use std::str::FromStr;
+    #[test]
+    fn malformed_restrictions_are_rejected_instead_of_dropped_or_wrapped() {
+        let bad = XdsAddress {
+            address: vec![10, 1, 2].into(),
+            length: 32,
+        };
+        for field in 0..4 {
+            let mut wire = Match::default();
+            match field {
+                0 => wire.source_ips = vec![bad.clone()],
+                1 => wire.not_source_ips = vec![bad.clone()],
+                2 => wire.destination_ips = vec![bad.clone()],
+                _ => wire.not_destination_ips = vec![bad.clone()],
+            }
+            assert!(
+                RbacMatch::try_from(&wire).is_err(),
+                "bad address field {field} must not disappear"
+            );
+        }
+        for prefix in [33, 128, 256, 288, u32::MAX] {
+            let bad = XdsAddress {
+                address: vec![10, 1, 2, 3].into(),
+                length: prefix,
+            };
+            assert!(
+                IpNet::try_from(&bad).is_err(),
+                "prefix {prefix} must not wrap or broaden"
+            );
+        }
+        for value in [0, 65536, 65537, u32::MAX] {
+            for negated in [false, true] {
+                let mut wire = Match::default();
+                if negated {
+                    wire.not_destination_ports = vec![value]
+                } else {
+                    wire.destination_ports = vec![value]
+                }
+                assert!(
+                    RbacMatch::try_from(&wire).is_err(),
+                    "port {value} must not wrap"
+                );
+            }
+        }
+        for field in 0..4 {
+            let mut wire = Match::default();
+            let absent = XdsStringMatch { match_type: None };
+            match field {
+                0 => wire.namespaces = vec![absent],
+                1 => wire.not_namespaces = vec![absent],
+                2 => wire.principals = vec![absent],
+                _ => wire.not_principals = vec![absent],
+            }
+            assert!(
+                RbacMatch::try_from(&wire).is_err(),
+                "missing oneof {field} must not disappear"
+            );
+        }
+    }
+    #[test]
+    fn valid_recovery_preserves_principal_source_ip_destination_port_and_conjunction() {
+        let wire = Match {
+            principals: vec![XdsStringMatch {
+                match_type: Some(MatchType::Exact("cluster-a.mesh/ns/orders/sa/api".into())),
+            }],
+            source_ips: vec![XdsAddress {
+                address: vec![10, 1, 2, 3].into(),
+                length: 32,
+            }],
+            destination_ips: vec![XdsAddress {
+                address: vec![10, 4, 5, 6].into(),
+                length: 32,
+            }],
+            destination_ports: vec![8080],
+            ..Default::default()
+        };
+        let auth = XdsRbac {
+            name: "compiled".into(),
+            namespace: "orders".into(),
+            scope: 2,
+            action: 0,
+            rules: vec![crate::xds::istio::security::Rule {
+                clauses: vec![crate::xds::istio::security::Clause {
+                    matches: vec![wire.clone()],
+                }],
+            }],
+            dry_run: false,
+            ..Default::default()
+        };
+        let parsed = Authorization::try_from(auth).unwrap();
+        let positive = Connection {
+            src: "10.1.2.3:42000".parse().unwrap(),
+            dst: "10.4.5.6:8080".parse().unwrap(),
+            src_identity: Some(
+                Identity::from_str("spiffe://cluster-a.mesh/ns/orders/sa/api").unwrap(),
+            ),
+            dst_network: "".into(),
+        };
+        assert!(parsed.matches(&positive));
+        let mut negative = positive.clone();
+        negative.src = "10.1.2.4:42000".parse().unwrap();
+        assert!(
+            !parsed.matches(&negative),
+            "same SA on an unselected source IP is not allowed"
+        );
+        negative = positive.clone();
+        negative.dst = "10.4.5.6:31337".parse().unwrap();
+        assert!(!parsed.matches(&negative));
+        negative = positive.clone();
+        negative.src_identity =
+            Some(Identity::from_str("spiffe://cluster-b.mesh/ns/orders/sa/api").unwrap());
+        assert!(!parsed.matches(&negative));
+        negative = positive;
+        negative.dst = "10.4.5.7:8080".parse().unwrap();
+        assert!(!parsed.matches(&negative));
+        let mut corrupted = wire;
+        corrupted.source_ips[0].length = 288;
+        assert!(RbacMatch::try_from(&corrupted).is_err());
+    }
+    #[test]
+    fn unsupported_extensions_enums_and_malformed_service_accounts_reject() {
+        use crate::xds::istio::workload::Extension;
+        for field in 0..2 {
+            let mut wire = XdsRbac::default();
+            if field == 0 {
+                wire.scope = 99;
+            } else {
+                wire.action = 99;
+            }
+            assert!(Authorization::try_from(wire).is_err());
+        }
+        let wire = XdsRbac {
+            extensions: vec![Extension::default()],
+            ..Default::default()
+        };
+        assert!(Authorization::try_from(wire).is_err());
+        let wire = Match {
+            extensions: vec![Extension::default()],
+            ..Default::default()
+        };
+        assert!(RbacMatch::try_from(&wire).is_err());
+        for (namespace, service_account) in [
+            ("", "api"),
+            ("orders", ""),
+            ("UPPER", "api"),
+            ("orders", "../api"),
+            ("orders", "bad..sa"),
+        ] {
+            for negated in [false, true] {
+                let mut wire = Match::default();
+                let value = XdsServiceAccountMatch {
+                    namespace: namespace.into(),
+                    service_account: service_account.into(),
+                };
+                if negated {
+                    wire.not_service_accounts = vec![value]
+                } else {
+                    wire.service_accounts = vec![value]
+                }
+                assert!(RbacMatch::try_from(&wire).is_err());
+            }
+        }
+        let valid = Match {
+            service_accounts: vec![XdsServiceAccountMatch {
+                namespace: "orders".into(),
+                service_account: "api.v2".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(RbacMatch::try_from(&valid).is_ok());
+    }
+    #[test]
+    fn native_zero_clause_quarantine_matches_all_tcp_ports_and_beats_allow_by_action() {
+        let wire = XdsRbac {
+            name: "cilium_l4_quarantine_test".into(),
+            namespace: "orders".into(),
+            scope: 2,
+            action: 1,
+            rules: vec![crate::xds::istio::security::Rule { clauses: vec![] }],
+            ..Default::default()
+        };
+        let policy = Authorization::try_from(wire).unwrap();
+        assert_eq!(policy.action, RbacAction::Deny);
+        for port in [1, 80, 8080, 31337, 65535] {
+            let conn = Connection {
+                src: "10.1.2.3:42000".parse().unwrap(),
+                dst: format!("10.4.5.6:{port}").parse().unwrap(),
+                src_identity: None,
+                dst_network: "".into(),
+            };
+            assert!(policy.matches(&conn));
+        }
     }
 }

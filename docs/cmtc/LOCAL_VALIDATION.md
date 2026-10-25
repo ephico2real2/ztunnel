@@ -16,6 +16,28 @@ from upstream `master` at `9a17cb0ff35c20977100de3582c1e4435360f618`, with our
 enhancements ported onto that source. The original branch remains available as
 `feat/persistent-inbound-mtls`; its older development history was not rewritten.
 
+## Strict authorization rejection qualification
+
+The current local increment rejects malformed CIDRs, overflowing/zero TCP ports,
+missing string match types, unsupported extensions and malformed service accounts.
+It retains a rejected strict ADS session for at most one second so the queued
+NACK reaches the actual TLS peer. The traffic gate stays closed. Corrections on
+that stream cannot update state or receive an ACK. Recovery requires a new,
+complete session. A workload-specific wildcard DENY overrides a global ALLOW.
+
+The complete ARM64 Podman run passes 515 tests: 465 library, 20 direct and 30
+namespace tests, with zero failed, ignored or filtered tests. Formatting and
+strict Clippy pass after two test-only initializer corrections. The actual TLS
+ADS tests verify NACK delivery, active-flow cancellation, rejected same-stream
+correction and fresh recovery. Native quarantine tests verify all application
+ports and old or recreated policy references.
+
+The earlier ADS test reproduced a dropped NACK before this fix. Its failure log,
+the full passing suite and lint diagnostics are retained in the CMTC repository's
+`docs/evidence/native-issuer-profile/live-provider/` ledger. This source increment
+has not been deployed. It does not qualify cross-cluster membership, effective
+positive authorization, persistent CRL antirollback history or workload mTLS.
+
 ## Changes
 
 - Require verified inbound workload peers independently of whether an

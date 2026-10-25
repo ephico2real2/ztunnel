@@ -843,20 +843,20 @@ impl AdsClient {
             .contains_key(&ISSUER_PROFILE_TYPE)
             .then(|| tokio::time::Instant::now() + self.config.issuer_profile_initial_timeout);
         let mut profile_changes = self.config.profile_provider.as_ref().map(|p| p.subscribe());
-        let mut profile_nack_deadline = None;
+        let mut rejection_deadline = None;
         loop {
             tokio::select! {
                 _ = async {
-                    if let Some(deadline) = profile_nack_deadline { tokio::time::sleep_until(deadline).await; }
+                    if let Some(deadline) = rejection_deadline { tokio::time::sleep_until(deadline).await; }
                     else { std::future::pending::<()>().await; }
-                } => { return Err(Error::RejectedResponse("native issuer profile NACK delivery deadline".into())); }
+                } => { return Err(Error::RejectedResponse("strict xDS NACK delivery deadline".into())); }
                 changed = async {
                     match profile_changes.as_mut() {
                         Some(changes) => changes.changed().await.ok(),
                         None => std::future::pending().await,
                     }
                 } => {
-                    if changed.is_some() && profile_nack_deadline.is_none() && !self.types_to_expect.contains(&ISSUER_PROFILE_TYPE.to_string())
+                    if changed.is_some() && rejection_deadline.is_none() && !self.types_to_expect.contains(&ISSUER_PROFILE_TYPE.to_string())
                         && self.config.profile_provider.as_ref().is_some_and(|p| !p.available_for_session(self.session_generation)) {
                         return Err(Error::RejectedResponse("native issuer profile/session became unavailable".into()));
                     }
@@ -864,11 +864,11 @@ impl AdsClient {
                 _ = async {
                     if let Some(deadline)=profile_initial_deadline { tokio::time::sleep_until(deadline).await; }
                     else { std::future::pending::<()>().await; }
-                }, if !self.types_to_expect.is_empty() => {
+                }, if !self.types_to_expect.is_empty() && rejection_deadline.is_none() => {
                     if let Some(gate)=&self.session_gate{gate.mark_stale(self.session_generation);}
                     return Err(Error::RejectedResponse("issuer-profile initial snapshot deadline exceeded".into()));
                 }
-                _demand_event = self.state.demand.recv() => {
+                _demand_event = self.state.demand.recv(), if rejection_deadline.is_none() => {
                     self.handle_demand_event(_demand_event, &discovery_req_tx).await?;
                 }
                 msg = response_stream.message() => {
@@ -877,8 +877,11 @@ impl AdsClient {
                         // This could be an explicit OK response, or if the stream is reset without a gRPC status.
                         return Ok(());
                     };
-                    if profile_nack_deadline.is_some() {
-                        return Err(Error::RejectedResponse("native issuer profile NACK requires a new complete session".into()));
+                    if rejection_deadline.is_some() {
+                        // This epoch is irreversibly fenced. Keep polling only
+                        // to let the outbound NACK reach the peer or the fixed
+                        // deadline expire; later corrections cannot mutate it.
+                        continue;
                     }
                     // Strict mode accepts one complete initial response for
                     // each required type. Any later security delta forces a
@@ -915,27 +918,22 @@ impl AdsClient {
                             ));
                         }
                     }
-                    let is_profile_response=msg.type_url==ISSUER_PROFILE_TYPE.to_string();
                     let received_type = (!self.types_to_expect.is_empty())
                         .then(|| msg.type_url.clone());
                     let signal = self.handle_stream_event(msg, &discovery_req_tx).await?;
                     if let XdsSignal::Nack = signal {
-                        // Keep this fenced stream alive long enough for the
-                        // peer to read the NACK. The server closes on NACK;
-                        // the initial deadline bounds an unresponsive peer.
-                        // Never count this response toward readiness.
-                        if is_profile_response {
-                            if self.config.profile_provider.is_some() { profile_nack_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1)); }
-                            continue;
-                        }
+                        // handle_stream_event revoked the gate before enqueueing
+                        // the NACK. Returning here can drop the tonic outbound
+                        // queue before the peer sees it. Retain this CLOSED
+                        // stream for one bounded delivery window. No response,
+                        // demand, profile renewal or initial-sync completion is
+                        // allowed to reactivate the rejected epoch.
                         if self.session_gate.is_some() {
-                            return Err(Error::RejectedResponse(
-                                received_type.unwrap_or_else(|| "unknown type".to_string()),
-                            ));
+                            rejection_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
                         }
-                        // Ungated clients retain their last accepted versions
-                        // and allow corrected responses on the same stream.
-                        // A NACK must not satisfy initial readiness.
+                        // Ungated clients preserve upstream recovery semantics.
+                        // The initial profile deadline still bounds a probe
+                        // configured without a strict session gate.
                         continue;
                     }
                     if let Some(received_type) = received_type {
@@ -2724,5 +2722,356 @@ mod tests {
         );
         supervisor.abort();
         let _ = supervisor.await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_policy_tls_ads_nacks_drains_and_requires_fresh_recovery() {
+        use crate::proxy::connection_manager::{ConnectionManager, PolicyWatcher};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let gate = XdsSessionGate::new();
+        let (mut connections, client, state, _) =
+            AdsServer::spawn_with_session_gate(false, Some(gate.clone())).await;
+        let manager = ConnectionManager::default();
+        let (stop_tx, stop) = crate::drain::new();
+        let watcher = tokio::spawn(PolicyWatcher::new(state.clone(), stop, manager.clone()).run());
+        let task = tokio::spawn(client.run());
+        let allow_resource = || {
+            let mut wire =
+                XdsAuthorization::decode(get_auth(0).resource.unwrap().value.as_slice()).unwrap();
+            wire.action = crate::xds::istio::security::Action::Allow as i32;
+            wire.rules = vec![crate::xds::istio::security::Rule { clauses: vec![] }];
+            ProtoResource {
+                name: "default/allow".into(),
+                version: "1".into(),
+                resource: Some(Any {
+                    type_url: AUTHORIZATION_TYPE.to_string(),
+                    value: wire.encode_to_vec(),
+                }),
+                ..Default::default()
+            }
+        };
+        let bad_resource = || {
+            let mut wire =
+                XdsAuthorization::decode(allow_resource().resource.unwrap().value.as_slice())
+                    .unwrap();
+            wire.rules = vec![crate::xds::istio::security::Rule {
+                clauses: vec![crate::xds::istio::security::Clause {
+                    matches: vec![crate::xds::istio::security::Match {
+                        source_ips: vec![crate::xds::istio::security::Address {
+                            address: vec![10, 1, 2].into(),
+                            length: 32,
+                        }],
+                        destination_ports: vec![8080],
+                        ..Default::default()
+                    }],
+                }],
+            }];
+            ProtoResource {
+                name: "default/bad".into(),
+                version: "2".into(),
+                resource: Some(Any {
+                    type_url: AUTHORIZATION_TYPE.to_string(),
+                    value: wire.encode_to_vec(),
+                }),
+                ..Default::default()
+            }
+        };
+        let address_response = || DeltaDiscoveryResponse {
+            type_url: ADDRESS_TYPE.to_string(),
+            nonce: "addr".into(),
+            resources: vec![get_address_with_uid_resource_name(
+                0,
+                "10.0.0.8".parse().unwrap(),
+            )],
+            ..Default::default()
+        };
+        let mut first = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for expected in [ADDRESS_TYPE, AUTHORIZATION_TYPE] {
+            assert_eq!(first.rx.recv().await.unwrap().type_url, expected);
+        }
+        first.tx.send(Ok(address_response())).await.unwrap();
+        first
+            .tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: AUTHORIZATION_TYPE.to_string(),
+                nonce: "good".into(),
+                resources: vec![allow_resource()],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            assert!(
+                tokio::time::timeout(Duration::from_secs(2), first.rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .error_detail
+                    .is_none()
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !gate.is_open() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let destination = state
+            .read()
+            .workloads
+            .find_uid(&strng::new("default/foo0"))
+            .unwrap();
+        let ctx = crate::state::ProxyRbacContext {
+            dest_workload: destination,
+            conn: crate::rbac::Connection {
+                src: "10.0.0.9:42000".parse().unwrap(),
+                dst: "10.0.0.8:8080".parse().unwrap(),
+                dst_network: "".into(),
+                src_identity: Some("spiffe://local/ns/default/sa/default".parse().unwrap()),
+            },
+        };
+        assert!(state.assert_rbac(&ctx).await.is_ok());
+        let mut inbound = manager.assert_rbac(&state, &ctx, None).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.write_all(b"A").await.unwrap();
+        let mut byte = [0];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 1);
+        assert_eq!(byte, *b"A");
+        let flow = tokio::spawn(async move {
+            let ack = inbound.watcher().wait_for_drain().await;
+            drop(socket);
+            drop(ack);
+            drop(inbound);
+        });
+        // A later security delta is fenced before application by design. It must
+        // close the strict stream, rather than preserving any earlier ALLOW.
+        first
+            .tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: AUTHORIZATION_TYPE.to_string(),
+                nonce: "live-bad".into(),
+                resources: vec![bad_resource()],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), peer.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "real tracked socket must close through the production watcher"
+        );
+        tokio::time::timeout(Duration::from_secs(2), flow)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!gate.is_open());
+        assert!(state.assert_rbac(&ctx).await.is_err());
+        let mut second = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for expected in [ADDRESS_TYPE, AUTHORIZATION_TYPE] {
+            let req = second.rx.recv().await.unwrap();
+            assert_eq!(req.type_url, expected);
+            assert!(req.initial_resource_versions.is_empty());
+        }
+        assert!(
+            state
+                .read()
+                .policies
+                .get(&strng::new("default/allow"))
+                .is_none(),
+            "old ALLOW must be removed before the fresh epoch"
+        );
+        second.tx.send(Ok(address_response())).await.unwrap();
+        assert!(second.rx.recv().await.unwrap().error_detail.is_none());
+        second
+            .tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: AUTHORIZATION_TYPE.to_string(),
+                nonce: "initial-bad".into(),
+                resources: vec![allow_resource(), bad_resource()],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let nack = tokio::time::timeout(Duration::from_secs(2), second.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(nack.response_nonce, "initial-bad");
+        assert!(nack.error_detail.is_some());
+        assert!(!gate.is_open());
+        assert!(
+            state
+                .read()
+                .policies
+                .get(&strng::new("default/allow"))
+                .is_none(),
+            "semantically invalid batch must not partially insert ALLOW"
+        );
+        let mut third = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for expected in [ADDRESS_TYPE, AUTHORIZATION_TYPE] {
+            assert_eq!(third.rx.recv().await.unwrap().type_url, expected);
+        }
+        third.tx.send(Ok(address_response())).await.unwrap();
+        assert!(third.rx.recv().await.unwrap().error_detail.is_none());
+        assert!(!gate.is_open());
+        third
+            .tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: AUTHORIZATION_TYPE.to_string(),
+                nonce: "recovered".into(),
+                resources: vec![allow_resource()],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(third.rx.recv().await.unwrap().error_detail.is_none());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !gate.is_open() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.assert_rbac(&ctx).await.is_ok());
+        task.abort();
+        let _ = task.await;
+        stop_tx
+            .start_drain_and_wait(crate::drain::DrainMode::Immediate)
+            .await;
+        watcher.await.unwrap();
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn strict_policy_nack_delivery_deadline_rejects_same_stream_correction() {
+        let gate = XdsSessionGate::new();
+        let (mut connections, client, state, _) =
+            AdsServer::spawn_with_session_gate(false, Some(gate.clone())).await;
+        let task = tokio::spawn(client.run());
+        let mut first = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for expected in [ADDRESS_TYPE, AUTHORIZATION_TYPE] {
+            assert_eq!(first.rx.recv().await.unwrap().type_url, expected);
+        }
+        let mut wire =
+            XdsAuthorization::decode(get_auth(0).resource.unwrap().value.as_slice()).unwrap();
+        wire.action = crate::xds::istio::security::Action::Allow as i32;
+        wire.rules = vec![crate::xds::istio::security::Rule {
+            clauses: vec![crate::xds::istio::security::Clause {
+                matches: vec![crate::xds::istio::security::Match {
+                    destination_ports: vec![65536],
+                    ..Default::default()
+                }],
+            }],
+        }];
+        let bad = ProtoResource {
+            name: "default/rejected".into(),
+            version: "1".into(),
+            resource: Some(Any {
+                type_url: AUTHORIZATION_TYPE.to_string(),
+                value: wire.encode_to_vec(),
+            }),
+            ..Default::default()
+        };
+        first
+            .tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: AUTHORIZATION_TYPE.to_string(),
+                nonce: "must-be-delivered".into(),
+                resources: vec![bad],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let nack = tokio::time::timeout(Duration::from_secs(2), first.rx.recv())
+            .await
+            .unwrap()
+            .expect("strict typed-policy NACK must reach the actual TLS ADS peer");
+        assert_eq!(nack.response_nonce, "must-be-delivered");
+        assert!(nack.error_detail.is_some());
+        assert!(!gate.is_open());
+        assert!(
+            state
+                .read()
+                .policies
+                .get(&strng::new("default/rejected"))
+                .is_none()
+        );
+        // A server which keeps the rejected stream open must not be able to
+        // revive it with apparently valid data or postpone its fixed deadline.
+        first
+            .tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: AUTHORIZATION_TYPE.to_string(),
+                nonce: "correction-cannot-ack".into(),
+                resources: vec![get_auth(0)],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        first
+            .tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: ADDRESS_TYPE.to_string(),
+                nonce: "address-cannot-ack".into(),
+                resources: vec![get_address_with_uid_resource_name(
+                    0,
+                    "10.0.0.8".parse().unwrap(),
+                )],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), first.rx.recv())
+                .await
+                .expect("rejected stream deadline must be bounded")
+                .is_none(),
+            "fenced corrections must produce no ACK"
+        );
+        assert!(!gate.is_open());
+        assert!(
+            state.read().policies.get(&strng::new("foo0")).is_none(),
+            "same-stream correction was applied"
+        );
+        assert!(
+            state
+                .read()
+                .workloads
+                .find_uid(&strng::new("default/foo0"))
+                .is_none(),
+            "same-stream Address was applied"
+        );
+        let mut fresh = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for expected in [ADDRESS_TYPE, AUTHORIZATION_TYPE] {
+            let req = fresh.rx.recv().await.unwrap();
+            assert_eq!(req.type_url, expected);
+            assert!(req.initial_resource_versions.is_empty());
+        }
+        assert!(
+            !gate.is_open(),
+            "reconnect is not complete initial synchronization"
+        );
+        task.abort();
+        let _ = task.await;
     }
 }
