@@ -646,6 +646,70 @@ impl AnchorPublication {
         }
         Ok(())
     }
+    /// Revoke every currently approved issuer, including the local domain, at a
+    /// single authenticated publication sequence. This is an authoritative
+    /// tombstone, NOT an API/ADS availability or freshness failure.
+    ///
+    /// Existing revocation and retained-connection history is cumulative. The
+    /// organizational authority/local-domain identity is retained for a later
+    /// explicitly authorized restore, but no issuer remains usable. Build the
+    /// returned value first, then publish it under the runtime's single writer;
+    /// this helper itself does not swap live TLS verifiers or drain sockets.
+    pub fn withdraw_all(&self, sequence: u64) -> Result<Self, AnchorError> {
+        self.require_newer(sequence)?;
+        let mut next = self.clone();
+        for pin in self.set.by_domain.values().flatten() {
+            next.bundle_fenced.insert(pin.spki_der.clone());
+            next.drain_admitted_before
+                .insert(pin.spki_der.clone(), sequence);
+        }
+        next.set.by_domain.clear();
+        next.set.generation = sequence;
+        Ok(next)
+    }
+
+    /// Apply one complete, independently approved authority decision, including
+    /// restoring multiple withdrawn domains at one publication sequence.
+    ///
+    /// The caller must authorize the *logical approval generation* separately
+    /// from candidate.generation (the producer publication sequence). A lease
+    /// renewal or same-generation replay is not restore authority. Ordinary
+    /// snapshots must continue to use replace(), which rejects withdrawn keys.
+    /// This does not approve a new organizational root or local-domain identity.
+    pub fn restore_authoritative_snapshot(
+        &self,
+        candidate: DomainAnchorSet,
+    ) -> Result<Self, AnchorError> {
+        self.require_newer(candidate.generation)?;
+        if candidate.local_domain != self.set.local_domain
+            || candidate.organizational_root != self.set.organizational_root
+        {
+            return Err(AnchorError::ChangedProfileAuthority);
+        }
+        let mut next = self.clone();
+        // Removed keys remain revoked even when the same transaction restores
+        // other keys. Preserve history for issuers absent from both snapshots.
+        for old in self.set.by_domain.values().flatten() {
+            if !candidate.by_domain.values().flatten().any(|pin| pin == old) {
+                next.bundle_fenced.insert(old.spki_der.clone());
+                next.drain_admitted_before
+                    .insert(old.spki_der.clone(), candidate.generation);
+            }
+        }
+        for pin in candidate.by_domain.values().flatten() {
+            let was_fenced = self.bundle_fenced.contains(&pin.spki_der);
+            let unchanged = self.set.by_domain.values().flatten().any(|old| old == pin);
+            next.bundle_fenced.remove(&pin.spki_der);
+            if was_fenced || !unchanged {
+                // A restored key may authenticate a new connection, but cannot
+                // resurrect a connection admitted before this decision.
+                next.drain_admitted_before
+                    .insert(pin.spki_der.clone(), candidate.generation);
+            }
+        }
+        next.set = candidate;
+        Ok(next)
+    }
     pub fn withdraw_pin(
         &self,
         domain: &Strng,
@@ -1465,5 +1529,302 @@ mod tests {
             retained_tunnel(&tunnel, &publication, expected),
             RetainedDecision::Drain
         );
+    }
+    #[test]
+    fn all_domain_tombstone_revokes_rotation_overlap_and_local_domain_in_one_sequence() {
+        let (root, a, b, _) = fixture();
+        let a2 = CertifiedIssuer::signed_by(
+            ca_params("a-rotation"),
+            KeyPair::generate().unwrap(),
+            &root,
+        )
+        .unwrap();
+        let c = CertifiedIssuer::signed_by(ca_params("c"), KeyPair::generate().unwrap(), &root)
+            .unwrap();
+        let domains = [A, A, B, "cmtc-c.mesh.example"];
+        let issuers = [&a, &a2, &b, &c];
+        let pins: Vec<_> = domains
+            .iter()
+            .zip(issuers)
+            .map(|(domain, issuer)| {
+                pin_from_certificate((*domain).into(), issuer.der().clone()).unwrap()
+            })
+            .collect();
+        let set = DomainAnchorSet::try_new(A.into(), root.der().clone(), 10, pins.clone()).unwrap();
+        let old = AnchorPublication::initial(set);
+        let next = old.withdraw_all(11).unwrap();
+        assert_eq!(old.generation(), 10);
+        assert_eq!(old.current_signer_ders(SystemTime::now()).len(), 4);
+        assert_eq!(next.generation(), 11);
+        assert_eq!(next.anchors().local_domain(), &Strng::from(A));
+        assert_eq!(next.set.organizational_root, old.set.organizational_root);
+        assert!(next.current_signer_ders(SystemTime::now()).is_empty());
+        assert!(next.set.by_domain.is_empty());
+        for ((domain, issuer), pin) in domains.iter().zip(issuers).zip(pins) {
+            let uri = format!("spiffe://{domain}/ns/orders/sa/api");
+            let certificate = leaf(&[&uri], issuer);
+            let retained = verify_peer_evidence(
+                &certificate,
+                &[],
+                old.anchors(),
+                UnixTime::now(),
+                PeerRole::Client,
+            )
+            .unwrap()
+            .retained_tunnel();
+            assert!(next.bundle_fenced(&pin.spki_der));
+            assert_eq!(next.drain_admitted_before.get(&pin.spki_der), Some(&11));
+            assert!(
+                next.current_unfenced_signer(&(*domain).into(), &pin.spki_der, SystemTime::now())
+                    .is_none()
+            );
+            assert_eq!(
+                retained_tunnel(&retained, &next, SystemTime::now()),
+                RetainedDecision::Drain
+            );
+            for role in [PeerRole::Client, PeerRole::Server] {
+                assert!(
+                    verify_peer_evidence(&certificate, &[], next.anchors(), UnixTime::now(), role)
+                        .is_err()
+                );
+            }
+            assert!(matches!(
+                next.observe_bundle(
+                    &(*domain).into(),
+                    BundleFetch::Authorities(vec![issuer.der().clone()]),
+                    SystemTime::now()
+                ),
+                BundleObservation::Rejected(AnchorError::WithdrawnIssuer { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn all_domain_tombstone_is_strictly_sequenced_and_preserves_prior_history() {
+        let (_, _, _, set) = fixture();
+        let b_spki = set.pin_spkis(&B.into()).pop().unwrap();
+        let a_spki = set.pin_spkis(&A.into()).pop().unwrap();
+        let partial = AnchorPublication::initial(set)
+            .withdraw_pin(&B.into(), &b_spki, 2)
+            .unwrap();
+        let all = partial.withdraw_all(3).unwrap();
+        assert_eq!(all.drain_admitted_before.get(&b_spki), Some(&2));
+        assert_eq!(all.drain_admitted_before.get(&a_spki), Some(&3));
+        for sequence in [0, 1, 2, 3] {
+            let before = all.clone();
+            assert_eq!(
+                all.withdraw_all(sequence),
+                Err(AnchorError::StaleGeneration {
+                    current: 3,
+                    candidate: sequence
+                })
+            );
+            assert_eq!(all, before);
+        }
+        let repeated = all.withdraw_all(4).unwrap();
+        assert_eq!(repeated.generation(), 4);
+        assert_eq!(repeated.bundle_fenced, all.bundle_fenced);
+        assert_eq!(repeated.drain_admitted_before, all.drain_admitted_before);
+        assert!(repeated.set.by_domain.is_empty());
+    }
+
+    #[test]
+    fn all_domain_tombstone_cannot_be_restored_by_an_ordinary_snapshot() {
+        let (_, a, b, set) = fixture();
+        let evidence: Vec<_> = [(&a, URI_A), (&b, URI_B)]
+            .iter()
+            .map(|(issuer, uri)| {
+                verify_peer_evidence(
+                    &leaf(&[uri], issuer),
+                    &[],
+                    &set,
+                    UnixTime::now(),
+                    PeerRole::Client,
+                )
+                .unwrap()
+                .retained_tunnel()
+            })
+            .collect();
+        let all = AnchorPublication::initial(set.clone())
+            .withdraw_all(2)
+            .unwrap();
+        assert_eq!(
+            all.replace(set.with_generation(3).unwrap()),
+            Err(AnchorError::WithdrawnSnapshot { candidate: 3 })
+        );
+        let restored = all
+            .restore_authoritative_snapshot(set.with_generation(3).unwrap())
+            .unwrap();
+        assert_eq!(restored.generation(), 3);
+        assert_eq!(restored.current_signer_ders(SystemTime::now()).len(), 2);
+        for (i, (issuer, uri)) in [(&a, URI_A), (&b, URI_B)].iter().enumerate() {
+            assert_eq!(
+                retained_tunnel(&evidence[i], &restored, SystemTime::now()),
+                RetainedDecision::Drain
+            );
+            let fresh = verify_peer_evidence(
+                &leaf(&[uri], issuer),
+                &[],
+                restored.anchors(),
+                UnixTime::now(),
+                PeerRole::Client,
+            )
+            .unwrap()
+            .retained_tunnel();
+            assert_eq!(
+                retained_tunnel(&fresh, &restored, SystemTime::now()),
+                RetainedDecision::Keep
+            );
+        }
+        // Same-approval renewals use replace(), retain the drain floor, and do
+        // not resurrect pre-revocation retained tunnels.
+        let renewed = restored
+            .replace(restored.anchors().with_generation(4).unwrap())
+            .unwrap();
+        assert_eq!(
+            renewed.drain_admitted_before,
+            restored.drain_admitted_before
+        );
+        for retained in evidence {
+            assert_eq!(
+                retained_tunnel(&retained, &renewed, SystemTime::now()),
+                RetainedDecision::Drain
+            );
+        }
+    }
+
+    #[test]
+    fn authoritative_snapshot_restore_preserves_unaffected_live_connections() {
+        let (_, a, b, set) = fixture();
+        let a_tunnel = verify_peer_evidence(
+            &leaf(&[URI_A], &a),
+            &[],
+            &set,
+            UnixTime::now(),
+            PeerRole::Client,
+        )
+        .unwrap()
+        .retained_tunnel();
+        let b_tunnel = verify_peer_evidence(
+            &leaf(&[URI_B], &b),
+            &[],
+            &set,
+            UnixTime::now(),
+            PeerRole::Client,
+        )
+        .unwrap()
+        .retained_tunnel();
+        let b_spki = set.pin_spkis(&B.into()).pop().unwrap();
+        let partial = AnchorPublication::initial(set.clone())
+            .withdraw_pin(&B.into(), &b_spki, 2)
+            .unwrap();
+        let restored = partial
+            .restore_authoritative_snapshot(set.with_generation(3).unwrap())
+            .unwrap();
+        assert_eq!(
+            retained_tunnel(&a_tunnel, &restored, SystemTime::now()),
+            RetainedDecision::Keep
+        );
+        assert_eq!(
+            retained_tunnel(&b_tunnel, &restored, SystemTime::now()),
+            RetainedDecision::Drain
+        );
+        assert_eq!(restored.drain_admitted_before.get(&b_spki), Some(&3));
+    }
+
+    #[test]
+    fn authoritative_snapshot_keeps_absent_issuer_history_and_revokes_simultaneous_removals() {
+        let (root, a, _, set) = fixture();
+        let old_a = set.pin_spkis(&A.into()).pop().unwrap();
+        let old_b = set.pin_spkis(&B.into()).pop().unwrap();
+        let a2 =
+            CertifiedIssuer::signed_by(ca_params("new-a"), KeyPair::generate().unwrap(), &root)
+                .unwrap();
+        let b2 =
+            CertifiedIssuer::signed_by(ca_params("new-b"), KeyPair::generate().unwrap(), &root)
+                .unwrap();
+        let partial = AnchorPublication::initial(set.clone())
+            .withdraw_pin(&B.into(), &old_b, 2)
+            .unwrap();
+        let candidate = DomainAnchorSet::try_new(
+            A.into(),
+            root.der().clone(),
+            3,
+            vec![
+                pin_from_certificate(A.into(), a2.der().clone()).unwrap(),
+                pin_from_certificate(B.into(), b2.der().clone()).unwrap(),
+            ],
+        )
+        .unwrap();
+        let restored = partial.restore_authoritative_snapshot(candidate).unwrap();
+        assert!(restored.bundle_fenced(&old_a));
+        assert!(restored.bundle_fenced(&old_b));
+        assert_eq!(restored.drain_admitted_before.get(&old_b), Some(&2));
+        assert_eq!(restored.drain_admitted_before.get(&old_a), Some(&3));
+        assert!(restored.replace(set.with_generation(4).unwrap()).is_err());
+        assert!(
+            verify_peer_evidence(
+                &leaf(&[URI_A], &a),
+                &[],
+                restored.anchors(),
+                UnixTime::now(),
+                PeerRole::Client
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn authoritative_snapshot_rejects_changed_authority_or_stale_sequence_without_mutation() {
+        let (_, _, _, set) = fixture();
+        let all = AnchorPublication::initial(set.clone())
+            .withdraw_all(2)
+            .unwrap();
+        let before = all.clone();
+        for sequence in [1, 2] {
+            let mut stale = set.clone();
+            stale.generation = sequence;
+            assert_eq!(
+                all.restore_authoritative_snapshot(stale),
+                Err(AnchorError::StaleGeneration {
+                    current: 2,
+                    candidate: sequence
+                })
+            );
+            assert_eq!(all, before);
+        }
+        let mut changed_local = set.with_generation(3).unwrap();
+        changed_local.local_domain = B.into();
+        assert_eq!(
+            all.restore_authoritative_snapshot(changed_local),
+            Err(AnchorError::ChangedProfileAuthority)
+        );
+        let (_, _, _, other_root_set) = fixture();
+        assert_eq!(
+            all.restore_authoritative_snapshot(other_root_set.with_generation(3).unwrap()),
+            Err(AnchorError::ChangedProfileAuthority)
+        );
+        assert_eq!(all, before);
+        assert!(
+            DomainAnchorSet::try_new(A.into(), set.organizational_root.clone(), 3, vec![]).is_err()
+        );
+    }
+
+    #[test]
+    fn all_domain_tombstone_at_maximum_sequence_remains_closed_without_overflow() {
+        let (_, _, _, set) = fixture();
+        let all = AnchorPublication::initial(set)
+            .withdraw_all(u64::MAX)
+            .unwrap();
+        assert_eq!(all.generation(), u64::MAX);
+        assert!(all.current_signer_ders(SystemTime::now()).is_empty());
+        assert_eq!(
+            all.withdraw_all(u64::MAX),
+            Err(AnchorError::StaleGeneration {
+                current: u64::MAX,
+                candidate: u64::MAX
+            })
+        );
+        assert!(all.withdraw_all(1).is_err());
     }
 }

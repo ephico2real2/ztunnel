@@ -17,6 +17,7 @@ mod control;
 pub mod crl;
 pub mod csr;
 pub mod domain_anchors;
+pub mod issuer_profile_wire;
 mod lib;
 #[cfg(any(test, feature = "testing"))]
 pub mod mock;

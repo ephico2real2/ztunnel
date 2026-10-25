@@ -1,0 +1,49 @@
+{
+  "description": "PUBLIC TEST ONLY; no signing keys retained; evaluate at nowUnix",
+  "nowUnix": "1792893634",
+  "approvalJSON": "{\"schemaVersion\":1,\"generation\":7,\"expiresAt\":\"2026-10-26T02:00:33Z\",\"roots\":[{\"certificatePEM\":\"-----BEGIN CERTIFICATE-----\\nMIIBkDCCATegAwIBAgIBATAKBggqhkjOPQQDAjAeMRwwGgYDVQQDDBNDTVRDIFRF\\nU1QgT05MWSBST09UMB4XDTI2MTAyNTAyMDAzMVoXDTI4MTAyNDAyMDAzMVowHjEc\\nMBoGA1UEAwwTQ01UQyBURVNUIE9OTFkgUk9PVDBZMBMGByqGSM49AgEGCCqGSM49\\nAwEHA0IABIe7pZPAYFFYLmWhtXxXqJu8gDoZtsEabCguIBR2Lixxlou7wBS+/NJM\\noVdm6ivRxRVlo+zS4U4AEW0e3ecrYVGjZjBkMBIGA1UdEwEB/wQIMAYBAf8CAQEw\\nDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBQdgeOdf9C1JIvdHPLIrrA0yKcMgTAf\\nBgNVHSMEGDAWgBQdgeOdf9C1JIvdHPLIrrA0yKcMgTAKBggqhkjOPQQDAgNHADBE\\nAiAjK1NfR6F1JtcNBs3Vhg+N6nykTIQorEq4r7PqhqBWJQIgOmZN3fAEiv0lDikQ\\nym+QTRd5Ti0z70Q1iyNDatxPAwc=\\n-----END CERTIFICATE-----\\n\",\"sha256\":\"49a85f5a391f5585f5a91dfdaa9ce2ced3c9c9c69f02f47ad37b4b36d5e5beaf\"}],\"clusters\":[{\"clusterID\":\"cmtc-a\",\"trustDomain\":\"cmtc-a.mesh.example\",\"issuers\":[{\"certificatePEM\":\"-----BEGIN CERTIFICATE-----\\nMIIBlTCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAeMRwwGgYDVQQDDBNDTVRDIFRF\\nU1QgT05MWSBST09UMB4XDTI2MTAyNTAyMDAzMVoXDTI3MTAyNTAyMDAzMVowIjEg\\nMB4GA1UEAwwXQ01UQyBURVNUIE9OTFkgSVNTVUVSIGEwWTATBgcqhkjOPQIBBggq\\nhkjOPQMBBwNCAAS7a8QSDxLeRFRE32QyCCQMFiRighl91SWAgaQwhfiZgcrQXyx8\\nzAVCh/fmh+A1fINcijkaHq/WKfIpEje1GO3Ho2YwZDASBgNVHRMBAf8ECDAGAQH/\\nAgEAMA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQUF+M7aZXdplciEWrLPBGeW8aZ\\nezEwHwYDVR0jBBgwFoAUHYHjnX/QtSSL3RzyyK6wNMinDIEwCgYIKoZIzj0EAwID\\nSAAwRQIgIPpUlVBQHMvSTDvKmYTzgCvaclZcexIOUr7WhnVHsTMCIQCmEkr2vDif\\nsmoKljCePXbXMfW0XjUqCc6GHBN0VnU6Ow==\\n-----END CERTIFICATE-----\\n\",\"spkiSHA256\":\"e38ffcc1dd5c2bda4d03ef7daaa380065aa4faefc1d3d8e258ee9bbf7a79099c\",\"rootSHA256\":\"49a85f5a391f5585f5a91dfdaa9ce2ced3c9c9c69f02f47ad37b4b36d5e5beaf\"}]},{\"clusterID\":\"cmtc-b\",\"trustDomain\":\"cmtc-b.mesh.example\",\"issuers\":[{\"certificatePEM\":\"-----BEGIN CERTIFICATE-----\\nMIIBlTCCATugAwIBAgIBAzAKBggqhkjOPQQDAjAeMRwwGgYDVQQDDBNDTVRDIFRF\\nU1QgT05MWSBST09UMB4XDTI2MTAyNTAyMDAzMVoXDTI3MTAyNTAyMDAzMVowIjEg\\nMB4GA1UEAwwXQ01UQyBURVNUIE9OTFkgSVNTVUVSIGIwWTATBgcqhkjOPQIBBggq\\nhkjOPQMBBwNCAAQ9vFqFTdhOQdMNt8m9CJI5s/ZIYOIm/zEPpWRMLyd0+nZ5+vF0\\nsT+kxOH0HXB/eS65OaUu9a5tM9DkaGAyhN0Ao2YwZDASBgNVHRMBAf8ECDAGAQH/\\nAgEAMA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQUJE7cZCrI2dOFo6m8h+Mvk78e\\nmjkwHwYDVR0jBBgwFoAUHYHjnX/QtSSL3RzyyK6wNMinDIEwCgYIKoZIzj0EAwID\\nSAAwRQIhAIdZ+b8+yOzowizevCBEpRz6NYVgRirawfDZtSyzxEvhAiABghVWePZw\\n83Zgi0HM4tgCx3TYTazcISLBlXoCYQnV9Q==\\n-----END CERTIFICATE-----\\n\",\"spkiSHA256\":\"c9fdac805287676b27571a967fe665b076934592daded9a422b22b7f772fb402\",\"rootSHA256\":\"49a85f5a391f5585f5a91dfdaa9ce2ced3c9c9c69f02f47ad37b4b36d5e5beaf\"}]}]}",
+  "publicationJSON": "{\"schemaVersion\":1,\"sequence\":10,\"state\":\"published\",\"reason\":\"Validated\",\"producerCluster\":\"cmtc-a\",\"outputUID\":\"fixture-output-uid\",\"expectedSourceUID\":\"fixture-source-uid\",\"source\":{\"namespace\":\"cmtc-system\",\"name\":\"issuer-approval\",\"uid\":\"fixture-source-uid\",\"resourceVersion\":\"17\",\"generation\":7},\"acceptedGeneration\":7,\"acceptedSourceUID\":\"fixture-source-uid\",\"acceptedApprovalDigest\":\"63d2ff33b79505477b45c873524f96641bc605242686a8c99274cb8b3b9b065e\",\"approvalDigest\":\"63d2ff33b79505477b45c873524f96641bc605242686a8c99274cb8b3b9b065e\",\"approval\":{\"schemaVersion\":1,\"generation\":7,\"expiresAt\":\"2026-10-26T02:00:33Z\",\"roots\":[{\"certificatePEM\":\"-----BEGIN CERTIFICATE-----\\nMIIBkDCCATegAwIBAgIBATAKBggqhkjOPQQDAjAeMRwwGgYDVQQDDBNDTVRDIFRF\\nU1QgT05MWSBST09UMB4XDTI2MTAyNTAyMDAzMVoXDTI4MTAyNDAyMDAzMVowHjEc\\nMBoGA1UEAwwTQ01UQyBURVNUIE9OTFkgUk9PVDBZMBMGByqGSM49AgEGCCqGSM49\\nAwEHA0IABIe7pZPAYFFYLmWhtXxXqJu8gDoZtsEabCguIBR2Lixxlou7wBS+/NJM\\noVdm6ivRxRVlo+zS4U4AEW0e3ecrYVGjZjBkMBIGA1UdEwEB/wQIMAYBAf8CAQEw\\nDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBQdgeOdf9C1JIvdHPLIrrA0yKcMgTAf\\nBgNVHSMEGDAWgBQdgeOdf9C1JIvdHPLIrrA0yKcMgTAKBggqhkjOPQQDAgNHADBE\\nAiAjK1NfR6F1JtcNBs3Vhg+N6nykTIQorEq4r7PqhqBWJQIgOmZN3fAEiv0lDikQ\\nym+QTRd5Ti0z70Q1iyNDatxPAwc=\\n-----END CERTIFICATE-----\\n\",\"sha256\":\"49a85f5a391f5585f5a91dfdaa9ce2ced3c9c9c69f02f47ad37b4b36d5e5beaf\"}],\"clusters\":[{\"clusterID\":\"cmtc-a\",\"trustDomain\":\"cmtc-a.mesh.example\",\"issuers\":[{\"certificatePEM\":\"-----BEGIN CERTIFICATE-----\\nMIIBlTCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAeMRwwGgYDVQQDDBNDTVRDIFRF\\nU1QgT05MWSBST09UMB4XDTI2MTAyNTAyMDAzMVoXDTI3MTAyNTAyMDAzMVowIjEg\\nMB4GA1UEAwwXQ01UQyBURVNUIE9OTFkgSVNTVUVSIGEwWTATBgcqhkjOPQIBBggq\\nhkjOPQMBBwNCAAS7a8QSDxLeRFRE32QyCCQMFiRighl91SWAgaQwhfiZgcrQXyx8\\nzAVCh/fmh+A1fINcijkaHq/WKfIpEje1GO3Ho2YwZDASBgNVHRMBAf8ECDAGAQH/\\nAgEAMA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQUF+M7aZXdplciEWrLPBGeW8aZ\\nezEwHwYDVR0jBBgwFoAUHYHjnX/QtSSL3RzyyK6wNMinDIEwCgYIKoZIzj0EAwID\\nSAAwRQIgIPpUlVBQHMvSTDvKmYTzgCvaclZcexIOUr7WhnVHsTMCIQCmEkr2vDif\\nsmoKljCePXbXMfW0XjUqCc6GHBN0VnU6Ow==\\n-----END CERTIFICATE-----\\n\",\"spkiSHA256\":\"e38ffcc1dd5c2bda4d03ef7daaa380065aa4faefc1d3d8e258ee9bbf7a79099c\",\"rootSHA256\":\"49a85f5a391f5585f5a91dfdaa9ce2ced3c9c9c69f02f47ad37b4b36d5e5beaf\"}]},{\"clusterID\":\"cmtc-b\",\"trustDomain\":\"cmtc-b.mesh.example\",\"issuers\":[{\"certificatePEM\":\"-----BEGIN CERTIFICATE-----\\nMIIBlTCCATugAwIBAgIBAzAKBggqhkjOPQQDAjAeMRwwGgYDVQQDDBNDTVRDIFRF\\nU1QgT05MWSBST09UMB4XDTI2MTAyNTAyMDAzMVoXDTI3MTAyNTAyMDAzMVowIjEg\\nMB4GA1UEAwwXQ01UQyBURVNUIE9OTFkgSVNTVUVSIGIwWTATBgcqhkjOPQIBBggq\\nhkjOPQMBBwNCAAQ9vFqFTdhOQdMNt8m9CJI5s/ZIYOIm/zEPpWRMLyd0+nZ5+vF0\\nsT+kxOH0HXB/eS65OaUu9a5tM9DkaGAyhN0Ao2YwZDASBgNVHRMBAf8ECDAGAQH/\\nAgEAMA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQUJE7cZCrI2dOFo6m8h+Mvk78e\\nmjkwHwYDVR0jBBgwFoAUHYHjnX/QtSSL3RzyyK6wNMinDIEwCgYIKoZIzj0EAwID\\nSAAwRQIhAIdZ+b8+yOzowizevCBEpRz6NYVgRirawfDZtSyzxEvhAiABghVWePZw\\n83Zgi0HM4tgCx3TYTazcISLBlXoCYQnV9Q==\\n-----END CERTIFICATE-----\\n\",\"spkiSHA256\":\"c9fdac805287676b27571a967fe665b076934592daded9a422b22b7f772fb402\",\"rootSHA256\":\"49a85f5a391f5585f5a91dfdaa9ce2ced3c9c9c69f02f47ad37b4b36d5e5beaf\"}]}]},\"publishedAt\":\"2026-10-25T02:00:33Z\",\"validUntil\":\"2026-10-25T02:01:03Z\",\"digest\":\"7b8c9915b1a1b30f795d4dd42e61584f05f5edf00be23094bc4accb4a90a9c2f\"}",
+  "wire": {
+    "wireVersion": 1,
+    "cluster": "cmtc-a",
+    "node": "cmtc-a-worker",
+    "sourceNamespace": "cmtc-system",
+    "sourceName": "issuer-approval",
+    "sourceUID": "fixture-source-uid",
+    "outputNamespace": "cmtc-system",
+    "outputName": "issuer-publication",
+    "outputUID": "fixture-output-uid",
+    "sequence": "10",
+    "generation": "7",
+    "approvalDigest": "63d2ff33b79505477b45c873524f96641bc605242686a8c99274cb8b3b9b065e",
+    "publicationDigest": "7b8c9915b1a1b30f795d4dd42e61584f05f5edf00be23094bc4accb4a90a9c2f",
+    "state": "published",
+    "publishedUnix": "1792893633",
+    "validUntilUnix": "1792893663",
+    "rootSHA256": "49a85f5a391f5585f5a91dfdaa9ce2ced3c9c9c69f02f47ad37b4b36d5e5beaf",
+    "rootDER": "MIIBkDCCATegAwIBAgIBATAKBggqhkjOPQQDAjAeMRwwGgYDVQQDDBNDTVRDIFRFU1QgT05MWSBST09UMB4XDTI2MTAyNTAyMDAzMVoXDTI4MTAyNDAyMDAzMVowHjEcMBoGA1UEAwwTQ01UQyBURVNUIE9OTFkgUk9PVDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABIe7pZPAYFFYLmWhtXxXqJu8gDoZtsEabCguIBR2Lixxlou7wBS+/NJMoVdm6ivRxRVlo+zS4U4AEW0e3ecrYVGjZjBkMBIGA1UdEwEB/wQIMAYBAf8CAQEwDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBQdgeOdf9C1JIvdHPLIrrA0yKcMgTAfBgNVHSMEGDAWgBQdgeOdf9C1JIvdHPLIrrA0yKcMgTAKBggqhkjOPQQDAgNHADBEAiAjK1NfR6F1JtcNBs3Vhg+N6nykTIQorEq4r7PqhqBWJQIgOmZN3fAEiv0lDikQym+QTRd5Ti0z70Q1iyNDatxPAwc=",
+    "clusters": [
+      {
+        "clusterID": "cmtc-a",
+        "trustDomain": "cmtc-a.mesh.example",
+        "issuers": [
+          {
+            "certificateDER": "MIIBlTCCATugAwIBAgIBAjAKBggqhkjOPQQDAjAeMRwwGgYDVQQDDBNDTVRDIFRFU1QgT05MWSBST09UMB4XDTI2MTAyNTAyMDAzMVoXDTI3MTAyNTAyMDAzMVowIjEgMB4GA1UEAwwXQ01UQyBURVNUIE9OTFkgSVNTVUVSIGEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAS7a8QSDxLeRFRE32QyCCQMFiRighl91SWAgaQwhfiZgcrQXyx8zAVCh/fmh+A1fINcijkaHq/WKfIpEje1GO3Ho2YwZDASBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQUF+M7aZXdplciEWrLPBGeW8aZezEwHwYDVR0jBBgwFoAUHYHjnX/QtSSL3RzyyK6wNMinDIEwCgYIKoZIzj0EAwIDSAAwRQIgIPpUlVBQHMvSTDvKmYTzgCvaclZcexIOUr7WhnVHsTMCIQCmEkr2vDifsmoKljCePXbXMfW0XjUqCc6GHBN0VnU6Ow==",
+            "spkiSHA256": "e38ffcc1dd5c2bda4d03ef7daaa380065aa4faefc1d3d8e258ee9bbf7a79099c"
+          }
+        ]
+      },
+      {
+        "clusterID": "cmtc-b",
+        "trustDomain": "cmtc-b.mesh.example",
+        "issuers": [
+          {
+            "certificateDER": "MIIBlTCCATugAwIBAgIBAzAKBggqhkjOPQQDAjAeMRwwGgYDVQQDDBNDTVRDIFRFU1QgT05MWSBST09UMB4XDTI2MTAyNTAyMDAzMVoXDTI3MTAyNTAyMDAzMVowIjEgMB4GA1UEAwwXQ01UQyBURVNUIE9OTFkgSVNTVUVSIGIwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQ9vFqFTdhOQdMNt8m9CJI5s/ZIYOIm/zEPpWRMLyd0+nZ5+vF0sT+kxOH0HXB/eS65OaUu9a5tM9DkaGAyhN0Ao2YwZDASBgNVHRMBAf8ECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQUJE7cZCrI2dOFo6m8h+Mvk78emjkwHwYDVR0jBBgwFoAUHYHjnX/QtSSL3RzyyK6wNMinDIEwCgYIKoZIzj0EAwIDSAAwRQIhAIdZ+b8+yOzowizevCBEpRz6NYVgRirawfDZtSyzxEvhAiABghVWePZw83Zgi0HM4tgCx3TYTazcISLBlXoCYQnV9Q==",
+            "spkiSHA256": "c9fdac805287676b27571a967fe665b076934592daded9a422b22b7f772fb402"
+          }
+        ]
+      }
+    ],
+    "reason": "Validated"
+  }
+}
