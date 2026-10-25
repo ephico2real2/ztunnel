@@ -361,8 +361,8 @@ impl WorkloadProxyManagerState {
                 .map_err(|error| Error::ProtocolError(format!("snapshot drain failed: {error}")))?;
         }
         // Every removed workload is fully stopped. Without this a bound owner
-        // stayed incomplete although its proxy was gone, and check_add refused
-        // every later ADD of the Pod until this proxy execution ended.
+        // stayed live although its proxy was gone, and check_add refused a
+        // restarted source's ADD of the Pod until this proxy execution ended.
         for uid in &removed {
             self.owners.complete_removed(uid);
         }

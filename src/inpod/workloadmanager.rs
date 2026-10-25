@@ -1009,11 +1009,10 @@ pub(crate) mod tests {
     }
     /// The order after an agent restart: a new source connects, its snapshot
     /// omits a bound workload (the agent re-admits it later), and this proxy
-    /// stops that workload before acknowledging the snapshot. That stop is the
-    /// owner's drain, so the new source's ADD for the same sandbox is accepted,
-    /// while the drained incarnation itself can never be installed again.
+    /// stops that workload before acknowledging the snapshot. The new source's
+    /// ADD for the same sandbox is then accepted without a drain it cannot produce.
     #[tokio::test]
-    async fn typed_native_snapshot_omission_drains_owner_for_a_new_source() {
+    async fn typed_native_snapshot_omission_releases_owner_for_a_new_source() {
         assert!(crate::test_helpers::can_run_privilged_test());
         let f = test_helpers::Fixture::default();
         let state = WorkloadProxyManagerState::new(
@@ -1036,7 +1035,6 @@ pub(crate) mod tests {
                 .0
         };
         let acked = |response: zds::WorkloadResponse| matches!(response.payload, Some(zds::workload_response::Payload::Ack(a)) if a.error.is_empty());
-        let refused = |response: zds::WorkloadResponse, reason: &str| matches!(response.payload, Some(zds::workload_response::Payload::Ack(a)) if a.error.contains(reason));
 
         let mut peer = accept().await;
         let hello = read_hello(&mut peer).await;
@@ -1069,29 +1067,117 @@ pub(crate) mod tests {
             acked(read_msg(&mut peer).await),
             "the snapshot ACK follows the omitted proxy's stop"
         );
-
-        send_bound_add(&mut peer, original.clone(), &fd).await;
-        assert!(
-            refused(
-                read_msg(&mut peer).await,
-                "completed incarnation cannot be revived"
-            ),
-            "the drained incarnation itself is never installed again"
-        );
-        drop(peer);
-
-        let mut peer = accept().await;
-        assert_eq!(read_hello(&mut peer).await.proxy_epoch, hello.proxy_epoch);
         let readmitted = zds::WorkloadBinding {
             source_epoch: "agent-after-restart".into(),
             capture_generation: 1,
-            ..original.clone()
+            ..original
         };
         send_bound_add(&mut peer, readmitted, &fd).await;
         assert!(
             acked(read_msg(&mut peer).await),
             "the new source re-admits the same sandbox without a drain it cannot produce"
         );
+        drop(peer);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            stop.start_drain_and_wait(crate::drain::DrainMode::Immediate),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+    /// The same source reconnects and its snapshot leaves out a bound workload:
+    /// the ACK of its ADD was lost, or capture could not be reasserted for the
+    /// replay. The omission stops the proxy but is no drain the source asked
+    /// for, so the fresh capture generation admission sends next, and the next
+    /// snapshot's replay of the acknowledged binding, are both accepted. A
+    /// refused replay would fail that snapshot and every later one.
+    #[tokio::test]
+    async fn typed_native_snapshot_omission_keeps_the_same_source_incarnation() {
+        assert!(crate::test_helpers::can_run_privilged_test());
+        let f = test_helpers::Fixture::default();
+        let state = WorkloadProxyManagerState::new(
+            f.proxy_factory,
+            f.ipc,
+            f.inpod_metrics,
+            Default::default(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot-same-source.sock");
+        let listener = crate::inpod::packet::bind(&path).unwrap();
+        let (stop, watch) = crate::drain::new();
+        let manager = WorkloadProxyManager::new(path, state, readiness::Ready::new()).unwrap();
+        let running = tokio::spawn(manager.run(watch));
+        let accept = || async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+        };
+        let acked = |response: zds::WorkloadResponse| matches!(response.payload, Some(zds::workload_response::Payload::Ack(a)) if a.error.is_empty());
+
+        let mut peer = accept().await;
+        let hello = read_hello(&mut peer).await;
+        let fd = new_netns();
+        let stat = nix::sys::stat::fstat(&fd).unwrap();
+        let original = zds::WorkloadBinding {
+            version: 1,
+            source_epoch: "same-agent".into(),
+            cluster_id: 1,
+            namespace_uid: "namespace-uid".into(),
+            pod_uid: "omitted-pod".into(),
+            endpoint_id: 22,
+            incarnation: 1,
+            capture_generation: 3,
+            netns_dev: stat.st_dev,
+            netns_ino: stat.st_ino,
+            proxy_epoch: hello.proxy_epoch.clone(),
+        };
+        send_snap_sent(&mut peer).await;
+        assert!(acked(read_msg(&mut peer).await));
+        // The ADD is installed, but the source closes the stream before its ACK.
+        send_bound_add(&mut peer, original.clone(), &fd).await;
+        drop(peer);
+
+        // Without that ACK the source's next snapshot leaves the Pod out.
+        let mut peer = accept().await;
+        assert_eq!(read_hello(&mut peer).await.proxy_epoch, hello.proxy_epoch);
+        send_snap_sent(&mut peer).await;
+        assert!(acked(read_msg(&mut peer).await));
+        let fresh = zds::WorkloadBinding {
+            capture_generation: original.capture_generation + 1,
+            ..original
+        };
+        send_bound_add(&mut peer, fresh.clone(), &fd).await;
+        assert!(
+            acked(read_msg(&mut peer).await),
+            "admission re-admits the omitted incarnation with a fresh capture generation"
+        );
+        drop(peer);
+
+        // That ACK was observed, but this snapshot cannot reassert capture and
+        // leaves the Pod out again.
+        let mut peer = accept().await;
+        assert_eq!(read_hello(&mut peer).await.proxy_epoch, hello.proxy_epoch);
+        send_snap_sent(&mut peer).await;
+        assert!(acked(read_msg(&mut peer).await));
+        drop(peer);
+
+        // The next snapshot replays the acknowledged binding.
+        let mut peer = accept().await;
+        assert_eq!(read_hello(&mut peer).await.proxy_epoch, hello.proxy_epoch);
+        send_bound_add(&mut peer, fresh, &fd).await;
+        assert!(
+            acked(read_msg(&mut peer).await),
+            "the replay of the acknowledged binding restarts the omitted proxy"
+        );
+        send_snap_sent(&mut peer).await;
+        assert!(acked(read_msg(&mut peer).await));
         drop(peer);
         tokio::time::timeout(
             std::time::Duration::from_secs(3),

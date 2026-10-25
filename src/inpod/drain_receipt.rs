@@ -16,6 +16,11 @@ struct Owner {
     binding: WorkloadBinding,
     generation: u64,
     completed: bool,
+    // This execution stopped the owner's proxy because a source snapshot
+    // omitted it. An omission is no drain the source asked for: the same
+    // source re-admits its incarnation with a fresh capture generation, and a
+    // restarted source replaces it. Only a typed drain completes an owner.
+    stopped: bool,
 }
 #[derive(Default)]
 pub(super) struct DrainOwners {
@@ -61,20 +66,19 @@ impl DrainOwners {
     }
     pub(super) fn check_add(&self, uid: &WorkloadUid, b: &WorkloadBinding) -> anyhow::Result<()> {
         if let Some(old) = self.owners.get(uid) {
+            let replacement = old.binding != *b
+                && (old.binding.source_epoch != b.source_epoch
+                    || old.binding.incarnation != b.incarnation);
+            let mut refreshed = old.binding.clone();
+            refreshed.capture_generation = b.capture_generation;
+            let refresh = refreshed == *b && b.capture_generation >= old.binding.capture_generation;
             if old.completed {
-                anyhow::ensure!(
-                    old.binding != *b
-                        && (old.binding.source_epoch != b.source_epoch
-                            || old.binding.incarnation != b.incarnation),
-                    "completed incarnation cannot be revived"
-                );
+                anyhow::ensure!(replacement, "completed incarnation cannot be revived");
             } else {
-                let mut refreshed = old.binding.clone();
-                refreshed.capture_generation = b.capture_generation;
+                // A stopped owner's proxy is gone, so a replacement needs no
+                // drain; a refresh of the same incarnation needs none begun.
                 anyhow::ensure!(
-                    old.generation == 0
-                        && refreshed == *b
-                        && b.capture_generation >= old.binding.capture_generation,
+                    (old.generation == 0 && refresh) || (old.stopped && replacement),
                     "old workload must complete its exact drain before replacement"
                 );
             }
@@ -87,6 +91,7 @@ impl DrainOwners {
         anyhow::ensure!(
             !self.owners.iter().any(|(other, owner)| other != uid
                 && !owner.completed
+                && !owner.stopped
                 && owner.binding.netns_dev == b.netns_dev
                 && owner.binding.netns_ino == b.netns_ino),
             "sandbox already belongs to another workload"
@@ -94,13 +99,13 @@ impl DrainOwners {
         Ok(())
     }
     /// Records that this proxy execution stopped `uid` because the current
-    /// source's snapshot omitted it. The snapshot ACK is sent only after every
-    /// removed workload is fully stopped, so it is the source's receipt: the
-    /// owner is drained as a typed drain would leave it, and only a different
-    /// incarnation may be installed for the Pod afterwards.
+    /// source's snapshot omitted it. reconcile calls this only after every
+    /// removed workload is fully stopped. The omission ends the proxy, not the
+    /// incarnation: a restarted source may replace the owner, and the same
+    /// source may re-admit it with a fresh capture generation.
     pub(super) fn complete_removed(&mut self, uid: &WorkloadUid) {
         if let Some(owner) = self.owners.get_mut(uid) {
-            owner.completed = true;
+            owner.stopped = true;
         }
     }
     pub(super) fn installed(&mut self, uid: WorkloadUid, binding: WorkloadBinding) {
@@ -110,6 +115,7 @@ impl DrainOwners {
                 binding,
                 generation: 0,
                 completed: false,
+                stopped: false,
             },
         );
     }
@@ -227,6 +233,47 @@ mod tests {
         assert_eq!(owners.complete(&retry).unwrap().nonce, retry.nonce);
         assert!(DrainOwners::default().begin(&req, &[3; 32]).is_err()); // restarted proxy, no old-owner proof
         assert!(owners.begin(&req, &[8; 32]).is_err());
+    }
+    #[test]
+    fn snapshot_omission_stops_owner_without_ending_its_incarnation() {
+        let b = binding();
+        let uid = WorkloadUid::new(b.pod_uid.clone());
+        let mut owners = DrainOwners::default();
+        owners.installed(uid.clone(), b.clone());
+        owners.complete_removed(&uid);
+        // The same source replays its acknowledged binding, or re-admits the
+        // incarnation with a fresh capture generation; an older one is stale.
+        assert!(owners.check_add(&uid, &b).is_ok());
+        let mut fresh = b.clone();
+        fresh.capture_generation += 1;
+        assert!(owners.check_add(&uid, &fresh).is_ok());
+        let mut stale = b.clone();
+        stale.capture_generation -= 1;
+        assert!(owners.check_add(&uid, &stale).is_err());
+        // A restarted source replaces the stopped owner, whose sandbox is free.
+        let mut restarted = b.clone();
+        restarted.source_epoch = "restarted-source".into();
+        restarted.capture_generation = 1;
+        assert!(owners.check_add(&uid, &restarted).is_ok());
+        let mut other = b;
+        other.pod_uid = "other-pod".into();
+        assert!(
+            owners
+                .check_add(&WorkloadUid::new(other.pod_uid.clone()), &other)
+                .is_ok()
+        );
+        // A begun drain refuses a refresh of a stopped owner, not its
+        // replacement.
+        let req = request();
+        owners.begin(&req, &[3; 32]).unwrap();
+        assert!(owners.check_add(&uid, &fresh).is_err());
+        assert!(owners.check_add(&uid, &restarted).is_ok());
+        // A typed drain of the exact binding still completes the owner, and
+        // completion stays terminal for the incarnation.
+        owners.begin(&req, &[3; 32]).unwrap();
+        owners.complete(&req).unwrap();
+        assert!(owners.check_add(&uid, &fresh).is_err());
+        assert!(owners.check_add(&uid, &restarted).is_ok());
     }
     #[test]
     fn capacity_preserves_completed_owner_and_fails_closed_without_eviction() {
