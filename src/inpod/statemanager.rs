@@ -14,6 +14,7 @@
 
 use crate::drain;
 use crate::drain::DrainTrigger;
+use futures::FutureExt;
 use std::sync::Arc;
 use tracing::{Instrument, debug, info};
 
@@ -31,30 +32,87 @@ use super::netns::{InpodNetns, NetnsID};
 pub(super) struct WorkloadState {
     drain: DrainTrigger,
     netns_id: NetnsID,
+    tasks: Vec<tokio::task::JoinHandle<Result<(), crate::proxy::Error>>>,
+    connections: Option<crate::proxy::connection_manager::ConnectionManager>,
 }
+
+type DrainCompletion =
+    futures::future::Shared<futures::future::BoxFuture<'static, Result<(), Arc<str>>>>;
 
 #[derive(Default)]
 struct DrainingTasks {
-    draining: Vec<tokio::task::JoinHandle<()>>,
+    draining: Vec<(WorkloadUid, DrainCompletion)>,
 }
 
 impl DrainingTasks {
-    fn shutdown_workload(&mut self, workload_state: WorkloadState) {
-        // Workload is gone, so no need to gracefully clean it up
-        let handle = tokio::spawn(
-            workload_state
-                .drain
-                .start_drain_and_wait(drain::DrainMode::Immediate),
-        );
-        // before we push to draining, try to clear done entries, so the vector doesn't grow too much
-        self.draining.retain(|x| !x.is_finished());
-        // add deleted pod to draining. we do this so we make sure to wait for it incase we
-        // get the global drain signal.
-        self.draining.push(handle);
+    fn shutdown_workload(&mut self, uid: WorkloadUid, workload: WorkloadState) {
+        self.shutdown_workload_with_mode(uid, workload, drain::DrainMode::Immediate)
     }
-
-    async fn join(self) {
-        futures::future::join_all(self.draining).await;
+    fn shutdown_workload_with_mode(
+        &mut self,
+        uid: WorkloadUid,
+        workload: WorkloadState,
+        mode: drain::DrainMode,
+    ) {
+        // The task owns the stop signal and actual JoinHandles even if the
+        // caller or its ZDS connection is canceled while awaiting this barrier.
+        let task = tokio::spawn(async move {
+            let (_, results) = tokio::join!(
+                workload.drain.start_drain_and_wait(mode),
+                futures::future::join_all(workload.tasks),
+            );
+            for result in results {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => return Err(Arc::<str>::from(error.to_string())),
+                    Err(error) => return Err(Arc::<str>::from(error.to_string())),
+                }
+            }
+            if workload
+                .connections
+                .as_ref()
+                .is_some_and(|connections| !connections.is_empty())
+            {
+                return Err(Arc::<str>::from(
+                    "owned connection registry is not empty after task shutdown",
+                ));
+            }
+            Ok(())
+        });
+        let completion = async move {
+            match task.await {
+                Ok(result) => result,
+                Err(error) => Err(Arc::<str>::from(error.to_string())),
+            }
+        }
+        .boxed()
+        .shared();
+        // Completed successes require no further ownership. Keep failures so
+        // retrying an unknown UID cannot manufacture a successful drain.
+        self.draining
+            .retain(|(_, completion)| !matches!(completion.clone().now_or_never(), Some(Ok(()))));
+        self.draining.push((uid, completion));
+    }
+    async fn wait_workload(&self, uid: &WorkloadUid) -> Result<(), Error> {
+        let pending = self
+            .draining
+            .iter()
+            .filter(|(owner, _)| owner == uid)
+            .map(|(_, future)| future.clone());
+        for result in futures::future::join_all(pending).await {
+            result
+                .map_err(|error| Error::ProtocolError(format!("workload drain failed: {error}")))?;
+        }
+        Ok(())
+    }
+    async fn join(self) -> Result<(), Error> {
+        for result in
+            futures::future::join_all(self.draining.into_iter().map(|(_, future)| future)).await
+        {
+            result
+                .map_err(|error| Error::ProtocolError(format!("workload drain failed: {error}")))?;
+        }
+        Ok(())
     }
 }
 
@@ -172,31 +230,16 @@ impl WorkloadProxyManagerState {
                     uid = workload_uid.0,
                     "pod delete request, shutting down proxy"
                 );
-                if !self.snapshot_received {
-                    debug!("got workload delete before snapshot");
-                    // Since we insert here on AddWorkload before we get a snapshot,
-                    // make sure we also opportunistically remove here before we
-                    // get a snapshot
-                    //
-                    // Note that even though AddWorkload starts the workload, we do *not* need
-                    // to stop it here, as it should be auto-dropped subsequently during snapshot
-                    // reconcile(), when we actually get the `SnapshotSent` notification.
-                    self.snapshot_names.remove(&workload_uid);
-                    // `reconcile()` will drop this workload later, but if the workload never successfully
-                    // starts it will stay in the pending queue (which `reconcile()` can't remove it from),
-                    // so clear the pending queue here.
-                    self.pending_workloads.remove(&workload_uid);
-                    return Ok(());
-                }
-                self.del_workload(&workload_uid);
-                Ok(())
+                self.snapshot_names.remove(&workload_uid);
+                self.del_workload(&workload_uid).await
             }
+
             WorkloadMessage::WorkloadSnapshotSent => {
                 info!("received snapshot sent");
                 if self.snapshot_received {
                     return Err(Error::ProtocolError("pod snapshot received already".into()));
                 }
-                self.reconcile();
+                self.reconcile().await?;
                 // mark ready
                 self.snapshot_received = true;
                 Ok(())
@@ -206,27 +249,38 @@ impl WorkloadProxyManagerState {
 
     // reconcile existing state to snaphsot. drains any workloads not in the snapshot
     // this can happen if workloads were removed while we were disconnected.
-    fn reconcile(&mut self) {
-        for (_, workload_state) in self
+    async fn reconcile(&mut self) -> Result<(), Error> {
+        for (uid, workload_state) in self
             .workload_states
             .extract_if(|uid, _| !self.snapshot_names.contains(uid))
         {
-            self.draining.shutdown_workload(workload_state);
+            self.draining.shutdown_workload(uid, workload_state);
         }
         self.snapshot_names.clear();
         self.update_proxy_count_metrics();
+        // A snapshot ACK also requires removed workloads to be fully stopped.
+        for result in futures::future::join_all(
+            self.draining
+                .draining
+                .iter()
+                .map(|(_, future)| future.clone()),
+        )
+        .await
+        {
+            result
+                .map_err(|error| Error::ProtocolError(format!("snapshot drain failed: {error}")))?;
+        }
+        Ok(())
     }
 
-    pub async fn drain(self) {
-        let drain_futures =
-            self.workload_states.into_iter().map(|(_, v)| {
-                v.drain.start_drain_and_wait(drain::DrainMode::Graceful)
-            } /* do not .await here!!! */);
-        // join these first, as we need to drive these to completion
-        futures::future::join_all(drain_futures).await;
-        // these are join handles that are driven by tokio, we just need to wait for them, so join these
-        // last
-        self.draining.join().await;
+    pub async fn drain(mut self) {
+        for (uid, workload) in self.workload_states.drain() {
+            self.draining
+                .shutdown_workload_with_mode(uid, workload, drain::DrainMode::Graceful);
+        }
+        if let Err(error) = self.draining.join().await {
+            tracing::error!(%error,"workload shutdown barrier failed");
+        }
     }
 
     async fn add_workload(
@@ -259,6 +313,10 @@ impl WorkloadProxyManagerState {
         workload_info: &WorkloadInfo,
         netns: InpodNetns,
     ) -> Result<(), crate::proxy::Error> {
+        self.draining
+            .wait_workload(workload_uid)
+            .await
+            .map_err(|error| crate::proxy::Error::Anyhow(error.into()))?;
         // check if we have a proxy already
         let maybe_existing = self.workload_states.get(workload_uid);
         if let Some(existing) = maybe_existing {
@@ -267,7 +325,9 @@ impl WorkloadProxyManagerState {
                 // this can happen when there's a CNI failure (that's unrelated to us) which triggers
                 // pod sandobx to be re-created with a fresh new netns.
                 // drain the old proxy and add this one.
-                self.del_workload(workload_uid);
+                self.del_workload(workload_uid)
+                    .await
+                    .map_err(|error| crate::proxy::Error::Anyhow(error.into()))?;
             } else {
                 // idempotency - no error if we already have a proxy for the workload
                 // check if the inodes match. if they don't, we have a new netns
@@ -302,6 +362,7 @@ impl WorkloadProxyManagerState {
 
         let uid = workload_uid.clone();
 
+        let connections = proxies.connection_manager.clone();
         self.admin_handler
             .proxy_up(&uid, workload_info, proxies.connection_manager);
 
@@ -309,19 +370,21 @@ impl WorkloadProxyManagerState {
         let admin_handler = self.admin_handler.clone();
 
         metrics.proxies_started.inc();
+        let mut tasks = Vec::new();
         if let Some(proxy) = proxies.proxy {
-            tokio::spawn(
+            tasks.push(tokio::spawn(
                 async move {
-                    proxy.run().await;
+                    let result=proxy.run_checked().await;
                     debug!("proxy for workload {:?} exited", uid);
                     metrics.proxies_stopped.inc();
                     admin_handler.proxy_down(&uid);
+                    result
                 }
                 .instrument(tracing::info_span!("proxy", wl=%format!("{}/{}", workload_info.namespace, workload_info.name))),
-            );
+            ));
         }
         if let Some(proxy) = proxies.dns_proxy {
-            tokio::spawn(proxy.run().instrument(tracing::info_span!("dns_proxy", wl=%format!("{}/{}", workload_info.namespace, workload_info.name))));
+            tasks.push(tokio::spawn(async move{proxy.run().await;Ok(())}.instrument(tracing::info_span!("dns_proxy", wl=%format!("{}/{}", workload_info.namespace, workload_info.name)))));
         }
 
         self.workload_states.insert(
@@ -329,6 +392,8 @@ impl WorkloadProxyManagerState {
             WorkloadState {
                 drain: drain_tx,
                 netns_id: workload_netns_id,
+                tasks,
+                connections,
             },
         );
 
@@ -362,17 +427,15 @@ impl WorkloadProxyManagerState {
         }
     }
 
-    fn del_workload(&mut self, workload_uid: &WorkloadUid) {
-        // for idempotency, we ignore errors here (maybe just log / metric them)
+    async fn del_workload(&mut self, workload_uid: &WorkloadUid) -> Result<(), Error> {
         self.pending_workloads.remove(workload_uid);
-        let Some(workload_state) = self.workload_states.remove(workload_uid) else {
-            // TODO: add metrics
-            return;
-        };
-
-        self.update_proxy_count_metrics();
-
-        self.draining.shutdown_workload(workload_state);
+        if let Some(workload) = self.workload_states.remove(workload_uid) {
+            self.draining
+                .shutdown_workload(workload_uid.clone(), workload);
+            self.update_proxy_count_metrics();
+        }
+        // A retry must wait for a prior canceled delete's retained task too.
+        self.draining.wait_workload(workload_uid).await
     }
 
     fn update_proxy_count_metrics(&self) {
@@ -723,5 +786,114 @@ mod tests {
         let add = WorkloadMessage::AddWorkload(data);
 
         assert_matches!(state.process_msg(add).await, Err(_));
+    }
+}
+
+#[cfg(test)]
+mod owned_drain_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn canceled_delete_waiter_retains_real_socket_task_and_retry_waits() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (socket, _) = listener.accept().await.unwrap();
+        let (signal, watch) = drain::new();
+        let (release_tx, release) = tokio::sync::oneshot::channel();
+        let (stopped_tx, stopped) = tokio::sync::oneshot::channel();
+        let child = tokio::spawn(async move {
+            let stop = watch.wait_for_drain().await;
+            let _ = stopped_tx.send(());
+            release.await.unwrap();
+            drop(socket);
+            drop(stop);
+            Ok(())
+        });
+        let mut drains = DrainingTasks::default();
+        let uid = WorkloadUid::new("owned-pod".into());
+        drains.shutdown_workload(
+            uid.clone(),
+            WorkloadState {
+                drain: signal,
+                netns_id: NetnsID { inode: 1, dev: 1 },
+                tasks: vec![child],
+                connections: None,
+            },
+        );
+        stopped.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), drains.wait_workload(&uid))
+                .await
+                .is_err()
+        );
+        // Canceling that caller did not discard the actual owned shutdown task.
+        assert!(drains.draining[0].1.clone().now_or_never().is_none());
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), drains.wait_workload(&uid))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
+        drains.join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_owned_task_poison_is_not_erased_by_repeated_delete() {
+        let (signal, watch) = drain::new();
+        drop(watch);
+        let child = tokio::spawn(async {
+            Err(crate::proxy::Error::Anyhow(anyhow::anyhow!(
+                "injected owned-task failure"
+            )))
+        });
+        let uid = WorkloadUid::new("failed-pod".into());
+        let mut drains = DrainingTasks::default();
+        drains.shutdown_workload(
+            uid.clone(),
+            WorkloadState {
+                drain: signal,
+                netns_id: NetnsID { inode: 1, dev: 1 },
+                tasks: vec![child],
+                connections: None,
+            },
+        );
+        assert!(drains.wait_workload(&uid).await.is_err());
+        assert!(drains.wait_workload(&uid).await.is_err());
+        assert!(drains.join().await.is_err());
+    }
+    #[tokio::test]
+    async fn leftover_owned_connection_registry_prevents_successful_barrier() {
+        let manager = crate::proxy::connection_manager::ConnectionManager::default();
+        let guard = manager.track_outbound(
+            "10.0.0.1:42000".parse().unwrap(),
+            "10.0.0.2:8080".parse().unwrap(),
+            "10.0.0.2:8080".parse().unwrap(),
+            crate::state::workload::OutboundProtocol::HBONE,
+            true,
+        );
+        let (signal, watch) = drain::new();
+        drop(watch);
+        let uid = WorkloadUid::new("leftover-registry".into());
+        let mut drains = DrainingTasks::default();
+        drains.shutdown_workload(
+            uid.clone(),
+            WorkloadState {
+                drain: signal,
+                netns_id: NetnsID { inode: 1, dev: 1 },
+                tasks: vec![],
+                connections: Some(manager),
+            },
+        );
+        assert!(drains.wait_workload(&uid).await.is_err());
+        drop(guard);
+        assert!(
+            drains.wait_workload(&uid).await.is_err(),
+            "a later empty registry cannot erase a failed barrier result"
+        );
     }
 }

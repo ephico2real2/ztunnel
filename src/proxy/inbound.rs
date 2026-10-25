@@ -109,65 +109,71 @@ impl Inbound {
                 };
                 pi.metrics.record_socket_open(&socket_labels);
 
+                let mut lifetime_shutdown = force_shutdown.clone();
                 let serve_client = async move {
-                    let _socket_guard =
-                        metrics::SocketCloseGuard::new(pi.metrics.clone(), Reporter::destination);
-                    let accepted = Box::pin(Self::accept_profile_tls(&pi, raw_socket)).await;
-                    let (tls, revocation) = match accepted {
-                        Ok(tls) => tls,
-                        Err(e) => {
-                            if crate::tls::tls_error_is_cert_revoked(&e) {
-                                pi.metrics.record_crl_rejection(Reporter::destination);
+                    tokio::select! {
+                        _=lifetime_shutdown.changed()=>Err(proxy::Error::DrainTimeOut),
+                        result=async move {
+                        let _socket_guard =
+                            metrics::SocketCloseGuard::new(pi.metrics.clone(), Reporter::destination);
+                        let accepted = Box::pin(Self::accept_profile_tls(&pi, raw_socket)).await;
+                        let (tls, revocation) = match accepted {
+                            Ok(tls) => tls,
+                            Err(e) => {
+                                if crate::tls::tls_error_is_cert_revoked(&e) {
+                                    pi.metrics.record_crl_rejection(Reporter::destination);
+                                }
+                                metrics::log_early_deny(src, dst, Reporter::destination, e);
+
+                                return Err::<(), _>(proxy::Error::SelfCall);
                             }
-                            metrics::log_early_deny(src, dst, Reporter::destination, e);
+                        };
+                        debug!(latency=?start.elapsed(), "accepted TLS connection");
+                        let (_, ssl) = tls.get_ref().get_ref();
+                        let src_identity = {
+                            let x509_cert = tls::certificate_from_connection(ssl);
+                            tls::identity(&x509_cert)
+                        };
+                        let conn = Connection {
+                            src_identity: src_identity.clone(),
+                            src,
+                            dst_network: pi.cfg.network.clone(), // inbound request must be on our network
+                            dst,
+                        };
+                        debug!(%conn, "accepted connection");
+                        let cfg = pi.cfg.clone();
+                        // Enforce CRL revocation on this existing connection when a CRL is configured
+                        // The handshake helper already registered the exact verified
+                        // peer SPIRE signer, including cross-domain peers.
+                        let request_handler = move |req| {
+                            let id = Self::extract_traceparent(&req);
+                            let peer = conn.src;
+                            let req_handler = Self::serve_connect(
+                                pi.clone(),
+                                conn.clone(),
+                                self.enable_orig_src,
+                                req,
+                            )
+                            .instrument(info_span!("inbound", %id, %peer));
+                            // This is for each user connection, so most important to keep small
+                            assertions::size_between_ref(1500, 2750, &req_handler);
+                            req_handler
+                        };
 
-                            return Err::<(), _>(proxy::Error::SelfCall);
-                        }
-                    };
-                    debug!(latency=?start.elapsed(), "accepted TLS connection");
-                    let (_, ssl) = tls.get_ref().get_ref();
-                    let src_identity = {
-                        let x509_cert = tls::certificate_from_connection(ssl);
-                        tls::identity(&x509_cert)
-                    };
-                    let conn = Connection {
-                        src_identity: src_identity.clone(),
-                        src,
-                        dst_network: pi.cfg.network.clone(), // inbound request must be on our network
-                        dst,
-                    };
-                    debug!(%conn, "accepted connection");
-                    let cfg = pi.cfg.clone();
-                    // Enforce CRL revocation on this existing connection when a CRL is configured
-                    // The handshake helper already registered the exact verified
-                    // peer SPIRE signer, including cross-domain peers.
-                    let request_handler = move |req| {
-                        let id = Self::extract_traceparent(&req);
-                        let peer = conn.src;
-                        let req_handler = Self::serve_connect(
-                            pi.clone(),
-                            conn.clone(),
-                            self.enable_orig_src,
-                            req,
-                        )
-                        .instrument(info_span!("inbound", %id, %peer));
-                        // This is for each user connection, so most important to keep small
-                        assertions::size_between_ref(1500, 2750, &req_handler);
-                        req_handler
-                    };
-
-                    let serve_conn = h2::server::serve_connection(
-                        cfg,
-                        tls,
-                        drain,
-                        force_shutdown,
-                        revocation,
-                        request_handler,
-                    );
-                    // This is per HBONE connection, so while would be nice to be small, at least it
-                    // is pooled so typically fewer of these.
-                    let serve = Box::pin(assertions::size_between(3000, 7000, serve_conn));
-                    serve.await
+                        let serve_conn = h2::server::serve_connection(
+                            cfg,
+                            tls,
+                            drain,
+                            force_shutdown,
+                            revocation,
+                            request_handler,
+                        );
+                        // This is per HBONE connection, so while would be nice to be small, at least it
+                        // is pooled so typically fewer of these.
+                        let serve = Box::pin(assertions::size_between(3000, 7000, serve_conn));
+                        serve.await
+                        }=>result,
+                    }
                 };
                 // This is small since it only handles the TLS layer -- the HTTP2 layer is boxed
                 // and measured above.

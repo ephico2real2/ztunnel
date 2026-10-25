@@ -362,6 +362,12 @@ impl Proxy {
     }
 
     pub async fn run(self) {
+        if let Err(error) = self.run_checked().await {
+            tracing::error!(%error,"proxy component task failed");
+        }
+    }
+
+    pub(crate) async fn run_checked(self) -> Result<(), Error> {
         let mut tasks = vec![
             tokio::spawn(self.inbound_passthrough.run().in_current_span()),
             tokio::spawn(self.policy_watcher.run().in_current_span()),
@@ -373,7 +379,11 @@ impl Proxy {
             tasks.push(tokio::spawn(socks5.run().in_current_span()));
         };
 
-        futures::future::join_all(tasks).await;
+        let results = futures::future::join_all(tasks).await;
+        for result in results {
+            result.map_err(|error| Error::Anyhow(error.into()))?;
+        }
+        Ok(())
     }
 
     pub fn addresses(&self) -> Addresses {

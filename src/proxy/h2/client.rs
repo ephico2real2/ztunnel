@@ -179,6 +179,18 @@ pub async fn spawn_connection(
     revocation: Option<RevocationHandle>,
     teardown: TeardownCause,
 ) -> Result<H2ConnectClient, Error> {
+    spawn_owned_connection(cfg, s, driver_drain, wl_key, revocation, teardown, None).await
+}
+
+pub(crate) async fn spawn_owned_connection(
+    cfg: Arc<config::Config>,
+    s: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    driver_drain: Receiver<bool>,
+    wl_key: WorkloadKey,
+    revocation: Option<RevocationHandle>,
+    teardown: TeardownCause,
+    owner: Option<tokio_util::task::TaskTracker>,
+) -> Result<H2ConnectClient, Error> {
     let mut builder = h2::client::Builder::new();
     builder
         .initial_window_size(cfg.window_size)
@@ -208,12 +220,23 @@ pub async fn spawn_connection(
     // if we got a drain for that connection, respect it in a race
     // it is important to have a drain here, or this connection will never terminate
     let driver_teardown = teardown.clone();
-    tokio::spawn(
-        async move {
-            drive_connection(connection, driver_drain, revocation, driver_teardown).await;
-        }
-        .in_current_span(),
-    );
+    let driver_owner = owner.clone();
+    let future = async move {
+        drive_connection(
+            connection,
+            driver_drain,
+            revocation,
+            driver_teardown,
+            driver_owner,
+        )
+        .await;
+    }
+    .in_current_span();
+    if let Some(owner) = owner {
+        owner.spawn(future);
+    } else {
+        tokio::spawn(future);
+    }
 
     let c = H2ConnectClient {
         sender: send_req,
@@ -226,11 +249,21 @@ pub async fn spawn_connection(
     Ok(c)
 }
 
+pub(crate) async fn wait_driver_drain(stop: &mut Receiver<bool>) {
+    // Receiver clones created after shutdown already observe true and would
+    // otherwise wait forever for a second change which will never arrive.
+    if *stop.borrow_and_update() {
+        return;
+    }
+    let _ = stop.changed().await;
+}
+
 async fn drive_connection<S, B>(
     mut conn: Connection<S, B>,
     mut driver_drain: Receiver<bool>,
     mut revocation: Option<RevocationHandle>,
     teardown: TeardownCause,
+    owner: Option<tokio_util::task::TaskTracker>,
 ) where
     S: AsyncRead + AsyncWrite + Send + Unpin,
     B: Buf,
@@ -242,15 +275,19 @@ async fn drive_connection<S, B>(
     let (ping_drop_tx, ping_drop_rx) = oneshot::channel::<Teardown>();
     // for this fn to inform ping to give up when it is already dropped
     let dropped = Arc::new(AtomicBool::new(false));
-    tokio::task::spawn(
-        super::do_ping_pong(ping_pong, ping_drop_tx, dropped.clone()).in_current_span(),
-    );
+    let ping_future =
+        super::do_ping_pong(ping_pong, ping_drop_tx, dropped.clone()).in_current_span();
+    let ping = tokio_util::task::AbortOnDropHandle::new(if let Some(owner) = owner {
+        owner.spawn(ping_future)
+    } else {
+        tokio::spawn(ping_future)
+    });
 
     // `conn` is polled by reference so it outlives the select: the branch futures are dropped
     // before a branch body runs, and each teardown arm must record its cause before `conn` is
     // dropped below.
     tokio::select! {
-        _ = driver_drain.changed() => {
+        _ = wait_driver_drain(&mut driver_drain) => {
             debug!("draining outer HBONE connection");
         }
         reason = ping_drop_rx => {
@@ -289,6 +326,7 @@ async fn drive_connection<S, B>(
     drop(conn);
     // Signal to the ping_pong it should also stop.
     dropped.store(true, Ordering::Relaxed);
+    drop(ping);
 }
 
 #[cfg(test)]
@@ -388,5 +426,23 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::ConnectionAborted);
         assert_eq!(err.to_string(), "HBONE ping timeout");
+    }
+    #[tokio::test]
+    async fn driver_drain_observes_shutdown_before_receiver_clone() {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        sender.send(true).unwrap();
+        let mut late = receiver.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wait_driver_drain(&mut late),
+        )
+        .await
+        .expect("late clone missed the shutdown state");
+        let (sender, mut live) = tokio::sync::watch::channel(false);
+        let pending = tokio::spawn(async move {
+            wait_driver_drain(&mut live).await;
+        });
+        sender.send(true).unwrap();
+        pending.await.unwrap();
     }
 }

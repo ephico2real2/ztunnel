@@ -141,11 +141,12 @@ where
     let (ping_drop_tx, mut ping_drop_rx) = oneshot::channel::<Teardown>();
     // for this fn to inform ping to give up when it is already dropped
     let dropped = Arc::new(AtomicBool::new(false));
-    tokio::task::spawn(crate::proxy::h2::do_ping_pong(
-        ping_pong,
-        ping_drop_tx,
-        dropped.clone(),
-    ));
+    let ping_lifetime = drain.clone();
+    let ping_dropped = dropped.clone();
+    let ping = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(async move {
+        let _lifetime = ping_lifetime;
+        crate::proxy::h2::do_ping_pong(ping_pong, ping_drop_tx, ping_dropped).await;
+    }));
 
     // Each teardown arm records its cause before shutting down, so the streams report it rather
     // than the GOAWAY, which they would otherwise read as a clean close.
@@ -175,7 +176,12 @@ where
                 };
                 let handle = handler(req);
                 // Serve the stream in a new task
-                tokio::task::spawn(handle.in_current_span());
+                let stream_lifetime=drain.clone();
+                let mut stream_shutdown=force_shutdown.clone();
+                tokio::task::spawn(async move {
+                    let _lifetime=stream_lifetime;
+                    tokio::select!{_=stream_shutdown.changed()=>{},_=handle.in_current_span()=>{}}
+                });
             }
             reason = &mut ping_drop_rx => {
                 // Ideally this would be a warning/error message. However, due to an issue during shutdown,
@@ -188,7 +194,7 @@ where
                 conn.abrupt_shutdown(h2::Reason::NO_ERROR);
                 break
             }
-            _shutdown = drain.wait_for_drain() => {
+            _shutdown = drain.clone().wait_for_drain() => {
                 debug!("starting graceful drain...");
                 conn.graceful_shutdown();
                 break;
@@ -223,6 +229,7 @@ where
         }
     }
     // Mark we are done with the connection
+    drop(ping);
     drop(drain);
     Ok(())
 }

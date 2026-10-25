@@ -77,6 +77,7 @@ impl Socks5 {
             self.pi.crl_manager.clone(),
             self.pi.metrics.clone(),
         );
+        let pool_shutdown = pool.clone();
         let accept = async move |drain: DrainWatcher, force_shutdown: watch::Receiver<()>| {
             loop {
                 // Asynchronously wait for an inbound socket.
@@ -136,7 +137,8 @@ impl Socks5 {
             pi.cfg.self_termination_deadline,
             accept,
         )
-        .await
+        .await;
+        pool_shutdown.shutdown().await
     }
 }
 async fn handle_socks_connection(mut oc: OutboundConnection, mut stream: TcpStream) {

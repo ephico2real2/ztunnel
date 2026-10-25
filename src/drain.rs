@@ -15,7 +15,7 @@ use tracing::Instrument;
 
 use std::time::Duration;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::info;
 
 pub use internal::DrainMode;
 pub use internal::ReleaseShutdown as DrainBlocker;
@@ -52,27 +52,31 @@ pub async fn run_with_drain<F, O>(
     // Stop accepting once we drain.
     // We will then allow connections up to `deadline` to terminate on their own.
     // After that, they will be forcefully terminated.
+    let parent_lifetime = drain.clone();
     let fut = make_future(sub_drain, force_shutdown).in_current_span();
     tokio::select! {
-        _res = fut => {}
-        res = drain.wait_for_drain() => {
-            if res.mode() == DrainMode::Graceful {
-                debug!(component, "drain started, waiting {:?} for any connections to complete", deadline);
-                if tokio::time::timeout(deadline, sub_drain_signal.start_drain_and_wait(DrainMode::Graceful)).await.is_err() {
-                    // Not all connections completed within time, we will force shut them down
-                    warn!(component, "drain duration expired with pending connections, forcefully shutting down");
-                }
-            } else {
-                debug!(component, "terminating");
-            }
-            // Trigger force shutdown. In theory, this is only needed in the timeout case. However,
-            // it doesn't hurt to always trigger it.
+        _res = fut => {
+            // A listener can stop on its own while spawned connections remain.
+            // Do not release this component's parent lifetime until they stop.
             let _ = trigger_force_shutdown.send(());
-
-            info!(component, "shutdown complete");
+            sub_drain_signal.start_drain_and_wait(DrainMode::Immediate).await;
+        }
+        res = drain.wait_for_drain() => {
+            // Keep the stop future after a graceful timeout. Dropping the
+            // timeout future must not discard the outstanding child barrier.
+            let mut children = Box::pin(sub_drain_signal.start_drain_and_wait(res.mode()));
+            let completed = if res.mode() == DrainMode::Graceful {
+                tokio::time::timeout(deadline, &mut children).await.is_ok()
+            } else { false };
+            if !completed {
+                let _ = trigger_force_shutdown.send(());
+                children.await;
+            }
+            info!(component, "shutdown complete; owned child lifetimes released");
             drop(res);
         }
     };
+    drop(parent_lifetime);
 }
 
 mod internal {
@@ -189,6 +193,81 @@ mod internal {
     impl std::fmt::Debug for ReleaseShutdown {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("ReleaseShutdown").finish_non_exhaustive()
+        }
+    }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parent_completion_waits_for_actual_child_socket_release() {
+        for (mode, natural) in [
+            (DrainMode::Immediate, false),
+            (DrainMode::Graceful, false),
+            (DrainMode::Immediate, true),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut peer = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let (signal, watch) = new();
+            let (started_tx, started) = tokio::sync::oneshot::channel();
+            let (forced_tx, forced) = tokio::sync::oneshot::channel();
+            let (release_tx, release) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(run_with_drain(
+                "owned-test".into(),
+                watch,
+                Duration::from_millis(20),
+                async move |lifetime, mut force| {
+                    let child_lifetime = lifetime.clone();
+                    tokio::spawn(async move {
+                        socket.write_all(b"A").await.unwrap();
+                        let _ = started_tx.send(());
+                        force.changed().await.unwrap();
+                        let _ = forced_tx.send(());
+                        release.await.unwrap();
+                        drop(socket);
+                        drop(child_lifetime);
+                    });
+                    if !natural {
+                        let _lifetime = lifetime;
+                        std::future::pending::<()>().await;
+                    }
+                },
+            ));
+            started.await.unwrap();
+            let mut byte = [0];
+            assert_eq!(peer.read(&mut byte).await.unwrap(), 1);
+            let stopped = tokio::spawn(signal.start_drain_and_wait(mode));
+            tokio::time::timeout(Duration::from_secs(2), forced)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                !stopped.is_finished(),
+                "parent completed before a real owned socket was dropped"
+            );
+            assert!(
+                !task.is_finished(),
+                "component released its lifetime before owned socket closure"
+            );
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), peer.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            tokio::time::timeout(Duration::from_secs(2), stopped)
+                .await
+                .unwrap()
+                .unwrap();
+            task.await.unwrap();
         }
     }
 }

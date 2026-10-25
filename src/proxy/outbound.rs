@@ -89,6 +89,7 @@ impl Outbound {
             self.pi.metrics.clone(),
         );
         let pi = self.pi.clone();
+        let pool_shutdown = pool.clone();
         let accept = async move |drain: DrainWatcher, force_shutdown: watch::Receiver<()>| {
             loop {
                 // Asynchronously wait for an inbound socket.
@@ -151,7 +152,8 @@ impl Outbound {
             pi.cfg.self_termination_deadline,
             accept,
         )
-        .await
+        .await;
+        pool_shutdown.shutdown().await
     }
 }
 

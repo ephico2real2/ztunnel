@@ -22,7 +22,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use tokio::sync::watch;
 
@@ -55,6 +55,8 @@ pub struct WorkloadHBONEPool {
 
 // PoolState is effectively the gnarly inner state stuff that needs thread/task sync, and should be wrapped in a Mutex.
 struct PoolState {
+    tasks: tokio_util::task::TaskTracker,
+    closed: Arc<AtomicBool>,
     pool_notifier: watch::Sender<bool>, // This is already impl clone? rustc complains that it isn't, tho
     timeout_tx: watch::Sender<bool>, // This is already impl clone? rustc complains that it isn't, tho
     // this is effectively just a convenience data type - a rwlocked hashmap with keying and LRU drops
@@ -70,6 +72,8 @@ struct PoolState {
 }
 
 struct ConnSpawner {
+    tasks: tokio_util::task::TaskTracker,
+    closed: Arc<AtomicBool>,
     cfg: Arc<config::Config>,
     socket_factory: Arc<dyn SocketFactory + Send + Sync>,
     local_workload: Arc<LocalWorkloadInformation>,
@@ -81,6 +85,10 @@ struct ConnSpawner {
 // Does nothing but spawn new conns when asked
 impl ConnSpawner {
     async fn new_pool_conn(&self, key: WorkloadKey) -> Result<H2ConnectClient, Error> {
+        let _creation = self.tasks.token();
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::WorkloadHBONEPoolDraining);
+        }
         debug!("spawning new pool conn for {}", key);
 
         let cert = self.local_workload.fetch_certificate().await?;
@@ -109,14 +117,18 @@ impl ConnSpawner {
                     .record_crl_rejection(crate::proxy::metrics::Reporter::source);
             }
         })?;
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::WorkloadHBONEPoolDraining);
+        }
         trace!("connector connected, handshaking");
-        let mut sender = h2::client::spawn_connection(
+        let mut sender = h2::client::spawn_owned_connection(
             self.cfg.clone(),
             tls_stream,
             self.timeout_rx.clone(),
             key,
             revocation,
             Default::default(),
+            Some(self.tasks.clone()),
         )
         .await?;
         sender.bind_profile(lease);
@@ -146,6 +158,10 @@ impl PoolState {
     // Note that this simply removes the client ref from this pool - if other things hold client/streamrefs refs,
     // they must also drop those before the underlying connection is fully closed.
     fn maybe_checkin_conn(&self, conn: H2ConnectClient, pool_key: pingora_pool::ConnectionMeta) {
+        let _creation = self.tasks.token();
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
         if conn.will_be_at_max_streamcount() {
             debug!(
                 "checked out connection for {:?} is now at max streamcount; removing from pool",
@@ -158,12 +174,14 @@ impl PoolState {
         let pool_ref = self.connected_pool.clone();
         let pool_key_ref = pool_key.clone();
         let release_timeout = self.pool_unused_release_timeout;
-        tokio::spawn(
+        self.tasks.spawn(
             async move {
                 debug!("starting an idle timeout for connection {:?}", pool_key_ref);
-                pool_ref
-                    .idle_timeout(&pool_key_ref, Some(release_timeout), evict, rx, pickup)
-                    .await;
+                let mut forced=rx.clone();
+                tokio::select!{
+                    _=h2::client::wait_driver_drain(&mut forced)=>{},
+                    _=pool_ref.idle_timeout(&pool_key_ref,Some(release_timeout),evict,rx,pickup)=>{},
+                }
                 debug!(
                     "connection {:?} was removed/checked out/timed out of the pool",
                     pool_key_ref
@@ -365,8 +383,11 @@ impl WorkloadHBONEPool {
         let (timeout_tx, timeout_rx) = watch::channel(false);
         let (timeout_send, timeout_recv) = watch::channel(false);
         let pool_duration = cfg.pool_unused_release_timeout;
-
+        let tasks = tokio_util::task::TaskTracker::new();
+        let closed = Arc::new(AtomicBool::new(false));
         let spawner = ConnSpawner {
+            tasks: tasks.clone(),
+            closed: closed.clone(),
             cfg,
             socket_factory,
             local_workload,
@@ -377,6 +398,8 @@ impl WorkloadHBONEPool {
 
         Self {
             state: Arc::new(PoolState {
+                tasks,
+                closed,
                 pool_notifier: timeout_tx,
                 timeout_tx: timeout_send,
                 // timeout_rx: timeout_recv,
@@ -392,11 +415,21 @@ impl WorkloadHBONEPool {
         }
     }
 
+    pub(crate) async fn shutdown(&self) {
+        self.state.closed.store(true, Ordering::Release);
+        let _ = self.state.timeout_tx.send(true);
+        self.state.tasks.close();
+        self.state.tasks.wait().await;
+    }
+
     pub async fn send_request_pooled(
         &mut self,
         workload_key: &WorkloadKey,
         request: http::Request<()>,
     ) -> Result<(H2Stream, Option<Baggage>), Error> {
+        if self.state.closed.load(Ordering::Acquire) {
+            return Err(Error::WorkloadHBONEPoolDraining);
+        }
         if let Some(provider) = self.state.spawner.local_workload.state.profile_provider() {
             // An unavailable configured provider is never a reason to try the
             // legacy pool. Cached drivers have their own lease-bound I/O too.
@@ -1088,5 +1121,29 @@ mod test {
             src: IpAddr::from([127, 0, 0, ip]),
             dst: srv.addr,
         }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn explicit_shutdown_waits_for_idle_hbone_socket_and_rejects_reuse() {
+        let (mut pool, mut server) = setup_test_with_idle(4, Duration::from_secs(3600)).await;
+        let workload = key(&server, 1);
+        spawn_clients_concurrently(pool.clone(), workload.clone(), server.addr, 1).await;
+        assert_opens_drops!(server, 1, 0);
+        tokio::time::timeout(Duration::from_secs(2), pool.shutdown())
+            .await
+            .unwrap();
+        assert_opens_drops!(server, 1, 1);
+        let request = hyper::Request::builder()
+            .method(hyper::Method::CONNECT)
+            .uri(format!("{}", server.addr))
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            pool.send_request_pooled(&workload, request).await,
+            Err(Error::WorkloadHBONEPoolDraining)
+        ));
+        // Idempotent repeated shutdown cannot open a fresh driver.
+        tokio::time::timeout(Duration::from_secs(2), pool.shutdown())
+            .await
+            .unwrap();
     }
 }

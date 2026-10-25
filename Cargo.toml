@@ -116,7 +116,7 @@ http = "1.4"
 split-iter = "0.1"
 arcstr = { version = "1.2", features = ["serde"] }
 tracing-core = "0.1"
-tokio-util = { version = "0.7", features = ["io-util"] }
+tokio-util = { version = "0.7", features = ["io-util", "rt"] }
 educe = "0.7"
 spire-api = "0.3.6"
 spiffe = "0.7"

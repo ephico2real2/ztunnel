@@ -80,6 +80,7 @@ impl Default for ConnectionManager {
 }
 
 pub struct ConnectionGuard {
+    released: bool,
     cm: ConnectionManager,
     conn: InboundConnection,
     watch: Option<DrainWatcher>,
@@ -106,14 +107,15 @@ impl ConnectionGuard {
     pub fn watcher(&mut self) -> drain::DrainWatcher {
         self.watch.take().expect("watch cannot be taken twice")
     }
-    pub fn release(self) {
+    pub fn release(mut self) {
+        self.released = true;
         self.cm.release(&self.conn);
     }
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        if self.watch.is_some() {
+        if !self.released {
             debug!("rbac context {:?} auto-dropped", &self.conn);
             self.cm.release(&self.conn)
         }
@@ -243,6 +245,7 @@ impl ConnectionManager {
             cm: self.clone(),
             conn,
             watch: Some(watch),
+            released: false,
         })
     }
     // register a connection with the connection manager
@@ -339,6 +342,12 @@ impl ConnectionManager {
             .keys()
             .cloned()
             .collect()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.drains.read().expect("mutex").is_empty()
+            && self.outbound_connections.read().expect("mutex").is_empty()
+            && self.outbound_drains.read().expect("mutex").is_empty()
     }
 
     //  get a list of all connections being tracked
@@ -513,6 +522,7 @@ mod tests {
                 cm,
                 conn: c,
                 watch: Some(watch),
+                released: false,
             }
         };
 
@@ -615,6 +625,7 @@ mod tests {
                 cm,
                 conn: c,
                 watch: Some(watch),
+                released: false,
             }
         };
 
@@ -1139,5 +1150,53 @@ mod tests {
     async fn assert_close(c: DrainWatcher) {
         let result = tokio::time::timeout(Duration::from_secs(1), c.wait_for_drain()).await;
         assert!(result.is_ok())
+    }
+    #[test]
+    fn dropping_guard_after_taking_watcher_releases_exactly_one_registry_reference() {
+        let manager = ConnectionManager::default();
+        let connection = InboundConnection {
+            ctx: crate::state::ProxyRbacContext {
+                conn: Connection {
+                    src: "10.1.2.3:42000".parse().unwrap(),
+                    dst: "10.1.2.4:8080".parse().unwrap(),
+                    src_identity: None,
+                    dst_network: "".into(),
+                },
+                dest_workload: Arc::new(test_default_workload()),
+            },
+            dest_service: None,
+        };
+        let first = manager.register(&connection).unwrap();
+        let second = manager.register(&connection).unwrap();
+        let mut guard = ConnectionGuard {
+            cm: manager.clone(),
+            conn: connection.clone(),
+            watch: Some(first),
+            released: false,
+        };
+        let watch = guard.watcher();
+        drop(guard);
+        drop(watch);
+        assert_eq!(
+            manager
+                .drains
+                .read()
+                .unwrap()
+                .get(&connection)
+                .unwrap()
+                .count,
+            1
+        );
+        let final_guard = ConnectionGuard {
+            cm: manager.clone(),
+            conn: connection.clone(),
+            watch: Some(second),
+            released: false,
+        };
+        final_guard.release();
+        assert!(
+            manager.connections().is_empty(),
+            "explicit release must not double-release another reference"
+        );
     }
 }
