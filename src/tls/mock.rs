@@ -267,3 +267,18 @@ pub fn generate_intermediate_ca(root_ca_key: &[u8]) -> (String, String, Vec<u8>)
     let ia_key_pem = ia_kp.serialize_pem();
     (ia_key_pem, ia_cert_pem, ia_serial.to_bytes())
 }
+
+#[cfg(test)]
+pub(crate) fn fixture_client_verifier() -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
+    use rustls::pki_types::pem::PemObject;
+    let root =
+        rustls::pki_types::CertificateDer::from_pem_slice(crate::tls::mock::TEST_ROOT).unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(root).unwrap();
+    rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        super::lib::provider(),
+    )
+    .build()
+    .unwrap()
+}

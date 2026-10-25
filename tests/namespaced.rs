@@ -1523,6 +1523,7 @@ mod namespaced {
         use ztunnel::tls::mock::crl_pem_revoking_cert;
 
         let mut manager = setup_netns_test!(Shared);
+        manager.use_stable_crl_certificates()?;
 
         // Deploy the local (client-side) ztunnel first so we can access its cert_manager.
         let local_zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
@@ -1615,6 +1616,7 @@ mod namespaced {
         use ztunnel::tls::mock::crl_pem_revoking_cert;
 
         let mut manager = setup_netns_test!(Shared);
+        manager.use_stable_crl_certificates()?;
 
         // Deploy the remote (server-side) ztunnel first so we can access its cert_manager.
         let remote_zt = manager.deploy_ztunnel(REMOTE_NODE).await?;
@@ -1659,6 +1661,40 @@ mod namespaced {
             .register()
             .await?;
         let srv = resolve_target(manager.resolver(), "server");
+
+        // A generic TLS failure cannot establish CRL enforcement. Check the
+        // actual DER windows and exact targeted serial before starting traffic.
+        // If the fixture rotates or its wall clock moves beyond the bounded
+        // issuance margin, fail here with that cause instead of misclassifying it.
+        let current_server = remote_zt
+            .cert_manager
+            .fetch_certificate(&identity::Identity::from_parts(
+                identity::DEFAULT_TRUST_DOMAIN.into(),
+                "default".into(),
+                "server".into(),
+            ))
+            .await?;
+        anyhow::ensure!(
+            current_server.cert.serial_bytes() == revoked_cert.cert.serial_bytes(),
+            "CRL fixture server certificate rotated before traffic"
+        );
+        let current_client = local_zt
+            .cert_manager
+            .fetch_certificate(&identity::Identity::from_parts(
+                identity::DEFAULT_TRUST_DOMAIN.into(),
+                "default".into(),
+                "client".into(),
+            ))
+            .await?;
+        for (role, certificate) in [("server", &current_server), ("client", &current_client)] {
+            let (_, parsed) = x509_parser::parse_x509_certificate(&certificate.cert.der)
+                .map_err(|error| anyhow::anyhow!("invalid {role} fixture DER: {error:?}"))?;
+            anyhow::ensure!(
+                parsed.validity().is_valid(),
+                "{role} CRL fixture certificate is not currently time-valid: {:?}",
+                parsed.validity()
+            );
+        }
 
         // run a TCP client expecting the connection to be terminated due to the CRL revoking the server workload's cert
         client
@@ -1709,6 +1745,7 @@ mod namespaced {
         use ztunnel::tls::mock::crl_pem_revoking_cert;
 
         let mut manager = setup_netns_test!(Shared);
+        manager.use_stable_crl_certificates()?;
 
         // deploy the client-side ztunnel first so we can read the client workload cert it presents
         // to the server during HBONE mTLS, and pre-build the CRL that revokes it.
@@ -1806,6 +1843,7 @@ mod namespaced {
         use ztunnel::tls::mock::crl_pem_revoking_cert;
 
         let mut manager = setup_netns_test!(Shared);
+        manager.use_stable_crl_certificates()?;
 
         // deploy the server-side ztunnel first so we can read the server workload cert it presents
         // to the client during HBONE mTLS, and pre-build the CRL that revokes it.

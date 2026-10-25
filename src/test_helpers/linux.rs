@@ -35,7 +35,7 @@ use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tracing::info;
 
@@ -56,6 +56,7 @@ pub struct WorkloadManager {
     mode: TestMode,
     tmp_dir: PathBuf,
     drops: Vec<ShutdownTrigger>,
+    stable_crl_certificates: bool,
 }
 
 #[derive(Debug)]
@@ -87,6 +88,34 @@ pub enum TestMode {
     Dedicated,
 }
 
+// Network integration tests validate packet and revocation behavior, not the
+// mock CA's 10-second rotation scheduler. Keep their serials stable across
+// namespace/process startup and backdate only this test fixture's issuance.
+// The mock's monotonic->wall-clock anchor can lead the VM's current wall clock
+// after clock correction. Production rustls time verification is unchanged.
+const NETWORK_FIXTURE_CERT_LIFETIME: Duration = Duration::from_secs(300);
+const NETWORK_FIXTURE_CERT_BACKDATE: Duration = Duration::from_secs(2);
+fn network_fixture_ca_config(
+    stable_crl: bool,
+    now: SystemTime,
+) -> identity::mock::SecretManagerConfig {
+    if !stable_crl {
+        return identity::mock::SecretManagerConfig {
+            cert_lifetime: Duration::from_secs(10),
+            fetch_latency: Duration::ZERO,
+            epoch: None,
+        };
+    }
+    identity::mock::SecretManagerConfig {
+        cert_lifetime: NETWORK_FIXTURE_CERT_LIFETIME,
+        fetch_latency: Duration::ZERO,
+        epoch: Some(
+            now.checked_sub(NETWORK_FIXTURE_CERT_BACKDATE)
+                .expect("network test wall clock must be after UNIX epoch plus fixture backdate"),
+        ),
+    }
+}
+
 impl WorkloadManager {
     /// new instantiates a manager with the given name. Using a unique name between tests is critical.
     pub fn new(name: &str, mode: TestMode) -> anyhow::Result<Self> {
@@ -102,7 +131,19 @@ impl WorkloadManager {
             services: HashMap::new(),
             policies: vec![],
             drops: vec![],
+            stable_crl_certificates: false,
         })
+    }
+
+    /// Select only for CRL tests that revoke a fixed certificate serial. Keep
+    /// ordinary namespace and rotation fixtures on their existing 10s profile.
+    pub fn use_stable_crl_certificates(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.ztunnels.is_empty(),
+            "select stable CRL certificates before deploying any ztunnel"
+        );
+        self.stable_crl_certificates = true;
+        Ok(())
     }
 
     pub fn mode(&self) -> TestMode {
@@ -206,6 +247,7 @@ impl WorkloadManager {
         let cfg_ztunnel_identity = ztunnel_shared_identity.clone();
         let cfg_ztunnel_workload_info = ztunnel_shared_workload_info.clone();
         let base_config = cfg_override.unwrap_or_else(|| config::parse_config().unwrap());
+        let stable_crl_certificates = self.stable_crl_certificates;
 
         // Config for the workload this ztunnel instance is proxying for :
         // If Shared, ztunnel is effectively proxying for itself
@@ -252,7 +294,9 @@ impl WorkloadManager {
                     // inside the pod's netns
                     helpers::run_command("scripts/ztunnel-redirect.sh")?;
                 }
-                let cert_manager = identity::mock::new_secret_manager(Duration::from_secs(10));
+                let cert_manager = identity::mock::new_secret_manager_cfg(
+                    network_fixture_ca_config(stable_crl_certificates, SystemTime::now()),
+                );
                 let app = crate::app::build_with_cert(Arc::new(cfg), cert_manager.clone()).await?;
                 let shutdown = app.shutdown.trigger();
 
@@ -660,5 +704,98 @@ impl<'a> TestWorkloadBuilder<'a> {
         }
         self.manager.refresh_config().await?;
         Ok(network_namespace)
+    }
+}
+
+#[cfg(test)]
+mod certificate_fixture_tests {
+    use super::*;
+    use crate::tls::mock::fixture_client_verifier as verifier;
+    use rustls::pki_types::UnixTime;
+
+    #[test]
+    fn ordinary_namespace_fixture_keeps_original_rotation_profile() {
+        let cfg = network_fixture_ca_config(false, SystemTime::now());
+        assert_eq!(cfg.cert_lifetime, Duration::from_secs(10));
+        assert_eq!(cfg.fetch_latency, Duration::ZERO);
+        assert!(cfg.epoch.is_none());
+    }
+    #[test]
+    fn network_fixture_one_second_clock_lead_stays_valid_without_relaxing_tls() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_792_904_524);
+        let config = network_fixture_ca_config(true, now + Duration::from_secs(1));
+        let not_before = config.epoch.unwrap();
+        let id: crate::tls::mock::TestIdentity = identity::Identity::from_parts(
+            "cluster.local".into(),
+            "default".into(),
+            "client".into(),
+        )
+        .into();
+        let cert = crate::tls::mock::generate_test_certs_at(
+            &id,
+            not_before,
+            not_before + config.cert_lifetime,
+            None,
+        );
+        let validation_time =
+            UnixTime::since_unix_epoch(now.duration_since(SystemTime::UNIX_EPOCH).unwrap());
+        verifier()
+            .verify_client_cert(&cert.cert.der, &[], validation_time)
+            .unwrap();
+        let (_, parsed) = x509_parser::parse_x509_certificate(&cert.cert.der).unwrap();
+        assert!(parsed.validity().not_before.timestamp() <= validation_time.as_secs() as i64);
+        assert!(parsed.validity().not_after.timestamp() >= validation_time.as_secs() as i64 + 60);
+    }
+    #[test]
+    fn future_and_expired_certificates_still_fail_without_a_false_crl_classification() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_792_904_524);
+        let id: crate::tls::mock::TestIdentity = identity::Identity::from_parts(
+            "cluster.local".into(),
+            "default".into(),
+            "client".into(),
+        )
+        .into();
+        let validation_time =
+            UnixTime::since_unix_epoch(now.duration_since(SystemTime::UNIX_EPOCH).unwrap());
+        for (start, end) in [
+            (now + Duration::from_secs(1), now + Duration::from_secs(300)),
+            (now - Duration::from_secs(10), now - Duration::from_secs(1)),
+        ] {
+            let certificate = crate::tls::mock::generate_test_certs_at(&id, start, end, None);
+            let error = verifier()
+                .verify_client_cert(&certificate.cert.der, &[], validation_time)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::NotValidYetContext { .. }
+                            | rustls::CertificateError::ExpiredContext { .. }
+                    )
+                ),
+                "{error:?}"
+            );
+            let io = std::io::Error::new(std::io::ErrorKind::InvalidData, error);
+            assert!(
+                !crate::tls::io_error_is_cert_revoked(&io),
+                "time invalidity is not a CRL rejection"
+            );
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn network_fixture_keeps_targeted_serial_stable_through_slow_startup() {
+        let manager = identity::mock::new_secret_manager_cfg(network_fixture_ca_config(
+            true,
+            SystemTime::now(),
+        ));
+        let id = identity::Identity::from_parts(
+            "cluster.local".into(),
+            "default".into(),
+            "server".into(),
+        );
+        let before = manager.fetch_certificate(&id).await.unwrap();
+        tokio::time::advance(Duration::from_secs(20)).await;
+        let after = manager.fetch_certificate(&id).await.unwrap();
+        assert_eq!(before.cert.serial_bytes(), after.cert.serial_bytes());
     }
 }
