@@ -1018,6 +1018,28 @@ pub mod spire_tests {
         Ok(params)
     }
 
+    #[test]
+    fn native_spire_certificate_chain_contains_leaf_once() {
+        let svid = generate_svid(
+            "spiffe://cmtc-a.mesh.example/ns/demo/sa/client",
+            "exact-direct-signer",
+        );
+        assert_eq!(svid.cert_chain().len(), 2);
+        let issuer = svid.cert_chain().last().unwrap();
+        let cert = tls::WorkloadCertificate::new_svid(&svid, std::slice::from_ref(issuer))
+            .expect("actual parsed X509Svid fixture must convert");
+        let emitted = cert.cert_and_intermediates();
+        assert_eq!(
+            emitted.len(),
+            2,
+            "leaf must not be duplicated as an intermediate"
+        );
+        assert_eq!(emitted[0].der.as_ref(), svid.leaf().content());
+        assert_eq!(emitted[1].der.as_ref(), issuer.content());
+        assert_eq!(cert.chain.len(), 1);
+        assert_eq!(cert.chain[0].der.as_ref(), issuer.content());
+    }
+
     fn generate_svid(spiffe_id: &str, cn: &str) -> X509Svid {
         let ca_key = KeyPair::generate().unwrap();
         let ca_params = ca_params(cn).unwrap();

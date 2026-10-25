@@ -296,6 +296,9 @@ impl WorkloadCertificate {
         let chain = svid
             .cert_chain()
             .iter()
+            // spiffe::X509Svid::cert_chain includes the leaf at index zero.
+            // WorkloadCertificate stores it separately in `cert`.
+            .skip(1)
             .map(|c| {
                 let (_, cert) = x509_parser::parse_x509_certificate(c.content()).unwrap();
                 Certificate {
