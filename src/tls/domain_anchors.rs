@@ -68,6 +68,7 @@ pub struct DomainPin {
     trust_domain: Strng,
     spki_der: Vec<u8>,
     der: CertificateDer<'static>,
+    lineage: Vec<CertificateDer<'static>>,
     not_before: SystemTime,
     not_after: SystemTime,
 }
@@ -182,6 +183,12 @@ fn validity(cert: &X509Certificate<'_>) -> Result<(SystemTime, SystemTime), Anch
     Ok((before, after))
 }
 fn ca_material(cert: &X509Certificate<'_>) -> Result<(), AnchorError> {
+    ca_material_for_domain(cert, None)
+}
+fn ca_material_for_domain(
+    cert: &X509Certificate<'_>,
+    domain: Option<&Strng>,
+) -> Result<(), AnchorError> {
     let bc = cert
         .basic_constraints()
         .map_err(|_| AnchorError::BadEncoding)?
@@ -193,16 +200,17 @@ fn ca_material(cert: &X509Certificate<'_>) -> Result<(), AnchorError> {
     if !bc.critical || !bc.value.ca || !ku.value.key_cert_sign() {
         return Err(AnchorError::BadEncoding);
     }
-    // Narrow direct-issuer profile. Reject constraints we would otherwise lose
-    // by converting a certificate into a trust anchor.
+    // Retain all existing extension constraints. The only additional signer
+    // field is SPIRE's exact trust-domain URI SAN. It never assigns authority.
     for ext in cert.extensions() {
-        if !matches!(
-            ext.parsed_extension(),
-            ParsedExtension::BasicConstraints(_)
-                | ParsedExtension::KeyUsage(_)
-                | ParsedExtension::SubjectKeyIdentifier(_)
-                | ParsedExtension::AuthorityKeyIdentifier(_)
-        ) {
+        let allowed=match ext.parsed_extension(){
+            ParsedExtension::BasicConstraints(_)|ParsedExtension::KeyUsage(_)|ParsedExtension::SubjectKeyIdentifier(_)|ParsedExtension::AuthorityKeyIdentifier(_)=>true,
+            ParsedExtension::SubjectAlternativeName(san)=>domain.is_some_and(|domain|{
+                san.general_names.len()==1 && matches!(&san.general_names[0],GeneralName::URI(uri) if *uri==format!("spiffe://{domain}"))
+            }),
+            _=>false,
+        };
+        if !allowed {
             return Err(AnchorError::BadEncoding);
         }
     }
@@ -212,29 +220,77 @@ fn ca_material(cert: &X509Certificate<'_>) -> Result<(), AnchorError> {
 pub fn spki_der(der: &[u8]) -> Result<Vec<u8>, AnchorError> {
     Ok(parse_exact(der)?.public_key().raw.to_vec())
 }
+fn ca_depth_allows(cert: &X509Certificate<'_>, below: u32) -> Result<bool, AnchorError> {
+    let constraints = cert
+        .basic_constraints()
+        .map_err(|_| AnchorError::BadEncoding)?
+        .ok_or(AnchorError::BadEncoding)?;
+    Ok(constraints
+        .value
+        .path_len_constraint
+        .is_none_or(|depth| depth >= below))
+}
 pub fn pin_from_certificate(
     trust_domain: Strng,
     der: CertificateDer<'static>,
 ) -> Result<DomainPin, AnchorError> {
+    pin_from_certificate_with_lineage(trust_domain, der, Vec::new())
+}
+// Lineage is administrator-approved public material, not a discovered bundle.
+// The optional single parent is never placed in the peer workload root store.
+pub fn pin_from_certificate_with_lineage(
+    trust_domain: Strng,
+    der: CertificateDer<'static>,
+    lineage: Vec<CertificateDer<'static>>,
+) -> Result<DomainPin, AnchorError> {
     validate_domain(&trust_domain)?;
+    if lineage.len() > 1 {
+        return Err(AnchorError::InvalidPin(trust_domain.to_string()));
+    }
     let cert = parse_exact(der.as_ref())?;
-    ca_material(&cert)?;
-    let (not_before, not_after) = validity(&cert)?;
+    ca_material_for_domain(&cert, Some(&trust_domain))?;
+    let (mut not_before, mut not_after) = validity(&cert)?;
     let spki_der = cert.public_key().raw.to_vec();
+    if let Some(parent_der) = lineage.first() {
+        let parent = parse_exact(parent_der.as_ref())?;
+        ca_material(&parent)?;
+        if spki_der.as_slice() == parent.public_key().raw
+            || !ca_depth_allows(&parent, 1)?
+            || cert.issuer() != parent.subject()
+            || cert.verify_signature(Some(parent.public_key())).is_err()
+        {
+            return Err(AnchorError::InvalidPin(trust_domain.to_string()));
+        }
+        let (before, after) = validity(&parent)?;
+        not_before = not_before.max(before);
+        not_after = not_after.min(after);
+    }
+    if not_before >= not_after {
+        return Err(AnchorError::InvalidPin(trust_domain.to_string()));
+    }
     Ok(DomainPin {
         trust_domain,
         spki_der,
         der,
+        lineage,
         not_before,
         not_after,
     })
 }
 impl DomainPin {
+    pub fn lineage_ders(&self) -> &[CertificateDer<'static>] {
+        &self.lineage
+    }
     fn current(&self, now: SystemTime) -> bool {
         self.not_before <= now && now < self.not_after
     }
     fn validate_encoded(&self) -> Result<(), AnchorError> {
-        if pin_from_certificate(self.trust_domain.clone(), self.der.clone())? != *self {
+        if pin_from_certificate_with_lineage(
+            self.trust_domain.clone(),
+            self.der.clone(),
+            self.lineage.clone(),
+        )? != *self
+        {
             return Err(AnchorError::InvalidPin(self.trust_domain.to_string()));
         }
         Ok(())
@@ -248,6 +304,15 @@ impl DomainAnchorSet {
         organizational_root: CertificateDer<'static>,
         generation: u64,
         pins: Vec<DomainPin>,
+    ) -> Result<Self, AnchorError> {
+        Self::try_new_inner(local_domain, organizational_root, generation, pins, true)
+    }
+    fn try_new_inner(
+        local_domain: Strng,
+        organizational_root: CertificateDer<'static>,
+        generation: u64,
+        pins: Vec<DomainPin>,
+        require_local: bool,
     ) -> Result<Self, AnchorError> {
         validate_domain(&local_domain)?;
         if generation == 0 {
@@ -271,12 +336,37 @@ impl DomainAnchorSet {
         let (root_not_before, root_not_after) = validity(&root)?;
         let organizational_root_spki = root.public_key().raw.to_vec();
         let mut by_domain: HashMap<Strng, Vec<DomainPin>> = HashMap::new();
+        let signer_keys: HashSet<Vec<u8>> = pins.iter().map(|pin| pin.spki_der.clone()).collect();
         let mut seen = HashSet::new();
+        let mut parent_owners: HashMap<Vec<u8>, (Strng, Vec<u8>)> = HashMap::new();
         for pin in pins {
             pin.validate_encoded()?;
             let cert = parse_exact(pin.der.as_ref())?;
-            if pin.spki_der == organizational_root_spki
-                || !seen.insert(pin.spki_der.clone())
+            if pin.spki_der == organizational_root_spki || !seen.insert(pin.spki_der.clone()) {
+                return Err(AnchorError::InvalidPin(pin.trust_domain.to_string()));
+            }
+            if let Some(parent_der) = pin.lineage.first() {
+                let parent = parse_exact(parent_der.as_ref())?;
+                let key = parent.public_key().raw.to_vec();
+                if key == organizational_root_spki
+                    || signer_keys.contains(&key)
+                    || !ca_depth_allows(&root, 2)?
+                    || !ca_depth_allows(&parent, 1)?
+                    || parent.issuer() != root.subject()
+                    || parent.verify_signature(Some(root.public_key())).is_err()
+                {
+                    return Err(AnchorError::InvalidPin(pin.trust_domain.to_string()));
+                }
+                if parent_owners.get(&key).is_some_and(|(domain, der)| {
+                    domain != &pin.trust_domain || der.as_slice() != parent_der.as_ref()
+                }) {
+                    return Err(AnchorError::InvalidPin(pin.trust_domain.to_string()));
+                }
+                parent_owners.insert(
+                    key,
+                    (pin.trust_domain.clone(), parent_der.as_ref().to_vec()),
+                );
+            } else if !ca_depth_allows(&root, 1)?
                 || cert.issuer() != root.subject()
                 || cert.verify_signature(Some(root.public_key())).is_err()
             {
@@ -287,7 +377,7 @@ impl DomainAnchorSet {
                 .or_default()
                 .push(pin);
         }
-        if !by_domain.contains_key(&local_domain) {
+        if require_local && !by_domain.contains_key(&local_domain) {
             return Err(AnchorError::UntrustedTrustDomain(local_domain.to_string()));
         }
         Ok(Self {
@@ -570,6 +660,196 @@ pub struct AnchorPublication {
     set: DomainAnchorSet,
     bundle_fenced: HashSet<Vec<u8>>,
     drain_admitted_before: HashMap<Vec<u8>, u64>,
+}
+
+// Public certificate/key material only. No expiry/ACK/readiness assertion is
+// trusted from disk. This format preserves revocation and connection cutoffs.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnchorCheckpoint {
+    pub sequence: u64,
+    pub local_domain: String,
+    pub root_der: String,
+    pub pins: Vec<CheckpointPin>,
+    pub fenced_spkis: Vec<String>,
+    pub drain_before: Vec<CheckpointCutoff>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointPin {
+    pub domain: String,
+    pub certificate_der: String,
+    pub lineage_der: Vec<String>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointCutoff {
+    pub spki_der: String,
+    pub sequence: u64,
+}
+pub const MAX_CHECKPOINT_KEYS: usize = 256;
+pub const MAX_CHECKPOINT_PINS: usize = 32;
+fn checkpoint_b64(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+fn checkpoint_der(value: &str, limit: usize) -> Result<Vec<u8>, AnchorError> {
+    use base64::Engine;
+    if value.is_empty() || value.len() > limit.saturating_mul(4).div_ceil(3) + 4 {
+        return Err(AnchorError::BadEncoding);
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| AnchorError::BadEncoding)?;
+    if bytes.is_empty() || bytes.len() > limit || checkpoint_b64(&bytes) != value {
+        return Err(AnchorError::BadEncoding);
+    }
+    Ok(bytes)
+}
+impl AnchorPublication {
+    pub fn checkpoint(&self) -> Result<AnchorCheckpoint, AnchorError> {
+        let mut pins: Vec<_> = self
+            .set
+            .by_domain
+            .values()
+            .flatten()
+            .map(|p| CheckpointPin {
+                domain: p.trust_domain.to_string(),
+                certificate_der: checkpoint_b64(p.der.as_ref()),
+                lineage_der: p
+                    .lineage_ders()
+                    .iter()
+                    .map(|parent| checkpoint_b64(parent.as_ref()))
+                    .collect(),
+            })
+            .collect();
+        pins.sort_by(|a, b| (&a.domain, &a.certificate_der).cmp(&(&b.domain, &b.certificate_der)));
+        let mut fenced_spkis: Vec<_> = self
+            .bundle_fenced
+            .iter()
+            .map(|p| checkpoint_b64(p))
+            .collect();
+        fenced_spkis.sort();
+        let mut drain_before: Vec<_> = self
+            .drain_admitted_before
+            .iter()
+            .map(|(p, s)| CheckpointCutoff {
+                spki_der: checkpoint_b64(p),
+                sequence: *s,
+            })
+            .collect();
+        drain_before.sort_by(|a, b| a.spki_der.cmp(&b.spki_der));
+        let dto = AnchorCheckpoint {
+            sequence: self.generation(),
+            local_domain: self.set.local_domain.to_string(),
+            root_der: checkpoint_b64(self.set.organizational_root.as_ref()),
+            pins,
+            fenced_spkis,
+            drain_before,
+        };
+        // Apply the exact same validation to newly serialized and recovered state.
+        Self::from_checkpoint(&dto)?;
+        Ok(dto)
+    }
+    pub fn from_checkpoint(dto: &AnchorCheckpoint) -> Result<Self, AnchorError> {
+        if dto.pins.len() > MAX_CHECKPOINT_PINS
+            || dto.fenced_spkis.len() > MAX_CHECKPOINT_KEYS
+            || dto.drain_before.len() > MAX_CHECKPOINT_KEYS
+        {
+            return Err(AnchorError::BadEncoding);
+        }
+        let mut previous_pin: Option<(&str, &str)> = None;
+        let mut pins = Vec::with_capacity(dto.pins.len());
+        for p in &dto.pins {
+            let key = (p.domain.as_str(), p.certificate_der.as_str());
+            if previous_pin.is_some_and(|old| old >= key) {
+                return Err(AnchorError::BadEncoding);
+            }
+            previous_pin = Some(key);
+            if p.lineage_der.len() > 1 {
+                return Err(AnchorError::BadEncoding);
+            }
+            let lineage = p
+                .lineage_der
+                .iter()
+                .map(|parent| checkpoint_der(parent, 24576).map(CertificateDer::from))
+                .collect::<Result<Vec<_>, _>>()?;
+            pins.push(pin_from_certificate_with_lineage(
+                p.domain.clone().into(),
+                checkpoint_der(&p.certificate_der, 32768)?.into(),
+                lineage,
+            )?);
+        }
+        // Revalidate DER, root self-signature, direct signatures and uniqueness,
+        // but permit an empty/local-withdrawn set recorded by a real withdrawal.
+        let set = DomainAnchorSet::try_new_inner(
+            dto.local_domain.clone().into(),
+            checkpoint_der(&dto.root_der, 32768)?.into(),
+            dto.sequence,
+            pins,
+            false,
+        )?;
+        if set.by_domain.len() > 16 || set.by_domain.values().any(|pins| pins.len() > 2) {
+            return Err(AnchorError::BadEncoding);
+        }
+        let active: HashSet<_> = set
+            .by_domain
+            .values()
+            .flatten()
+            .map(|p| p.spki_der.clone())
+            .collect();
+        let mut bundle_fenced = HashSet::new();
+        let mut previous: Option<&str> = None;
+        for p in &dto.fenced_spkis {
+            if previous.is_some_and(|old| old >= p.as_str()) {
+                return Err(AnchorError::BadEncoding);
+            }
+            previous = Some(p);
+            let bytes = checkpoint_der(p, 8192)?;
+            if active.contains(&bytes)
+                || bytes == set.organizational_root_spki
+                || !bundle_fenced.insert(bytes)
+            {
+                return Err(AnchorError::BadEncoding);
+            }
+        }
+        let mut drain_admitted_before = HashMap::new();
+        previous = None;
+        for cutoff in &dto.drain_before {
+            if previous.is_some_and(|old| old >= cutoff.spki_der.as_str())
+                || cutoff.sequence == 0
+                || cutoff.sequence > dto.sequence
+            {
+                return Err(AnchorError::BadEncoding);
+            }
+            previous = Some(&cutoff.spki_der);
+            let bytes = checkpoint_der(&cutoff.spki_der, 8192)?;
+            if bytes == set.organizational_root_spki
+                || drain_admitted_before
+                    .insert(bytes, cutoff.sequence)
+                    .is_some()
+            {
+                return Err(AnchorError::BadEncoding);
+            }
+        }
+        if bundle_fenced
+            .iter()
+            .any(|p| !drain_admitted_before.contains_key(p))
+        {
+            return Err(AnchorError::BadEncoding);
+        }
+        let mut keys = active;
+        keys.extend(bundle_fenced.iter().cloned());
+        keys.extend(drain_admitted_before.keys().cloned());
+        if keys.len() > MAX_CHECKPOINT_KEYS {
+            return Err(AnchorError::BadEncoding);
+        }
+        Ok(Self {
+            set,
+            bundle_fenced,
+            drain_admitted_before,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1826,5 +2106,389 @@ mod tests {
             })
         );
         assert!(all.withdraw_all(1).is_err());
+    }
+    #[test]
+    fn checkpoint_dto_retains_all_withdrawn_issuers_and_connection_cutoffs() {
+        let (_, _, _, set) = fixture();
+        let original = AnchorPublication::initial(set);
+        let all = original.withdraw_all(2).unwrap();
+        let dto = all.checkpoint().unwrap();
+        assert!(dto.pins.is_empty());
+        assert_eq!(dto.fenced_spkis.len(), 2);
+        assert_eq!(dto.drain_before.len(), 2);
+        let recovered = AnchorPublication::from_checkpoint(&dto).unwrap();
+        assert_eq!(recovered, all);
+        assert!(recovered.current_signer_ders(SystemTime::now()).is_empty());
+        assert!(
+            recovered
+                .replace(original.anchors().with_generation(3).unwrap())
+                .is_err()
+        );
+        let restored = recovered
+            .restore_authoritative_snapshot(original.anchors().with_generation(3).unwrap())
+            .unwrap();
+        assert_eq!(
+            AnchorPublication::from_checkpoint(&restored.checkpoint().unwrap()).unwrap(),
+            restored
+        );
+    }
+    #[test]
+    fn checkpoint_dto_revalidates_certificates_duplicate_history_and_cutoff_bounds() {
+        let (_, _, _, set) = fixture();
+        let original = AnchorPublication::initial(set);
+        let dto = original.withdraw_all(2).unwrap().checkpoint().unwrap();
+        for variant in 0..5 {
+            let mut bad = dto.clone();
+            match variant {
+                0 => bad.fenced_spkis.push(bad.fenced_spkis[0].clone()),
+                1 => bad.drain_before.clear(),
+                2 => bad.drain_before[0].sequence = 0,
+                3 => bad.drain_before[0].sequence = 3,
+                _ => bad.root_der.push('='),
+            }
+            assert!(AnchorPublication::from_checkpoint(&bad).is_err());
+        }
+        let mut bad = original.checkpoint().unwrap();
+        bad.pins[0].certificate_der = bad.root_der.clone();
+        assert!(AnchorPublication::from_checkpoint(&bad).is_err());
+        let mut bad = dto;
+        bad.fenced_spkis = vec!["AA==".into(); MAX_CHECKPOINT_KEYS + 1];
+        assert!(AnchorPublication::from_checkpoint(&bad).is_err());
+    }
+    fn bounded_root(depth: u8) -> CertifiedIssuer<'static, KeyPair> {
+        let mut params = ca_params("bounded organization root");
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(depth));
+        CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap()
+    }
+    fn bounded_child(
+        name: &str,
+        parent: &CertifiedIssuer<'_, KeyPair>,
+        depth: u8,
+    ) -> CertifiedIssuer<'static, KeyPair> {
+        let mut params = ca_params(name);
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(depth));
+        CertifiedIssuer::signed_by(params, KeyPair::generate().unwrap(), parent).unwrap()
+    }
+    fn bounded_profile(
+        root: &CertifiedIssuer<'_, KeyPair>,
+        parent: &CertifiedIssuer<'_, KeyPair>,
+        signer: &CertifiedIssuer<'_, KeyPair>,
+        generation: u64,
+    ) -> Result<DomainAnchorSet, AnchorError> {
+        DomainAnchorSet::try_new(
+            A.into(),
+            root.der().clone(),
+            generation,
+            vec![pin_from_certificate_with_lineage(
+                A.into(),
+                signer.der().clone(),
+                vec![parent.der().clone()],
+            )?],
+        )
+    }
+    #[test]
+    fn approved_cluster_parent_does_not_become_a_workload_signer() {
+        let root = bounded_root(2);
+        let parent = bounded_child("cluster a CA", &root, 1);
+        let signer = bounded_child("SPIRE a CA", &parent, 0);
+        let set = bounded_profile(&root, &parent, &signer, 1).unwrap();
+        let now = UnixTime::since_unix_epoch(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
+        for role in [PeerRole::Client, PeerRole::Server] {
+            assert!(
+                verify_peer_certificate(&leaf(&[URI_A], &signer), &[], &set, now, role).is_ok()
+            );
+            assert!(
+                verify_peer_certificate(&leaf(&[URI_A], &parent), &[], &set, now, role).is_err()
+            );
+            assert!(verify_peer_certificate(&leaf(&[URI_A], &root), &[], &set, now, role).is_err());
+            let delegated = bounded_child("unapproved child CA", &signer, 0);
+            assert!(
+                verify_peer_certificate(
+                    &leaf(&[URI_A], &delegated),
+                    &[delegated.der().clone()],
+                    &set,
+                    now,
+                    role
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            set.by_domain[&Strng::from(A)][0].lineage_ders(),
+            &[parent.der().clone()]
+        );
+    }
+    #[test]
+    fn bounded_lineage_rejects_missing_unused_duplicate_and_insufficient_depth() {
+        let root = bounded_root(2);
+        let parent = bounded_child("cluster a CA", &root, 1);
+        let signer = bounded_child("SPIRE a CA", &parent, 0);
+        assert!(
+            DomainAnchorSet::try_new(
+                A.into(),
+                root.der().clone(),
+                1,
+                vec![pin_from_certificate(A.into(), signer.der().clone()).unwrap()]
+            )
+            .is_err()
+        );
+        assert!(
+            pin_from_certificate_with_lineage(
+                A.into(),
+                signer.der().clone(),
+                vec![parent.der().clone(), parent.der().clone()]
+            )
+            .is_err()
+        );
+        assert!(
+            pin_from_certificate_with_lineage(
+                A.into(),
+                signer.der().clone(),
+                vec![root.der().clone()]
+            )
+            .is_err()
+        );
+        let direct = bounded_child("direct root signer", &root, 0);
+        assert!(
+            pin_from_certificate_with_lineage(
+                A.into(),
+                direct.der().clone(),
+                vec![parent.der().clone()]
+            )
+            .is_err()
+        );
+        let shallow_root = bounded_root(1);
+        let parent = bounded_child("cluster a CA", &shallow_root, 1);
+        let signer = bounded_child("SPIRE a CA", &parent, 0);
+        assert!(bounded_profile(&shallow_root, &parent, &signer, 1).is_err());
+        let parent = bounded_child("shallow cluster CA", &root, 0);
+        let signer = bounded_child("SPIRE a CA", &parent, 0);
+        assert!(bounded_profile(&root, &parent, &signer, 1).is_err());
+    }
+    #[test]
+    fn identical_cluster_parent_can_rotate_only_within_one_domain() {
+        let root = bounded_root(2);
+        let parent = bounded_child("cluster a CA", &root, 1);
+        let signer1 = bounded_child("SPIRE a CA1", &parent, 0);
+        let signer2 = bounded_child("SPIRE a CA2", &parent, 0);
+        let pin1 = pin_from_certificate_with_lineage(
+            A.into(),
+            signer1.der().clone(),
+            vec![parent.der().clone()],
+        )
+        .unwrap();
+        let pin2 = pin_from_certificate_with_lineage(
+            A.into(),
+            signer2.der().clone(),
+            vec![parent.der().clone()],
+        )
+        .unwrap();
+        assert!(
+            DomainAnchorSet::try_new(A.into(), root.der().clone(), 1, vec![pin1.clone(), pin2])
+                .is_ok()
+        );
+        let foreign = pin_from_certificate_with_lineage(
+            B.into(),
+            signer2.der().clone(),
+            vec![parent.der().clone()],
+        )
+        .unwrap();
+        assert!(
+            DomainAnchorSet::try_new(A.into(), root.der().clone(), 1, vec![pin1, foreign]).is_err()
+        );
+    }
+    #[test]
+    fn parent_expiry_drains_and_new_approved_lineage_recovers() {
+        let root = bounded_root(2);
+        let instant = time::OffsetDateTime::now_utc();
+        let mut params = ca_params("short cluster CA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+        params.not_before = instant - time::Duration::hours(1);
+        params.not_after = instant + time::Duration::seconds(5);
+        let parent =
+            CertifiedIssuer::signed_by(params, KeyPair::generate().unwrap(), &root).unwrap();
+        let signer = bounded_child("SPIRE a CA", &parent, 0);
+        let old = bounded_profile(&root, &parent, &signer, 1).unwrap();
+        let before = UNIX_EPOCH + Duration::from_secs(instant.unix_timestamp() as u64);
+        let after = before + Duration::from_secs(6);
+        let certificate = leaf(&[URI_A], &signer);
+        let evidence = verify_peer_evidence(
+            &certificate,
+            &[],
+            &old,
+            UnixTime::since_unix_epoch(before.duration_since(UNIX_EPOCH).unwrap()),
+            PeerRole::Client,
+        )
+        .unwrap();
+        assert!(evidence.deadline() <= before + Duration::from_secs(5));
+        assert!(
+            verify_peer_certificate(
+                &certificate,
+                &[],
+                &old,
+                UnixTime::since_unix_epoch(after.duration_since(UNIX_EPOCH).unwrap()),
+                PeerRole::Client
+            )
+            .is_err()
+        );
+        assert_eq!(
+            retained_tunnel(
+                &evidence.retained_tunnel(),
+                &AnchorPublication::initial(old.clone()),
+                after
+            ),
+            RetainedDecision::Drain
+        );
+        let replacement_parent = bounded_child("replacement cluster CA", &root, 1);
+        let replacement_signer = bounded_child("replacement SPIRE CA", &replacement_parent, 0);
+        let fresh = bounded_profile(&root, &replacement_parent, &replacement_signer, 2).unwrap();
+        let fresh = select_published(Some(&old), fresh).unwrap();
+        assert!(
+            verify_peer_certificate(
+                &leaf(&[URI_A], &replacement_signer),
+                &[],
+                &fresh,
+                UnixTime::since_unix_epoch(after.duration_since(UNIX_EPOCH).unwrap()),
+                PeerRole::Client
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_peer_certificate(
+                &certificate,
+                &[],
+                &fresh,
+                UnixTime::since_unix_epoch(after.duration_since(UNIX_EPOCH).unwrap()),
+                PeerRole::Client
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn spire_ca_hint_must_be_one_exact_approved_domain_uri() {
+        let root = bounded_root(2);
+        let parent = bounded_child("cluster a CA", &root, 1);
+        for hint in [
+            "spiffe://cmtc-a.mesh.example",
+            "spiffe://cmtc-b.mesh.example",
+            "spiffe://cmtc-a.mesh.example/ns/orders/sa/api",
+        ] {
+            let mut params = ca_params("SPIRE-shaped CA");
+            params.subject_alt_names =
+                vec![SanType::URI(Ia5String::try_from(hint.to_string()).unwrap())];
+            let issuer =
+                CertifiedIssuer::signed_by(params, KeyPair::generate().unwrap(), &parent).unwrap();
+            let pin = pin_from_certificate_with_lineage(
+                A.into(),
+                issuer.der().clone(),
+                vec![parent.der().clone()],
+            );
+            assert_eq!(pin.is_ok(), hint == "spiffe://cmtc-a.mesh.example");
+        }
+        let mut params = ca_params("duplicate CA URI");
+        let uri =
+            SanType::URI(Ia5String::try_from("spiffe://cmtc-a.mesh.example".to_string()).unwrap());
+        params.subject_alt_names = vec![uri.clone(), uri];
+        let issuer =
+            CertifiedIssuer::signed_by(params, KeyPair::generate().unwrap(), &parent).unwrap();
+        assert!(
+            pin_from_certificate_with_lineage(
+                A.into(),
+                issuer.der().clone(),
+                vec![parent.der().clone()]
+            )
+            .is_err()
+        );
+        let mut params = ca_params("parent with forbidden URI");
+        params.subject_alt_names = vec![SanType::URI(
+            Ia5String::try_from("spiffe://cmtc-a.mesh.example".to_string()).unwrap(),
+        )];
+        let parent =
+            CertifiedIssuer::signed_by(params, KeyPair::generate().unwrap(), &root).unwrap();
+        let signer = bounded_child("SPIRE CA", &parent, 0);
+        assert!(
+            pin_from_certificate_with_lineage(
+                A.into(),
+                signer.der().clone(),
+                vec![parent.der().clone()]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bounded_parent_lineage_checkpoint_is_exact_and_cannot_be_dropped_or_swapped() {
+        let mut root_params = ca_params("lineage-root");
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(2));
+        let root = CertifiedIssuer::self_signed(root_params, KeyPair::generate().unwrap()).unwrap();
+        let mut parent_params = ca_params("cluster-parent-a");
+        parent_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+        let parent_a =
+            CertifiedIssuer::signed_by(parent_params, KeyPair::generate().unwrap(), &root).unwrap();
+        let mut parent_params = ca_params("cluster-parent-b");
+        parent_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(1));
+        let parent_b =
+            CertifiedIssuer::signed_by(parent_params, KeyPair::generate().unwrap(), &root).unwrap();
+        let mut signer_params = ca_params("spire-a");
+        signer_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        let signer_a =
+            CertifiedIssuer::signed_by(signer_params, KeyPair::generate().unwrap(), &parent_a)
+                .unwrap();
+        let mut signer_params = ca_params("spire-b");
+        signer_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+        let signer_b =
+            CertifiedIssuer::signed_by(signer_params, KeyPair::generate().unwrap(), &parent_b)
+                .unwrap();
+        let set = DomainAnchorSet::try_new(
+            A.into(),
+            root.der().clone(),
+            1,
+            vec![
+                pin_from_certificate_with_lineage(
+                    A.into(),
+                    signer_a.der().clone(),
+                    vec![parent_a.der().clone()],
+                )
+                .unwrap(),
+                pin_from_certificate_with_lineage(
+                    B.into(),
+                    signer_b.der().clone(),
+                    vec![parent_b.der().clone()],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let original = AnchorPublication::initial(set);
+        let dto = original.checkpoint().unwrap();
+        assert!(dto.pins.iter().all(|p| p.lineage_der.len() == 1));
+        assert_eq!(AnchorPublication::from_checkpoint(&dto).unwrap(), original);
+        let a = dto.pins.iter().position(|p| p.domain == A).unwrap();
+        for variant in 0..4 {
+            let mut bad = dto.clone();
+            match variant {
+                0 => bad.pins[a].lineage_der.clear(),
+                1 => bad.pins[a].lineage_der = vec![checkpoint_b64(parent_b.der().as_ref())],
+                2 => bad.pins[a]
+                    .lineage_der
+                    .push(checkpoint_b64(parent_b.der().as_ref())),
+                _ => bad.pins[a].lineage_der = vec![checkpoint_b64(root.der().as_ref())],
+            }
+            assert!(AnchorPublication::from_checkpoint(&bad).is_err());
+        }
+        assert_eq!(original.current_signer_ders(SystemTime::now()).len(), 2);
+        for parent in [parent_a.der(), parent_b.der()] {
+            assert!(
+                !original
+                    .current_signer_ders(SystemTime::now())
+                    .contains(parent)
+            );
+        }
+        let all = original.withdraw_all(2).unwrap();
+        assert_eq!(
+            AnchorPublication::from_checkpoint(&all.checkpoint().unwrap()).unwrap(),
+            all
+        );
     }
 }

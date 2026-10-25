@@ -36,6 +36,7 @@ fn main() -> Result<(), anyhow::Error> {
         "proto/xds.proto",
         "proto/workload.proto",
         "proto/authorization.proto",
+        "proto/issuer_profile.proto",
         "proto/citadel.proto",
         "proto/zds.proto",
         "proto/cri-api.proto",

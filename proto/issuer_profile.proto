@@ -1,0 +1,8 @@
+syntax = "proto3";
+package cilium.ztunnel.v1;
+option go_package = "github.com/cilium/cilium/pkg/ztunnel/pb/trust;trust";
+// Public validated material only. This message is not an activation ACK.
+message IssuerProfile {
+  uint32 transport_version = 1;
+  bytes strict_der_profile_json = 2;
+}

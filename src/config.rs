@@ -222,6 +222,8 @@ pub struct Config {
     pub require_inbound_mtls: bool,
     /// Require every non-exempt workload destination to use HBONE and a current xDS snapshot.
     pub require_mesh_hbone: bool,
+    /// Opt-in transport probe. The handler never activates trust or ACKs a profile.
+    pub issuer_profile_probe_pins: Option<PathBuf>,
     /// Static mesh CIDRs and narrow, explicit non-mesh exceptions used by strict egress mode.
     /// This is a lab/bootstrap input; production requires an authenticated, live Cilium inventory.
     pub mesh_egress: MeshEgressConfig,
@@ -1097,6 +1099,9 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         proxy: parse_default(ENABLE_PROXY, true)?,
         require_inbound_mtls: parse_default(REQUIRE_INBOUND_MTLS, false)?,
         require_mesh_hbone,
+        issuer_profile_probe_pins: parse::<String>("ISSUER_PROFILE_PROBE_PINS")?
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from),
         mesh_egress,
         // Enable by default; running the server is not an issue, clients still need to opt-in to sending their
         // DNS requests to Ztunnel.

@@ -21,6 +21,8 @@ pub mod issuer_profile_wire;
 mod lib;
 #[cfg(any(test, feature = "testing"))]
 pub mod mock;
+#[cfg(target_os = "linux")]
+pub mod profile_checkpoint;
 pub mod revocation;
 mod workload;
 

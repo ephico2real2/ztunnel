@@ -1248,7 +1248,8 @@ impl ProxyStateManager {
             let tls_client_fetcher = Box::new(tls::ControlPlaneAuthentication::RootCert(
                 config.xds_root_cert.clone(),
             ));
-            let xds_config = xds::Config::new(config.clone(), tls_client_fetcher);
+            let xds_config = xds::Config::new(config.clone(), tls_client_fetcher)
+                .with_configured_issuer_profile_probe(&config)?;
             let xds_config = if let Some(session) = &xds_session {
                 xds_config.with_session_gate(session.clone())
             } else {

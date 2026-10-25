@@ -39,6 +39,9 @@ use crate::xds::{ADDRESS_TYPE, AUTHORIZATION_TYPE};
 use crate::{identity, strng, tls};
 
 use super::Error;
+#[path = "issuer_profile.rs"]
+mod issuer_profile;
+use crate::xds::ISSUER_PROFILE_TYPE;
 
 const INSTANCE_IP: &str = "INSTANCE_IP";
 const INSTANCE_IPS: &str = "INSTANCE_IPS";
@@ -234,6 +237,7 @@ pub struct Config {
     initial_requests: Vec<DeltaDiscoveryRequest>,
     on_demand: bool,
     session_gate: Option<XdsSessionGate>,
+    issuer_profile_initial_timeout: Duration,
 
     /// alt_hostname provides an alternative accepted SAN for the control plane TLS verification
     alt_hostname: Option<String>,
@@ -297,10 +301,34 @@ impl Config {
             initial_requests: Vec::new(),
             on_demand: config.xds_on_demand,
             session_gate: None,
+            issuer_profile_initial_timeout: Duration::from_secs(10),
             proxy_metadata: config.proxy_metadata.clone(),
             alt_hostname: config.alt_xds_hostname.clone(),
             xds_headers: config.xds_headers.vec.clone(),
         }
+    }
+
+    pub(crate) fn with_configured_issuer_profile_probe(
+        mut self,
+        config: &crate::config::Config,
+    ) -> anyhow::Result<Self> {
+        if let Some(expected) = issuer_profile::load_config(config)? {
+            self = self.with_issuer_profile_probe(expected, std::time::SystemTime::now);
+        }
+        Ok(self)
+    }
+    fn with_issuer_profile_probe(
+        mut self,
+        expected: crate::tls::issuer_profile_wire::Expected,
+        clock: fn() -> std::time::SystemTime,
+    ) -> Self {
+        self.handlers.insert(
+            ISSUER_PROFILE_TYPE,
+            Box::new(issuer_profile::ProbeHandler::new(expected, clock)),
+        );
+        self.initial_requests
+            .push(self.construct_initial_request(ISSUER_PROFILE_TYPE, true));
+        self
     }
 
     pub fn with_watched_handler<F>(self, type_url: Strng, f: impl Handler<F>) -> Config
@@ -769,8 +797,20 @@ impl AdsClient {
         debug!("connected established");
 
         info!("Stream established");
+        let profile_initial_deadline = self
+            .config
+            .handlers
+            .contains_key(&ISSUER_PROFILE_TYPE)
+            .then(|| tokio::time::Instant::now() + self.config.issuer_profile_initial_timeout);
         loop {
             tokio::select! {
+                _ = async {
+                    if let Some(deadline)=profile_initial_deadline { tokio::time::sleep_until(deadline).await; }
+                    else { std::future::pending::<()>().await; }
+                }, if !self.types_to_expect.is_empty() => {
+                    if let Some(gate)=&self.session_gate{gate.mark_stale(self.session_generation);}
+                    return Err(Error::RejectedResponse("issuer-profile initial snapshot deadline exceeded".into()));
+                }
                 _demand_event = self.state.demand.recv() => {
                     self.handle_demand_event(_demand_event, &discovery_req_tx).await?;
                 }
@@ -787,7 +827,8 @@ impl AdsClient {
                     // briefly authorize against mixed state.
                     if let Some(gate) = &self.session_gate {
                         let is_security_type = msg.type_url == ADDRESS_TYPE.to_string()
-                            || msg.type_url == AUTHORIZATION_TYPE.to_string();
+                            || msg.type_url == AUTHORIZATION_TYPE.to_string()
+                            || msg.type_url == ISSUER_PROFILE_TYPE.to_string();
                         if is_security_type && !self.types_to_expect.contains(&msg.type_url) {
                             gate.mark_stale(self.session_generation);
                             warn!(
@@ -813,10 +854,16 @@ impl AdsClient {
                             ));
                         }
                     }
+                    let is_profile_response=msg.type_url==ISSUER_PROFILE_TYPE.to_string();
                     let received_type = (!self.types_to_expect.is_empty())
                         .then(|| msg.type_url.clone());
                     let signal = self.handle_stream_event(msg, &discovery_req_tx).await?;
                     if let XdsSignal::Nack = signal {
+                        // Keep this fenced stream alive long enough for the
+                        // peer to read the NACK. The server closes on NACK;
+                        // the initial deadline bounds an unresponsive peer.
+                        // Never count this response toward readiness.
+                        if is_profile_response { continue; }
                         if self.session_gate.is_some() {
                             return Err(Error::RejectedResponse(
                                 received_type.unwrap_or_else(|| "unknown type".to_string()),
@@ -2199,5 +2246,278 @@ mod tests {
 
         // plain hostname is not a unix socket
         assert_eq!(unix_socket_path("istiod:15012"), None);
+    }
+    fn issuer_profile_probe_fixture() -> (Vec<u8>, crate::tls::issuer_profile_wire::Expected) {
+        use crate::tls::issuer_profile_wire::Expected;
+        let f: serde_json::Value =
+            serde_json::from_str(include_str!("../tls/issuer-profile-v1.json")).unwrap();
+        (
+            serde_json::to_vec(&f["wire"]).unwrap(),
+            Expected {
+                cluster: "cmtc-a".into(),
+                node: "cmtc-a-worker".into(),
+                source_namespace: "cmtc-system".into(),
+                source_name: "issuer-approval".into(),
+                source_uid: "fixture-source-uid".into(),
+                output_namespace: "cmtc-system".into(),
+                output_name: "issuer-publication".into(),
+                output_uid: "fixture-output-uid".into(),
+                root_pins: vec![
+                    "49a85f5a391f5585f5a91dfdaa9ce2ced3c9c9c69f02f47ad37b4b36d5e5beaf".into(),
+                ],
+                minimum_generation: 7,
+                minimum_sequence: 10,
+                approval_digest_at_minimum: Some(
+                    "63d2ff33b79505477b45c873524f96641bc605242686a8c99274cb8b3b9b065e".into(),
+                ),
+                publication_digest_at_minimum: Some(
+                    "7b8c9915b1a1b30f795d4dd42e61584f05f5edf00be23094bc4accb4a90a9c2f".into(),
+                ),
+            },
+        )
+    }
+    fn issuer_profile_probe_clock() -> SystemTime {
+        let f: serde_json::Value =
+            serde_json::from_str(include_str!("../tls/issuer-profile-v1.json")).unwrap();
+        std::time::UNIX_EPOCH + Duration::from_secs(f["nowUnix"].as_str().unwrap().parse().unwrap())
+    }
+    fn issuer_profile_probe_response(body: Vec<u8>) -> DeltaDiscoveryResponse {
+        let wire: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let version = format!(
+            "{}/{}",
+            wire["sequence"].as_str().unwrap(),
+            wire["publicationDigest"].as_str().unwrap()
+        );
+        let message = crate::xds::cilium::ztunnel::v1::IssuerProfile {
+            transport_version: 1,
+            strict_der_profile_json: body,
+        };
+        DeltaDiscoveryResponse {
+            type_url: ISSUER_PROFILE_TYPE.to_string(),
+            nonce: "profile-probe-nonce".into(),
+            system_version_info: version.clone(),
+            resources: vec![ProtoResource {
+                name: "cilium/issuer-profile/cmtc-a-worker".into(),
+                version,
+                resource: Some(Any {
+                    type_url: ISSUER_PROFILE_TYPE.to_string(),
+                    value: message.encode_to_vec(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+    async fn issuer_profile_initial_requests(
+        connection: &mut crate::test_helpers::xds::AdsConnection,
+    ) {
+        for expected in [ADDRESS_TYPE, AUTHORIZATION_TYPE, ISSUER_PROFILE_TYPE] {
+            let request = tokio::time::timeout(Duration::from_secs(2), connection.rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.type_url, expected);
+            assert!(request.initial_resource_versions.is_empty());
+        }
+    }
+    async fn issuer_profile_send_address_authorization(
+        connection: &mut crate::test_helpers::xds::AdsConnection,
+    ) {
+        for (type_url, nonce) in [
+            (ADDRESS_TYPE, "address-for-probe"),
+            (AUTHORIZATION_TYPE, "authorization-for-probe"),
+        ] {
+            connection
+                .tx
+                .send(Ok(DeltaDiscoveryResponse {
+                    type_url: type_url.to_string(),
+                    nonce: nonce.into(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issuer_profile_native_tls_ads_never_acks_without_durable_provider_commit() {
+        helpers::initialize_telemetry();
+        let mut completed = 0;
+        for case in [
+            "valid-uncommitted",
+            "wrong-inner-type",
+            "wrong-transport-version",
+            "rollback",
+            "expired",
+            "unavailable",
+            "wrong-resource-version",
+            "oversized",
+        ] {
+            eprintln!("issuer-profile native TLS case: {case}");
+            let gate = XdsSessionGate::new();
+            let (mut connections, mut client, _state, ready) =
+                AdsServer::spawn_with_session_gate(false, Some(gate.clone())).await;
+            let (body, expected) = issuer_profile_probe_fixture();
+            client.config = client
+                .config
+                .with_issuer_profile_probe(expected, issuer_profile_probe_clock);
+            client.config.issuer_profile_initial_timeout = Duration::from_secs(2);
+            let task = tokio::spawn(client.run());
+            let mut first = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            issuer_profile_initial_requests(&mut first).await;
+            issuer_profile_send_address_authorization(&mut first).await;
+            let mut response = issuer_profile_probe_response(body.clone());
+            match case {
+                "wrong-inner-type" => {
+                    response.resources[0].resource.as_mut().unwrap().type_url =
+                        ADDRESS_TYPE.to_string()
+                }
+                "wrong-transport-version" => {
+                    let profile = crate::xds::cilium::ztunnel::v1::IssuerProfile {
+                        transport_version: 2,
+                        strict_der_profile_json: body.clone(),
+                    };
+                    response.resources[0].resource.as_mut().unwrap().value =
+                        profile.encode_to_vec();
+                }
+                "wrong-resource-version" => response.resources[0].version = "10/foreign".into(),
+                "oversized" => {
+                    response.resources[0].resource.as_mut().unwrap().value =
+                        vec![0; crate::tls::issuer_profile_wire::MAX_WIRE_BYTES + 65]
+                }
+                "rollback" | "expired" | "unavailable" => {
+                    let mut wire: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    if case == "rollback" {
+                        wire["sequence"] = "9".into();
+                    } else if case == "expired" {
+                        wire["validUntilUnix"] = wire["publishedUnix"].clone();
+                    } else {
+                        wire["state"] = "withdrawn".into();
+                        wire["reason"] = "SourceUnavailable".into();
+                        wire["sequence"] = "11".into();
+                        wire["rootDER"] = serde_json::Value::Null;
+                        wire["rootSHA256"] = "".into();
+                        wire["clusters"] = serde_json::json!([]);
+                        wire["validUntilUnix"] = wire["publishedUnix"].clone();
+                    }
+                    response = issuer_profile_probe_response(serde_json::to_vec(&wire).unwrap());
+                }
+                _ => {}
+            }
+            first.tx.send(Ok(response)).await.unwrap();
+            let nack = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let request = first
+                        .rx
+                        .recv()
+                        .await
+                        .expect("native TLS ADS must deliver the NACK");
+                    if request.type_url == ISSUER_PROFILE_TYPE.to_string() {
+                        break request;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(nack.response_nonce, "profile-probe-nonce");
+            let rejection = nack.error_detail.expect("profile activation must NACK");
+            if case == "valid-uncommitted" || case == "unavailable" {
+                assert!(
+                    rejection
+                        .message
+                        .contains("durable provider commit unavailable"),
+                    "{}",
+                    rejection.message
+                );
+            }
+            assert!(!gate.is_open());
+            assert!(
+                ready.has_changed().is_ok(),
+                "profile NACK must not release readiness"
+            );
+            // Corrected delivery after reconnect still reaches the explicit
+            // durable/provider barrier; it never fakes a successful activation.
+            first
+                .tx
+                .send(Err(tonic::Status::unavailable(
+                    "force fresh profile session",
+                )))
+                .await
+                .unwrap();
+            let mut recovered = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            issuer_profile_initial_requests(&mut recovered).await;
+            recovered
+                .tx
+                .send(Ok(issuer_profile_probe_response(body)))
+                .await
+                .unwrap();
+            let nack = tokio::time::timeout(Duration::from_secs(2), recovered.rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(nack.type_url, ISSUER_PROFILE_TYPE.to_string());
+            assert!(
+                nack.error_detail
+                    .unwrap()
+                    .message
+                    .contains("durable provider commit unavailable")
+            );
+            assert!(!gate.is_open());
+            assert!(ready.has_changed().is_ok());
+            task.abort();
+            let _ = task.await;
+            completed += 1;
+        }
+        assert_eq!(completed, 8);
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn issuer_profile_missing_snapshot_and_disconnect_keep_admission_closed() {
+        helpers::initialize_telemetry();
+        let gate = XdsSessionGate::new();
+        let (mut connections, mut client, _state, ready) =
+            AdsServer::spawn_with_session_gate(false, Some(gate.clone())).await;
+        let (_, expected) = issuer_profile_probe_fixture();
+        client.config = client
+            .config
+            .with_issuer_profile_probe(expected, issuer_profile_probe_clock);
+        client.config.issuer_profile_initial_timeout = Duration::from_millis(100);
+        let task = tokio::spawn(client.run());
+        let mut first = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        issuer_profile_initial_requests(&mut first).await;
+        issuer_profile_send_address_authorization(&mut first).await;
+        assert!(!gate.is_open());
+        assert!(ready.has_changed().is_ok());
+        let mut second = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        issuer_profile_initial_requests(&mut second).await;
+        assert!(!gate.is_open());
+        assert!(
+            ready.has_changed().is_ok(),
+            "missing trust response cannot satisfy initial sync"
+        );
+        second
+            .tx
+            .send(Err(tonic::Status::unavailable("disconnect")))
+            .await
+            .unwrap();
+        let mut third = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        issuer_profile_initial_requests(&mut third).await;
+        assert!(!gate.is_open());
+        assert!(ready.has_changed().is_ok());
+        task.abort();
+        let _ = task.await;
     }
 }

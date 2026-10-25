@@ -3,7 +3,9 @@
 //! Pure DER-profile decoder. NOT a network handler, provider or traffic grant.
 //! Authority comes from independently configured authenticated ADS origin and durable
 //! floors; SHA fields provide integrity/correlation, never an admin signature.
-use super::domain_anchors::{AnchorPublication, DomainAnchorSet, pin_from_certificate, spki_der};
+use super::domain_anchors::{
+    AnchorPublication, DomainAnchorSet, pin_from_certificate_with_lineage, spki_der,
+};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rustls::pki_types::CertificateDer;
@@ -20,6 +22,8 @@ struct Issuer {
     certificate_der: String,
     #[serde(rename = "spkiSHA256")]
     spki_sha256: String,
+    #[serde(default, rename = "lineageDER")]
+    lineage_der: Vec<String>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -338,9 +342,19 @@ pub fn decode(data: &[u8], expected: &Expected, now: SystemTime) -> Result<Decod
                     && sha256(&spki_der(certificate.as_ref())?)? == issuer.spki_sha256,
                 "issuer SPKI mismatch"
             );
-            pins.push(pin_from_certificate(
+            ensure!(
+                issuer.lineage_der.len() <= 1,
+                "only one explicit cluster CA ancestor is supported"
+            );
+            let lineage = issuer
+                .lineage_der
+                .iter()
+                .map(|encoded| der(encoded))
+                .collect::<Result<Vec<_>>>()?;
+            pins.push(pin_from_certificate_with_lineage(
                 c.trust_domain.clone().into(),
                 certificate,
+                lineage,
             )?);
         }
         bindings.push(ClusterBinding {
@@ -597,5 +611,123 @@ mod tests {
                 assert!(decode(&serde_json::to_vec(&v).unwrap(), &e, now).is_err());
             }
         }
+    }
+    fn approved_lineage_fixture() -> (Vec<u8>, Expected, SystemTime, serde_json::Value) {
+        let f: serde_json::Value =
+            serde_json::from_str(include_str!("issuer-profile-lineage-v1.json")).unwrap();
+        let expected = Expected {
+            cluster: "cmtc-a".into(),
+            node: "cmtc-a-worker".into(),
+            source_namespace: "cmtc-system".into(),
+            source_name: "issuer-approval".into(),
+            source_uid: "fixture-source-uid".into(),
+            output_namespace: "cmtc-system".into(),
+            output_name: "issuer-publication".into(),
+            output_uid: "fixture-source-output-uid".into(),
+            root_pins: vec![
+                "1211aab8606cf0845c3a3078289fe39126b35aba067aa85e81096d6993afb3e5".into(),
+            ],
+            minimum_generation: 7,
+            minimum_sequence: 10,
+            approval_digest_at_minimum: Some(
+                "9b222564c540e40d2ca08305fdfc072031c08fae89c85f7ade2a1b67a4921093".into(),
+            ),
+            publication_digest_at_minimum: Some(
+                "94a6322abcf648dbe9906d477e2a7399aa4d7c5992ef09ec18d36dc2e2261c87".into(),
+            ),
+        };
+        let now = UNIX_EPOCH + Duration::from_secs(f["nowUnix"].as_str().unwrap().parse().unwrap());
+        (serde_json::to_vec(&f["wire"]).unwrap(), expected, now, f)
+    }
+    #[test]
+    fn actual_spire_shaped_lineage_decodes_but_only_direct_svid_signers_authenticate() {
+        use super::super::domain_anchors::{PeerRole, verify_peer_certificate};
+        use rustls::pki_types::UnixTime;
+        let (body, e, now, f) = approved_lineage_fixture();
+        let decoded = decode(&body, &e, now).unwrap();
+        assert_eq!(decoded.bindings.len(), 2);
+        let set = decoded.candidate.unwrap();
+        let unix = UnixTime::since_unix_epoch(now.duration_since(UNIX_EPOCH).unwrap());
+        for name in ["svid-a", "svid-b"] {
+            let leaf = der(f["certificates"][name]["der"].as_str().unwrap()).unwrap();
+            for role in [PeerRole::Client, PeerRole::Server] {
+                assert!(verify_peer_certificate(&leaf, &[], &set, unix, role).is_ok());
+            }
+        }
+        for name in ["svid-parent", "svid-root", "svid-delegated"] {
+            let leaf = der(f["certificates"][name]["der"].as_str().unwrap()).unwrap();
+            let delegated = der(f["certificates"]["delegated"]["der"].as_str().unwrap()).unwrap();
+            for role in [PeerRole::Client, PeerRole::Server] {
+                assert!(
+                    verify_peer_certificate(
+                        &leaf,
+                        std::slice::from_ref(&delegated),
+                        &set,
+                        unix,
+                        role
+                    )
+                    .is_err(),
+                    "unapproved signer {name}"
+                );
+            }
+        }
+        let parent = der(f["certificates"]["parent-a"]["der"].as_str().unwrap()).unwrap();
+        assert!(
+            !set.pin_spkis(&"cmtc-a.mesh.example".into())
+                .contains(&spki_der(parent.as_ref()).unwrap())
+        );
+        assert!(
+            !AnchorPublication::initial(set)
+                .current_signer_ders(now)
+                .contains(&parent)
+        );
+    }
+    #[test]
+    fn explicit_lineage_cannot_be_missing_reordered_expanded_or_reassigned() {
+        let (body, e, now, _) = approved_lineage_fixture();
+        for case in [
+            "missing",
+            "wrong-parent",
+            "root-as-parent",
+            "two-parents",
+            "wrong-domain",
+            "null-parent",
+        ] {
+            let mut wire: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let parent = wire["clusters"][0]["issuers"][0]["lineageDER"][0].clone();
+            match case {
+                "missing" => {
+                    let _ = wire["clusters"][0]["issuers"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("lineageDER");
+                }
+                "wrong-parent" => {
+                    wire["clusters"][0]["issuers"][0]["lineageDER"][0] =
+                        wire["clusters"][1]["issuers"][0]["lineageDER"][0].clone();
+                }
+                "root-as-parent" => {
+                    wire["clusters"][0]["issuers"][0]["lineageDER"][0] = wire["rootDER"].clone();
+                }
+                "two-parents" => {
+                    wire["clusters"][0]["issuers"][0]["lineageDER"] =
+                        serde_json::json!([parent, wire["rootDER"].clone()]);
+                }
+                "wrong-domain" => {
+                    wire["clusters"][0]["trustDomain"] = "another.mesh.example".into();
+                }
+                _ => {
+                    wire["clusters"][0]["issuers"][0]["lineageDER"] = serde_json::Value::Null;
+                }
+            };
+            assert!(
+                decode(&serde_json::to_vec(&wire).unwrap(), &e, now).is_err(),
+                "accepted {case}"
+            );
+        }
+        assert!(
+            decode(&body, &e, now).is_ok(),
+            "rejected input must not poison a later validated candidate"
+        );
     }
 }
