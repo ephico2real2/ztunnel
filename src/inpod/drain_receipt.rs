@@ -93,6 +93,16 @@ impl DrainOwners {
         );
         Ok(())
     }
+    /// Records that this proxy execution stopped `uid` because the current
+    /// source's snapshot omitted it. The snapshot ACK is sent only after every
+    /// removed workload is fully stopped, so it is the source's receipt: the
+    /// owner is drained as a typed drain would leave it, and only a different
+    /// incarnation may be installed for the Pod afterwards.
+    pub(super) fn complete_removed(&mut self, uid: &WorkloadUid) {
+        if let Some(owner) = self.owners.get_mut(uid) {
+            owner.completed = true;
+        }
+    }
     pub(super) fn installed(&mut self, uid: WorkloadUid, binding: WorkloadBinding) {
         self.owners.insert(
             uid,

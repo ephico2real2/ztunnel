@@ -1007,6 +1007,104 @@ pub(crate) mod tests {
         }
         state.drain().await;
     }
+    /// The order after an agent restart: a new source connects, its snapshot
+    /// omits a bound workload (the agent re-admits it later), and this proxy
+    /// stops that workload before acknowledging the snapshot. That stop is the
+    /// owner's drain, so the new source's ADD for the same sandbox is accepted,
+    /// while the drained incarnation itself can never be installed again.
+    #[tokio::test]
+    async fn typed_native_snapshot_omission_drains_owner_for_a_new_source() {
+        assert!(crate::test_helpers::can_run_privilged_test());
+        let f = test_helpers::Fixture::default();
+        let state = WorkloadProxyManagerState::new(
+            f.proxy_factory,
+            f.ipc,
+            f.inpod_metrics,
+            Default::default(),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot-drain.sock");
+        let listener = crate::inpod::packet::bind(&path).unwrap();
+        let (stop, watch) = crate::drain::new();
+        let manager = WorkloadProxyManager::new(path, state, readiness::Ready::new()).unwrap();
+        let running = tokio::spawn(manager.run(watch));
+        let accept = || async {
+            tokio::time::timeout(std::time::Duration::from_secs(3), listener.accept())
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+        };
+        let acked = |response: zds::WorkloadResponse| matches!(response.payload, Some(zds::workload_response::Payload::Ack(a)) if a.error.is_empty());
+        let refused = |response: zds::WorkloadResponse, reason: &str| matches!(response.payload, Some(zds::workload_response::Payload::Ack(a)) if a.error.contains(reason));
+
+        let mut peer = accept().await;
+        let hello = read_hello(&mut peer).await;
+        let fd = new_netns();
+        let stat = nix::sys::stat::fstat(&fd).unwrap();
+        let original = zds::WorkloadBinding {
+            version: 1,
+            source_epoch: "agent-before-restart".into(),
+            cluster_id: 1,
+            namespace_uid: "namespace-uid".into(),
+            pod_uid: "restored-pod".into(),
+            endpoint_id: 21,
+            incarnation: 1,
+            capture_generation: 3,
+            netns_dev: stat.st_dev,
+            netns_ino: stat.st_ino,
+            proxy_epoch: hello.proxy_epoch.clone(),
+        };
+        send_bound_add(&mut peer, original.clone(), &fd).await;
+        assert!(acked(read_msg(&mut peer).await));
+        send_snap_sent(&mut peer).await;
+        assert!(acked(read_msg(&mut peer).await));
+        drop(peer);
+
+        // The restarted agent: same proxy execution, a snapshot without the Pod.
+        let mut peer = accept().await;
+        assert_eq!(read_hello(&mut peer).await.proxy_epoch, hello.proxy_epoch);
+        send_snap_sent(&mut peer).await;
+        assert!(
+            acked(read_msg(&mut peer).await),
+            "the snapshot ACK follows the omitted proxy's stop"
+        );
+
+        send_bound_add(&mut peer, original.clone(), &fd).await;
+        assert!(
+            refused(
+                read_msg(&mut peer).await,
+                "completed incarnation cannot be revived"
+            ),
+            "the drained incarnation itself is never installed again"
+        );
+        drop(peer);
+
+        let mut peer = accept().await;
+        assert_eq!(read_hello(&mut peer).await.proxy_epoch, hello.proxy_epoch);
+        let readmitted = zds::WorkloadBinding {
+            source_epoch: "agent-after-restart".into(),
+            capture_generation: 1,
+            ..original.clone()
+        };
+        send_bound_add(&mut peer, readmitted, &fd).await;
+        assert!(
+            acked(read_msg(&mut peer).await),
+            "the new source re-admits the same sandbox without a drain it cannot produce"
+        );
+        drop(peer);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            stop.start_drain_and_wait(crate::drain::DrainMode::Immediate),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), running)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
     #[tokio::test]
     async fn typed_native_outer_manager_preserves_owner_through_request_rejection_and_reconnect() {
         assert!(crate::test_helpers::can_run_privilged_test());
