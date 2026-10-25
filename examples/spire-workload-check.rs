@@ -58,6 +58,11 @@ fn arguments(args: &[String]) -> anyhow::Result<(Identity, String, String)> {
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
+        Some("version") => {
+            ensure!(args.next().is_none(), "version takes no arguments");
+            println!("{}", ztunnel::version::BuildInfo::new());
+            return Ok(());
+        }
         Some("hold") => {
             ensure!(args.next().is_none(), "hold takes no arguments");
             tokio::time::sleep(Duration::from_secs(1800)).await;
