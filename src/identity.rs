@@ -19,6 +19,7 @@ use std::sync::Arc;
 mod caclient;
 pub use caclient::*;
 
+mod process_binding;
 mod spireclient;
 pub use spireclient::*;
 

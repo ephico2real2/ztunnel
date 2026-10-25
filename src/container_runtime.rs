@@ -12,10 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-
+use crate::{
+    config::Config,
+    identity::{PidClientTrait, WorkloadPid},
+    inpod::WorkloadUid,
+};
 use cri::runtime_service_client::RuntimeServiceClient;
 use hyper_util::rt::TokioIo;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 use tokio::net::UnixStream;
 use tonic::transport::Uri;
 use tonic::{
@@ -23,222 +30,209 @@ use tonic::{
     transport::{Channel, Endpoint},
 };
 use tower::service_fn;
-
-use crate::{
-    config::Config,
-    container_runtime::cri::{ContainerStatusRequest, ListContainersRequest},
-    identity::{PidClientTrait, WorkloadPid},
-    inpod::WorkloadUid,
-};
-
 pub mod cri {
-    tonic::include_proto!("runtime.v1"); // matches package name in proto
+    tonic::include_proto!("runtime.v1");
 }
 
 pub struct ContainerRuntimeManager {
     runtime_client: RuntimeServiceClient<Channel>,
+    timeout: Duration,
 }
-
 impl ContainerRuntimeManager {
     pub async fn new(cfg: &Config) -> Result<Self, std::io::Error> {
-        let path = cfg.container_runtime_sock_path.clone();
-
-        let channel = Self::uds_channel(path)
-            .await
-            .map_err(|e| std::io::Error::other(format!("Failed to create UDS channel: {}", e)))?;
-
-        let client = RuntimeServiceClient::new(channel);
-
-        Ok(ContainerRuntimeManager {
-            runtime_client: client,
+        if cfg.spire_timeout.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "positive SPIRE/CRI deadline required",
+            ));
+        }
+        let channel = tokio::time::timeout(
+            cfg.spire_timeout,
+            Self::uds_channel(cfg.container_runtime_sock_path.clone()),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "node CRI connection deadline exceeded",
+            )
+        })?
+        .map_err(|e| std::io::Error::other(format!("node CRI connection failed: {e}")))?;
+        Ok(Self {
+            runtime_client: RuntimeServiceClient::new(channel),
+            timeout: cfg.spire_timeout,
         })
     }
-
     pub fn new_with_client(client: RuntimeServiceClient<Channel>) -> Self {
-        ContainerRuntimeManager {
+        Self {
             runtime_client: client,
+            timeout: Duration::from_secs(10),
         }
     }
-
     async fn uds_channel(path: String) -> Result<Channel, tonic::transport::Error> {
-        let endpoint =
-            Endpoint::try_from("http://[::1]:50051")?
-                .connect_with_connector(service_fn(move |_: Uri| {
-                    let path = path.clone();
-                    async move {
-                        Ok::<_, std::io::Error>(TokioIo::new(UnixStream::connect(path).await?))
-                    }
-                }))
-                .await?;
-        Ok(endpoint)
+        Endpoint::try_from("http://[::1]:50051")?.connect_with_connector(service_fn(move|_:Uri|{
+            let path=path.clone();async move{Ok::<_,std::io::Error>(TokioIo::new(UnixStream::connect(path).await?))}
+        })).await
     }
-
     pub async fn get_pids_for_pod(&self, pod_uid: String) -> Result<Vec<i32>, tonic::Status> {
-        let mut client = self.runtime_client.clone();
-
-        tracing::info!("Fetching PIDs for pod UID: {}", pod_uid);
-
-        let mut map: HashMap<String, String> = std::collections::HashMap::new();
-        map.insert("io.kubernetes.pod.uid".to_string(), pod_uid.clone());
-
-        let ready_state = cri::PodSandboxStateValue {
-            state: 0, // PodSandboxState::SandboxReady
-        };
-
-        let pod_filter = cri::PodSandboxFilter {
-            label_selector: map,
-            state: Some(ready_state),
-            ..Default::default()
-        };
-
-        tracing::debug!("Listing pod sandboxes with filter: {:?}", pod_filter);
-
-        // 1. Find the sandbox
-        let sandboxes = match client
-            .list_pod_sandbox(cri::ListPodSandboxRequest {
-                filter: Some(pod_filter),
-            })
+        Ok(self
+            .processes(&pod_uid)
+            .await?
+            .iter()
+            .map(WorkloadPid::into_i32)
+            .collect())
+    }
+    async fn processes(&self, pod_uid: &str) -> Result<Vec<WorkloadPid>, tonic::Status> {
+        tokio::time::timeout(self.timeout, self.processes_inner(pod_uid))
             .await
+            .map_err(|_| {
+                tonic::Status::deadline_exceeded("node CRI workload observation deadline exceeded")
+            })?
+    }
+    async fn processes_inner(&self, pod_uid: &str) -> Result<Vec<WorkloadPid>, tonic::Status> {
+        let mut client = self.runtime_client.clone();
+        let request = cri::ListPodSandboxRequest {
+            filter: Some(cri::PodSandboxFilter {
+                label_selector: HashMap::from([("io.kubernetes.pod.uid".into(), pod_uid.into())]),
+                state: Some(cri::PodSandboxStateValue { state: 0 }),
+                ..Default::default()
+            }),
+        };
+        let sandboxes = client
+            .list_pod_sandbox(request.clone())
+            .await?
+            .into_inner()
+            .items;
+        if sandboxes.is_empty() {
+            return Err(tonic::Status::not_found(
+                "No sandbox found for workload UID",
+            ));
+        }
+        if sandboxes.len() != 1 {
+            return Err(tonic::Status::failed_precondition(
+                "ambiguous Ready sandboxes for workload UID",
+            ));
+        }
+        let sandbox = &sandboxes[0];
+        if sandbox.id.is_empty()
+            || sandbox.state != 0
+            || sandbox
+                .labels
+                .get("io.kubernetes.pod.uid")
+                .map(String::as_str)
+                != Some(pod_uid)
+            || sandbox.metadata.as_ref().map(|m| m.uid.as_str()) != Some(pod_uid)
         {
-            Ok(response) => response.into_inner().items,
-            Err(e) => {
-                tracing::error!("Failed to list pod sandboxes: {}", e);
-                return Err(e);
-            }
-        };
-
-        tracing::debug!(
-            "Found {} sandboxes for pod UID: {}",
-            sandboxes.len(),
-            pod_uid
-        );
-
-        let sandbox = sandboxes.first().ok_or_else(|| {
-            tracing::error!("No sandbox found for pod UID: {}", pod_uid);
-            tonic::Status::not_found(format!("No sandbox found for pod UID: {}", pod_uid))
-        })?;
-
-        let sandbox_id = sandbox.id.clone();
-        tracing::info!(
-            "Found sandbox for pod UID: {}, sandbox_id: {}",
-            pod_uid,
-            sandbox_id
-        );
-
-        let container_ready = cri::ContainerStateValue {
-            state: 1, // ContainerState::ContainerRunning
-        };
-
-        // 2. List containers in that sandbox
-        let containers = match client
-            .list_containers(ListContainersRequest {
+            return Err(tonic::Status::failed_precondition(
+                "CRI sandbox identity/state mismatch",
+            ));
+        }
+        let mut containers = client
+            .list_containers(cri::ListContainersRequest {
                 filter: Some(cri::ContainerFilter {
-                    pod_sandbox_id: sandbox_id.clone(),
-                    state: Some(container_ready),
+                    pod_sandbox_id: sandbox.id.clone(),
+                    state: Some(cri::ContainerStateValue { state: 1 }),
                     ..Default::default()
                 }),
             })
-            .await
-        {
-            Ok(response) => response.into_inner().containers,
-            Err(e) => {
-                tracing::error!("Failed to list containers in sandbox {}: {}", sandbox_id, e);
-                return Err(e);
+            .await?
+            .into_inner()
+            .containers;
+        if containers.is_empty() {
+            return Err(tonic::Status::not_found(
+                "No running containers found for workload UID",
+            ));
+        }
+        if containers.len() > 256 {
+            return Err(tonic::Status::resource_exhausted(
+                "bounded container set exceeded",
+            ));
+        }
+        // CRI list ordering is not stable; select deterministically and retain
+        // exact sandbox/container IDs through the post-attestation rejoin.
+        containers.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut ids = HashSet::new();
+        let mut processes = Vec::new();
+        let mut pids = HashSet::new();
+        for container in containers {
+            if container.id.is_empty()
+                || !ids.insert(container.id.clone())
+                || container.state != 1
+                || container.pod_sandbox_id != sandbox.id
+            {
+                return Err(tonic::Status::failed_precondition(
+                    "CRI container identity/state mismatch or duplicate",
+                ));
             }
-        };
-
-        tracing::debug!(
-            "Found {} containers in sandbox {}",
-            containers.len(),
-            sandbox_id
-        );
-
-        let mut pids = Vec::new();
-
-        // 3. Query container status → get PID
-        for c in containers {
-            tracing::debug!("Processing container: {}", c.id);
-            let status = match client
-                .container_status(ContainerStatusRequest {
-                    container_id: c.id.clone(),
+            let response = client
+                .container_status(cri::ContainerStatusRequest {
+                    container_id: container.id.clone(),
                     verbose: true,
                 })
-                .await
-            {
-                Ok(response) => response.into_inner(),
-                Err(e) => {
-                    tracing::error!("Failed to get status for container {}: {}", c.id, e);
-                    return Err(e);
-                }
-            };
-
-            let info = status.info.get("info");
-
-            //info is json string, parse it to get the pid field
+                .await?
+                .into_inner();
+            let status = response
+                .status
+                .as_ref()
+                .ok_or_else(|| tonic::Status::failed_precondition("CRI container status absent"))?;
+            if status.id != container.id || status.state != 1 || status.finished_at != 0 {
+                return Err(tonic::Status::failed_precondition(
+                    "CRI container status changed during observation",
+                ));
+            }
             #[derive(serde::Deserialize)]
-            struct ContainerInfo {
+            struct Info {
                 pid: i32,
             }
-            let info_json = info.ok_or_else(|| {
-                tracing::error!(
-                    "Container info not found for container: {}, available keys: {:?}",
-                    c.id,
-                    status.info.keys().collect::<Vec<_>>()
-                );
-                tonic::Status::internal(format!("Container info not found for container: {}", c.id))
-            })?;
-
-            let pid: ContainerInfo = serde_json::from_str(info_json).map_err(|e| {
-                tracing::error!(
-                    "Failed to parse container info for container {}: {}",
-                    c.id,
-                    e
-                );
-                tonic::Status::internal(format!(
-                    "Failed to parse container info for container {}: {}",
-                    c.id, e
-                ))
-            })?;
-
-            tracing::debug!("Found PID {} for container {}", pid.pid, c.id);
-            pids.push(pid.pid);
+            let info = response
+                .info
+                .get("info")
+                .ok_or_else(|| tonic::Status::failed_precondition("CRI runtime PID info absent"))?;
+            if info.len() > 1024 * 1024 {
+                return Err(tonic::Status::resource_exhausted(
+                    "bounded CRI PID info exceeded",
+                ));
+            }
+            let info: Info = serde_json::from_str(info)
+                .map_err(|_| tonic::Status::failed_precondition("invalid CRI runtime PID JSON"))?;
+            if info.pid <= 0 || !pids.insert(info.pid) {
+                return Err(tonic::Status::failed_precondition(
+                    "invalid or duplicate running container PID",
+                ));
+            }
+            processes.push(WorkloadPid::from_cri(
+                info.pid,
+                sandbox.id.clone(),
+                container.id,
+            ));
         }
-
-        if pids.is_empty() {
-            tracing::error!("No running containers found for pod UID: {}", pod_uid);
-            return Err(tonic::Status::not_found(format!(
-                "No running containers found for pod UID: {}",
-                pod_uid
-            )));
+        // Do not join container state to a retired/replaced sandbox snapshot.
+        let again = client.list_pod_sandbox(request).await?.into_inner().items;
+        if again != sandboxes {
+            return Err(tonic::Status::failed_precondition(
+                "CRI sandbox changed during observation",
+            ));
         }
-
-        tracing::info!(
-            "Successfully collected {} PIDs for pod UID: {}",
-            pids.len(),
-            pod_uid
-        );
-        Ok(pids)
+        Ok(processes)
     }
 }
-
 #[async_trait]
 impl PidClientTrait for ContainerRuntimeManager {
     async fn fetch_pid(&self, uid: &WorkloadUid) -> Result<WorkloadPid, std::io::Error> {
-        let pids = self
-            .get_pids_for_pod(uid.clone().into_string())
+        self.processes(&uid.clone().into_string())
             .await
-            .map_err(|e| std::io::Error::other(format!("CRI error: {}", e)))?;
-
-        let pid = pids.first().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "No PID found for pod")
-        })?;
-
-        Ok(WorkloadPid::new(*pid))
+            .map_err(|e| std::io::Error::other(format!("CRI error: {e}")))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "No PID found for pod")
+            })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::{identity::PidClientTrait, inpod::WorkloadUid};
     use std::{collections::HashMap, sync::Arc};
 
     use http::Uri;
@@ -265,10 +259,22 @@ mod tests {
         },
     };
 
+    fn running_status(id: &str, pid: i32) -> cri::ContainerStatusResponse {
+        cri::ContainerStatusResponse {
+            status: Some(cri::ContainerStatus {
+                id: id.into(),
+                state: 1,
+                ..Default::default()
+            }),
+            info: HashMap::from([("info".into(), format!("{{\"pid\":{pid}}}"))]),
+        }
+    }
+
     #[derive(Clone, Default)]
     struct MockRuntimeService {
         // You can put shared state here to control responses from your tests
         containers: Arc<Mutex<Vec<Container>>>,
+        stall_sandbox: Arc<std::sync::atomic::AtomicBool>,
         sandboxes: Arc<Mutex<Vec<PodSandbox>>>,
         container_statuses: Arc<Mutex<HashMap<String, ContainerStatusResponse>>>,
     }
@@ -294,6 +300,9 @@ mod tests {
             request: tonic::Request<cri::ListPodSandboxRequest>,
         ) -> std::result::Result<tonic::Response<cri::ListPodSandboxResponse>, tonic::Status>
         {
+            if self.stall_sandbox.load(std::sync::atomic::Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             let sandboxes = self.sandboxes.lock().await.clone();
             let req = request.into_inner();
 
@@ -394,6 +403,10 @@ mod tests {
             let mut lock = mock.sandboxes.lock().await;
             lock.push(cri::PodSandbox {
                 id: "fake-sandbox-123".into(),
+                metadata: Some(cri::PodSandboxMetadata {
+                    uid: "fake-uid-456".into(),
+                    ..Default::default()
+                }),
                 labels: {
                     let mut m = HashMap::new();
                     m.insert("io.kubernetes.pod.uid".into(), "fake-uid-456".into());
@@ -403,28 +416,8 @@ mod tests {
             });
 
             let mut lock = mock.container_statuses.lock().await;
-            lock.insert(
-                "fake-id-123".into(),
-                cri::ContainerStatusResponse {
-                    info: {
-                        let mut m = HashMap::new();
-                        m.insert("info".into(), r#"{"pid": 4321}"#.into());
-                        m
-                    },
-                    ..Default::default()
-                },
-            );
-            lock.insert(
-                "fake-id-321".into(),
-                cri::ContainerStatusResponse {
-                    info: {
-                        let mut m = HashMap::new();
-                        m.insert("info".into(), r#"{"pid": 1234}"#.into());
-                        m
-                    },
-                    ..Default::default()
-                },
-            );
+            lock.insert("fake-id-123".into(), running_status("fake-id-123", 4321));
+            lock.insert("fake-id-321".into(), running_status("fake-id-321", 1234));
         }
 
         // 2. Create a temporary Unix socket path
@@ -525,6 +518,10 @@ mod tests {
             let mut lock = mock.sandboxes.lock().await;
             lock.push(cri::PodSandbox {
                 id: "not-ready-sandbox".into(),
+                metadata: Some(cri::PodSandboxMetadata {
+                    uid: "not-ready-pod-uid".into(),
+                    ..Default::default()
+                }),
                 state: 1, // SANDBOX_NOTREADY
                 labels: {
                     let mut m = HashMap::new();
@@ -561,6 +558,10 @@ mod tests {
             let mut lock = mock.sandboxes.lock().await;
             lock.push(cri::PodSandbox {
                 id: "ready-sandbox-123".into(),
+                metadata: Some(cri::PodSandboxMetadata {
+                    uid: "pod-with-exited-containers".into(),
+                    ..Default::default()
+                }),
                 state: 0, // SANDBOX_READY
                 labels: {
                     let mut m = HashMap::new();
@@ -592,14 +593,7 @@ mod tests {
             let mut lock = mock.container_statuses.lock().await;
             lock.insert(
                 "exited-container-1".into(),
-                cri::ContainerStatusResponse {
-                    info: {
-                        let mut m = HashMap::new();
-                        m.insert("info".into(), r#"{"pid": 0}"#.into());
-                        m
-                    },
-                    ..Default::default()
-                },
+                running_status("exited-container-1", 0),
             );
         }
 
@@ -629,6 +623,10 @@ mod tests {
             let mut lock = mock.sandboxes.lock().await;
             lock.push(cri::PodSandbox {
                 id: "mixed-sandbox".into(),
+                metadata: Some(cri::PodSandboxMetadata {
+                    uid: "mixed-state-pod".into(),
+                    ..Default::default()
+                }),
                 state: 0, // SANDBOX_READY
                 labels: {
                     let mut m = HashMap::new();
@@ -664,26 +662,12 @@ mod tests {
             let mut lock = mock.container_statuses.lock().await;
             lock.insert(
                 "running-container".into(),
-                cri::ContainerStatusResponse {
-                    info: {
-                        let mut m = HashMap::new();
-                        m.insert("info".into(), r#"{"pid": 9999}"#.into());
-                        m
-                    },
-                    ..Default::default()
-                },
+                running_status("running-container", 9999),
             );
             // Exited container would have PID 0
             lock.insert(
                 "exited-container".into(),
-                cri::ContainerStatusResponse {
-                    info: {
-                        let mut m = HashMap::new();
-                        m.insert("info".into(), r#"{"pid": 0}"#.into());
-                        m
-                    },
-                    ..Default::default()
-                },
+                running_status("exited-container", 0),
             );
         }
 
@@ -702,5 +686,173 @@ mod tests {
 
         server_handle.abort();
         let _ = std::fs::remove_file(socket_path);
+    }
+    fn bound_mock() -> MockRuntimeService {
+        let mock = MockRuntimeService::default();
+        // Tests call this only outside a poll of these mutexes.
+        let uid = "11111111-2222-3333-4444-555555555555";
+        mock.sandboxes.try_lock().unwrap().push(cri::PodSandbox {
+            id: "sandbox-original".into(),
+            state: 0,
+            metadata: Some(cri::PodSandboxMetadata {
+                uid: uid.into(),
+                ..Default::default()
+            }),
+            labels: HashMap::from([("io.kubernetes.pod.uid".into(), uid.into())]),
+            ..Default::default()
+        });
+        mock.containers.try_lock().unwrap().push(Container {
+            id: "a".repeat(64),
+            pod_sandbox_id: "sandbox-original".into(),
+            state: 1,
+            ..Default::default()
+        });
+        mock.container_statuses
+            .try_lock()
+            .unwrap()
+            .insert("a".repeat(64), running_status(&"a".repeat(64), 123));
+        mock
+    }
+
+    #[tokio::test]
+    async fn native_cri_rejects_ambiguous_ready_sandboxes() {
+        let mock = bound_mock();
+        let mut second = mock.sandboxes.lock().await[0].clone();
+        second.id = "sandbox-second".into();
+        mock.sandboxes.lock().await.push(second);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.sock");
+        let (client, server) = setup_mock_server(mock, path.to_str().unwrap()).await;
+        let error = ContainerRuntimeManager::new_with_client(client)
+            .get_pids_for_pod("11111111-2222-3333-4444-555555555555".into())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("ambiguous"));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn native_cri_checks_metadata_status_pid_and_duplicate_container() {
+        for case in 0..6 {
+            let mock = bound_mock();
+            match case {
+                0 => {
+                    mock.sandboxes.lock().await[0]
+                        .metadata
+                        .as_mut()
+                        .unwrap()
+                        .uid = "wrong-uid".into()
+                }
+                1 => {
+                    mock.container_statuses
+                        .lock()
+                        .await
+                        .get_mut(&"a".repeat(64))
+                        .unwrap()
+                        .status = None
+                }
+                2 => {
+                    mock.container_statuses
+                        .lock()
+                        .await
+                        .get_mut(&"a".repeat(64))
+                        .unwrap()
+                        .status
+                        .as_mut()
+                        .unwrap()
+                        .id = "wrong-container".into()
+                }
+                3 => {
+                    mock.container_statuses
+                        .lock()
+                        .await
+                        .get_mut(&"a".repeat(64))
+                        .unwrap()
+                        .status
+                        .as_mut()
+                        .unwrap()
+                        .state = 2
+                }
+                4 => {
+                    mock.container_statuses
+                        .lock()
+                        .await
+                        .insert("a".repeat(64), running_status(&"a".repeat(64), 0));
+                }
+                5 => {
+                    let duplicate = mock.containers.lock().await[0].clone();
+                    mock.containers.lock().await.push(duplicate);
+                }
+                _ => unreachable!(),
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("runtime.sock");
+            let (client, server) = setup_mock_server(mock, path.to_str().unwrap()).await;
+            let error = ContainerRuntimeManager::new_with_client(client)
+                .get_pids_for_pod("11111111-2222-3333-4444-555555555555".into())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.code(),
+                tonic::Code::FailedPrecondition,
+                "case {case}: {error}"
+            );
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn native_cri_reordered_containers_keep_same_exact_selection() {
+        let mock = bound_mock();
+        mock.containers.lock().await.insert(
+            0,
+            Container {
+                id: "b".repeat(64),
+                pod_sandbox_id: "sandbox-original".into(),
+                state: 1,
+                ..Default::default()
+            },
+        );
+        mock.container_statuses
+            .lock()
+            .await
+            .insert("b".repeat(64), running_status(&"b".repeat(64), 456));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.sock");
+        let (client, server) = setup_mock_server(mock.clone(), path.to_str().unwrap()).await;
+        let manager = ContainerRuntimeManager::new_with_client(client);
+        let uid = WorkloadUid::new("11111111-2222-3333-4444-555555555555".into());
+        let first = manager.fetch_pid(&uid).await.unwrap();
+        mock.containers.lock().await.reverse();
+        let second = manager.fetch_pid(&uid).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.container_id.as_deref(), Some("a".repeat(64).as_str()));
+        assert_eq!(first.sandbox_id.as_deref(), Some("sandbox-original"));
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn native_cri_hung_sandbox_rpc_is_bounded() {
+        let mock = bound_mock();
+        mock.stall_sandbox
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime.sock");
+        let (client, server) = setup_mock_server(mock, path.to_str().unwrap()).await;
+        let mut manager = ContainerRuntimeManager::new_with_client(client);
+        manager.timeout = std::time::Duration::from_millis(30);
+        let start = std::time::Instant::now();
+        let error = manager
+            .get_pids_for_pod("11111111-2222-3333-4444-555555555555".into())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        server.abort();
+        let _ = server.await;
     }
 }

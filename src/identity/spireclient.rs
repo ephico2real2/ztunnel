@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::process_binding::{KernelProcessBinder, ProcessBinder};
 use crate::{
     config::Config,
     container_runtime::ContainerRuntimeManager,
@@ -70,16 +71,32 @@ impl DelegatedIdentityApi for DelegatedIdentityClient {
 }
 
 #[derive(
-    Eq, PartialEq, Hash, Debug, Clone, PartialOrd, Ord, serde::Serialize, serde::Deserialize, Copy,
+    Eq, PartialEq, Hash, Debug, Clone, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
-pub struct WorkloadPid(i32);
-
+pub struct WorkloadPid {
+    pub(crate) pid: i32,
+    pub(crate) sandbox_id: Option<String>,
+    pub(crate) container_id: Option<String>,
+}
 impl WorkloadPid {
+    /// An unbound PID is useful to explicit test doubles. The production
+    /// KernelProcessBinder rejects it; it can never authorize a credential.
     pub fn new(pid: i32) -> Self {
-        Self(pid)
+        Self {
+            pid,
+            sandbox_id: None,
+            container_id: None,
+        }
     }
-    pub fn into_i32(self) -> i32 {
-        self.0
+    pub(crate) fn from_cri(pid: i32, sandbox: String, container: String) -> Self {
+        Self {
+            pid,
+            sandbox_id: Some(sandbox),
+            container_id: Some(container),
+        }
+    }
+    pub fn into_i32(&self) -> i32 {
+        self.pid
     }
 }
 
@@ -89,9 +106,8 @@ pub trait PidClientTrait: Send + Sync {
     async fn fetch_pid(&self, uid: &WorkloadUid) -> Result<WorkloadPid, std::io::Error>;
 }
 
-/// SPIRE client that fetches X.509 certificates for workload identities using
-/// Kubernetes selectors (namespace + service account) rather than PIDs.
-/// This approach works in environments where PID-based attestation is not feasible.
+/// SPIRE delegated PID attestation bound to an exact CRI sandbox/container,
+/// held Linux process incarnation and kernel Pod UID. No selector fallback.
 pub struct SpireClient<C: DelegatedIdentityApi> {
     /// gRPC client for communicating with the SPIRE Delegated Identity API
     client: C,
@@ -99,6 +115,7 @@ pub struct SpireClient<C: DelegatedIdentityApi> {
     trust_domain: String,
     /// Optional PID client for workload PID verification
     pid: Box<dyn PidClientTrait>,
+    process_binder: Arc<dyn ProcessBinder>,
     /// Shared configuration for SPIRE client behavior
     cfg: Arc<Config>,
 }
@@ -121,6 +138,23 @@ impl<C: DelegatedIdentityApi> SpireClient<C> {
             client,
             trust_domain,
             pid,
+            process_binder: Arc::new(KernelProcessBinder),
+            cfg,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_test_binder(
+        client: C,
+        trust_domain: String,
+        pid: Box<dyn PidClientTrait>,
+        cfg: Arc<Config>,
+    ) -> Self {
+        Self {
+            client,
+            trust_domain,
+            pid,
+            process_binder: Arc::new(spire_tests::LiveTestBinder),
             cfg,
         }
     }
@@ -140,45 +174,43 @@ impl<C: DelegatedIdentityApi> SpireClient<C> {
     /// or certificate construction fails.
     async fn get_cert_by_pid(
         &self,
-        pid: i32,
+        process: WorkloadPid,
         id: &Identity,
         uid: &WorkloadUid,
     ) -> Result<tls::WorkloadCertificate, Error> {
-        let certs = self
-            .get_cert_from_spire(DelegateAttestationRequest::Pid(pid), id)
-            .await;
-
-        let certs = match certs {
-            Err(e) => {
-                return Err(Error::FailedToFetchCertificate(format!(
-                    "Failed to fetch certificate for PID {}: {}",
-                    pid, e
-                )));
-            }
-            Ok(certs) => certs,
+        let binding_error = |error: std::io::Error| {
+            Error::UnableToDeterminePidForWorkload(format!(
+                "workload process incarnation rejected: {error}"
+            ))
         };
-
-        // Verify that the PID we used for attestation matches the PID associated with the workload UID
-        let pid_verify = self.pid.fetch_pid(uid).await;
-
-        match pid_verify {
-            Ok(fetched_pid) => {
-                if fetched_pid.into_i32() != pid {
-                    return Err(Error::UnableToDeterminePidForWorkload(format!(
-                        "PID mismatch for workload UID {}: expected {}, got {}",
-                        uid.clone().into_string(),
-                        pid,
-                        fetched_pid.into_i32()
-                    )));
-                }
-                Ok(certs)
-            }
-            Err(e) => Err(Error::UnableToDeterminePidForWorkload(format!(
-                "Failed to verify PID for workload UID {}: {}",
-                uid.clone().into_string(),
-                e
-            ))),
+        let held = self
+            .process_binder
+            .bind(&process, uid)
+            .map_err(binding_error)?;
+        held.validate().map_err(binding_error)?;
+        // Rejoin CRI after pinning the process, before delegating its integer.
+        let current = self.pid.fetch_pid(uid).await.map_err(binding_error)?;
+        if current != process {
+            return Err(Error::UnableToDeterminePidForWorkload(
+                "CRI sandbox/container/PID changed before attestation".into(),
+            ));
         }
+        held.validate().map_err(binding_error)?;
+        let certs = self
+            .get_cert_from_spire(DelegateAttestationRequest::Pid(process.pid), id)
+            .await?;
+        // The pidfd remains held through stream establishment, first SVID,
+        // bundle retrieval and the final CRI join. An exited process never
+        // becomes valid merely because the same PID integer is reused.
+        held.validate().map_err(binding_error)?;
+        let current = self.pid.fetch_pid(uid).await.map_err(binding_error)?;
+        if current != process {
+            return Err(Error::UnableToDeterminePidForWorkload(
+                "CRI sandbox/container/PID changed after attestation".into(),
+            ));
+        }
+        held.validate().map_err(binding_error)?;
+        Ok(certs)
     }
 
     /// Fetches a workload certificate using workload UID to determine PID.
@@ -203,7 +235,7 @@ impl<C: DelegatedIdentityApi> SpireClient<C> {
         );
         let pid = self.pid.fetch_pid(uid).await;
         match pid {
-            Ok(pid) => self.get_cert_by_pid(pid.into_i32(), id, uid).await,
+            Ok(pid) => self.get_cert_by_pid(pid, id, uid).await,
             Err(e) => Err(Error::UnableToDeterminePidForWorkload(format!(
                 "Failed to fetch PID for workload UID {}: {}",
                 uid.clone().into_string(),
@@ -364,15 +396,25 @@ impl<C: DelegatedIdentityApi> crate::identity::CaClientTrait for SpireClient<C> 
     /// SPIRE attests the pod by PID, so the fetch must carry the pod UID. An
     /// identity-keyed fetch fails closed.
     async fn fetch_certificate(&self, key: &CacheKey) -> Result<tls::WorkloadCertificate, Error> {
-        match key {
+        let start = std::time::Instant::now();
+        let result = match key {
             CacheKey::Workload { id, uid, .. } => {
-                self.get_cert_by_workload_uid(id, &WorkloadUid::new(uid.to_string()))
-                    .await
+                tokio::time::timeout(self.cfg.spire_timeout,
+                    self.get_cert_by_workload_uid(id, &WorkloadUid::new(uid.to_string())))
+                    .await.unwrap_or_else(|_| Err(Error::FailedToFetchCertificate(
+                        "SPIRE credential deadline exceeded across CRI, process binding, SVID and bundle".into())))
             }
             CacheKey::Identity(_) => Err(Error::InvalidConfiguration(
                 "expected Workload key for SPIRE attestation".to_string(),
             )),
+        };
+        if let Err(error) = &result {
+            tracing::warn!(component="spire-client", stage="workload-credential", attempt=1u64,
+                elapsed_ms=start.elapsed().as_millis() as u64,
+                deadline_ms=self.cfg.spire_timeout.as_millis() as u64, backoff_ms=0u64,
+                error=%error, "native workload credential rejected");
         }
+        result
     }
 }
 
@@ -381,9 +423,11 @@ impl SecretManager {
         cfg: Arc<Config>,
         dc: C,
     ) -> Result<Self, spiffe::error::GrpcClientError> {
-        let pid_client = ContainerRuntimeManager::new(&cfg)
-            .await
-            .expect("unable to connect to container runtime");
+        let pid_client = ContainerRuntimeManager::new(&cfg).await.map_err(|error| {
+            spiffe::error::GrpcClientError::Grpc(tonic::Status::unavailable(format!(
+                "node CRI initialization failed: {error}"
+            )))
+        })?;
 
         let client = SpireClient::new(dc, cfg.cluster_domain.clone(), Box::new(pid_client), cfg);
 
@@ -403,6 +447,23 @@ impl SecretManager {
 
 #[cfg(test)]
 pub mod spire_tests {
+    pub(super) struct LiveTestBinder;
+    struct LiveTestProcess;
+    impl super::super::process_binding::BoundProcess for LiveTestProcess {
+        fn validate(&self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl ProcessBinder for LiveTestBinder {
+        fn bind(
+            &self,
+            _: &WorkloadPid,
+            _: &WorkloadUid,
+        ) -> std::io::Result<Box<dyn super::super::process_binding::BoundProcess>> {
+            Ok(Box::new(LiveTestProcess))
+        }
+    }
+
     use crate::config;
     use crate::identity::CaClientTrait;
     use crate::state::WorkloadInfo;
@@ -438,7 +499,7 @@ pub mod spire_tests {
         let mut cfg = config::parse_config().unwrap();
         cfg.spire_enabled = true;
 
-        let spire_client = SpireClient::new(
+        let spire_client = SpireClient::new_with_test_binder(
             mock_client,
             "example.org".to_string(),
             Box::new(pid_client),
@@ -461,7 +522,7 @@ pub mod spire_tests {
         let mut cfg = config::parse_config().unwrap();
         cfg.spire_enabled = true;
 
-        let spire_client = SpireClient::new(
+        let spire_client = SpireClient::new_with_test_binder(
             mock_client,
             "wrong.trust_domain".to_string(),
             Box::new(pid_client),
@@ -499,7 +560,7 @@ pub mod spire_tests {
 
         let cfg = Arc::new(cfg);
 
-        let spire_client = SpireClient::new(
+        let spire_client = SpireClient::new_with_test_binder(
             mock_client,
             "example.org".to_string(),
             Box::new(pid_client),
@@ -509,7 +570,9 @@ pub mod spire_tests {
         let identity =
             Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
         let uid = WorkloadUid::new("uid-123456".to_string());
-        let result = spire_client.get_cert_by_pid(10, &identity, &uid).await;
+        let result = spire_client
+            .get_cert_by_pid(WorkloadPid::new(10), &identity, &uid)
+            .await;
 
         assert!(result.is_ok());
 
@@ -553,7 +616,7 @@ pub mod spire_tests {
 
         let cfg = Arc::new(cfg);
 
-        let spire_client = SpireClient::new(
+        let spire_client = SpireClient::new_with_test_binder(
             mock_client,
             "example.org".to_string(),
             Box::new(pid_client),
@@ -563,7 +626,9 @@ pub mod spire_tests {
         let identity =
             Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
         let uid = WorkloadUid::new("uid-123456".to_string());
-        let result = spire_client.get_cert_by_pid(1337, &identity, &uid).await;
+        let result = spire_client
+            .get_cert_by_pid(WorkloadPid::new(1337), &identity, &uid)
+            .await;
 
         assert!(result.is_err());
     }
@@ -594,7 +659,7 @@ pub mod spire_tests {
         let mut cfg = config::parse_config().unwrap();
         cfg.spire_enabled = true;
 
-        let spire_client = SpireClient::new(
+        let spire_client = SpireClient::new_with_test_binder(
             mock_client,
             "example.org".to_string(),
             Box::new(pid_client),
@@ -604,7 +669,9 @@ pub mod spire_tests {
         let identity =
             Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
         let uid = WorkloadUid::new("uid-123456".to_string());
-        let result = spire_client.get_cert_by_pid(10, &identity, &uid).await;
+        let result = spire_client
+            .get_cert_by_pid(WorkloadPid::new(10), &identity, &uid)
+            .await;
 
         assert!(result.is_err());
     }
@@ -634,7 +701,7 @@ pub mod spire_tests {
 
         let cfg = Arc::new(cfg);
 
-        let spire_client = SpireClient::new(
+        let spire_client = SpireClient::new_with_test_binder(
             mock_client,
             "example.org".to_string(),
             Box::new(pid_client),
@@ -698,7 +765,7 @@ pub mod spire_tests {
 
         let cfg = Arc::new(cfg);
 
-        let spire_client = SpireClient::new(
+        let spire_client = SpireClient::new_with_test_binder(
             mock_client,
             "example.org".to_string(),
             Box::new(pid_client),
@@ -742,7 +809,7 @@ pub mod spire_tests {
 
         let cfg = Arc::new(cfg);
 
-        let spire_client = SpireClient::new(
+        let spire_client = SpireClient::new_with_test_binder(
             mock_client,
             "example.org".to_string(),
             Box::new(pid_client),
@@ -752,7 +819,9 @@ pub mod spire_tests {
         let identity =
             Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
         let uid = WorkloadUid::new("uid-123456".to_string());
-        let result = spire_client.get_cert_by_pid(10, &identity, &uid).await;
+        let result = spire_client
+            .get_cert_by_pid(WorkloadPid::new(10), &identity, &uid)
+            .await;
 
         assert!(result.is_ok());
 
@@ -797,7 +866,7 @@ pub mod spire_tests {
 
         let cfg = Arc::new(cfg);
 
-        let spire_client = SpireClient::new(
+        let spire_client = SpireClient::new_with_test_binder(
             mock_client,
             "example.org".to_string(),
             Box::new(pid_client),
@@ -807,7 +876,9 @@ pub mod spire_tests {
         let identity =
             Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
         let uid = WorkloadUid::new("uid-123456".to_string());
-        let result = spire_client.get_cert_by_pid(10, &identity, &uid).await;
+        let result = spire_client
+            .get_cert_by_pid(WorkloadPid::new(10), &identity, &uid)
+            .await;
 
         assert!(result.is_err());
 
@@ -840,7 +911,7 @@ pub mod spire_tests {
 
         let cfg = Arc::new(cfg);
 
-        let spire_client = SpireClient::new(
+        let spire_client = SpireClient::new_with_test_binder(
             mock_client,
             "example.org".to_string(),
             Box::new(pid_client),
@@ -850,7 +921,9 @@ pub mod spire_tests {
         let identity =
             Identity::from_parts("example.org".into(), "default".into(), "test-sa".into());
         let uid = WorkloadUid::new("uid-123456".to_string());
-        let result = spire_client.get_cert_by_pid(10, &identity, &uid).await;
+        let result = spire_client
+            .get_cert_by_pid(WorkloadPid::new(10), &identity, &uid)
+            .await;
 
         assert!(result.is_err());
 
@@ -961,7 +1034,7 @@ pub mod spire_tests {
         let mut cfg = config::parse_config().unwrap();
         cfg.spire_enabled = true;
 
-        let spire_client = SpireClient::new(
+        let spire_client = SpireClient::new_with_test_binder(
             mock_client,
             "example.org".to_string(),
             Box::new(pid_client),
@@ -982,6 +1055,197 @@ pub mod spire_tests {
             "Expected error to contain 'Mismatched identity', got: {}",
             err
         );
+    }
+
+    struct FlagBinder {
+        alive: Arc<std::sync::atomic::AtomicBool>,
+        leases: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    struct FlagProcess {
+        alive: Arc<std::sync::atomic::AtomicBool>,
+        leases: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl Drop for FlagProcess {
+        fn drop(&mut self) {
+            self.leases
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl super::super::process_binding::BoundProcess for FlagProcess {
+        fn validate(&self) -> std::io::Result<()> {
+            if self.alive.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "test held incarnation exited",
+                ))
+            }
+        }
+    }
+    impl ProcessBinder for FlagBinder {
+        fn bind(
+            &self,
+            _: &WorkloadPid,
+            _: &WorkloadUid,
+        ) -> std::io::Result<Box<dyn super::super::process_binding::BoundProcess>> {
+            if !self.alive.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::other("test pidfd unavailable"));
+            }
+            self.leases
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(FlagProcess {
+                alive: self.alive.clone(),
+                leases: self.leases.clone(),
+            }))
+        }
+    }
+    fn test_key() -> CacheKey {
+        workload_key(
+            &Identity::from_parts("example.org".into(), "default".into(), "test-sa".into()),
+            "11111111-2222-3333-4444-555555555555",
+        )
+    }
+    fn guarded_client<C: DelegatedIdentityApi>(
+        client: C,
+        pid: Box<dyn PidClientTrait>,
+        alive: Arc<std::sync::atomic::AtomicBool>,
+        leases: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> SpireClient<C> {
+        let mut cfg = config::parse_config().unwrap();
+        cfg.spire_enabled = true;
+        cfg.spire_timeout = std::time::Duration::from_secs(2);
+        let mut client = SpireClient::new(client, "example.org".into(), pid, Arc::new(cfg));
+        client.process_binder = Arc::new(FlagBinder { alive, leases });
+        client
+    }
+    #[tokio::test]
+    async fn same_integer_pid_cannot_revive_dead_binding_after_bundle() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let alive = Arc::new(AtomicBool::new(true));
+        let leases = Arc::new(AtomicUsize::new(0));
+        let mut api = MockDelegatedIdentityApi::new();
+        api.expect_get_x509_svids().returning(|_| {
+            Ok(mock_stream_svid_success_response(
+                "spiffe://example.org/ns/default/sa/test-sa".into(),
+            ))
+        });
+        let flag = alive.clone();
+        api.expect_get_x509_bundles().returning(move || {
+            flag.store(false, Ordering::SeqCst);
+            Ok(mock_bundle_response())
+        });
+        let mut pid = MockPidClientTrait::new();
+        pid.expect_fetch_pid()
+            .returning(|_| Ok(WorkloadPid::new(10)));
+        let client = guarded_client(api, Box::new(pid), alive, leases.clone());
+        let error = client.fetch_certificate(&test_key()).await.unwrap_err();
+        assert!(error.to_string().contains("incarnation exited"));
+        assert_eq!(leases.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn unavailable_pidfd_prevents_any_spire_request() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let alive = Arc::new(AtomicBool::new(false));
+        let leases = Arc::new(AtomicUsize::new(0));
+        let mut api = MockDelegatedIdentityApi::new();
+        api.expect_get_x509_svids().times(0);
+        api.expect_get_x509_bundles().times(0);
+        let mut pid = MockPidClientTrait::new();
+        pid.expect_fetch_pid()
+            .returning(|_| Ok(WorkloadPid::new(10)));
+        let client = guarded_client(api, Box::new(pid), alive, leases.clone());
+        assert!(client.fetch_certificate(&test_key()).await.is_err());
+        assert_eq!(leases.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn same_pid_new_sandbox_cannot_complete_old_fetch() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let alive = Arc::new(AtomicBool::new(true));
+        let leases = Arc::new(AtomicUsize::new(0));
+        let changed = Arc::new(AtomicBool::new(false));
+        let mut api = MockDelegatedIdentityApi::new();
+        api.expect_get_x509_svids().returning(|_| {
+            Ok(mock_stream_svid_success_response(
+                "spiffe://example.org/ns/default/sa/test-sa".into(),
+            ))
+        });
+        let flag = changed.clone();
+        api.expect_get_x509_bundles().returning(move || {
+            flag.store(true, Ordering::SeqCst);
+            Ok(mock_bundle_response())
+        });
+        let mut pid = MockPidClientTrait::new();
+        pid.expect_fetch_pid().returning(move |_| {
+            Ok(WorkloadPid::from_cri(
+                10,
+                if changed.load(Ordering::SeqCst) {
+                    "new"
+                } else {
+                    "old"
+                }
+                .into(),
+                "a".repeat(64),
+            ))
+        });
+        let client = guarded_client(api, Box::new(pid), alive, leases.clone());
+        let error = client.fetch_certificate(&test_key()).await.unwrap_err();
+        assert!(error.to_string().contains("changed after attestation"));
+        assert_eq!(leases.load(Ordering::SeqCst), 0);
+    }
+    struct HangingBundle;
+    #[async_trait]
+    impl DelegatedIdentityApi for HangingBundle {
+        async fn get_x509_bundles(&self) -> Result<spiffe::X509BundleSet, GrpcClientError> {
+            std::future::pending().await
+        }
+        async fn get_x509_svids(
+            &self,
+            _: DelegateAttestationRequest,
+        ) -> Result<
+            Box<dyn Stream<Item = Result<X509Svid, GrpcClientError>> + Send + Unpin>,
+            GrpcClientError,
+        > {
+            Ok(mock_stream_svid_success_response(
+                "spiffe://example.org/ns/default/sa/test-sa".into(),
+            ))
+        }
+    }
+    #[tokio::test]
+    async fn bundle_deadline_cancels_and_drops_process_binding() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let alive = Arc::new(AtomicBool::new(true));
+        let leases = Arc::new(AtomicUsize::new(0));
+        let mut pid = MockPidClientTrait::new();
+        pid.expect_fetch_pid()
+            .returning(|_| Ok(WorkloadPid::new(10)));
+        let mut client = guarded_client(HangingBundle, Box::new(pid), alive, leases.clone());
+        Arc::get_mut(&mut client.cfg).unwrap().spire_timeout = std::time::Duration::from_millis(30);
+        let start = std::time::Instant::now();
+        let error = client.fetch_certificate(&test_key()).await.unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded across CRI"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(leases.load(Ordering::SeqCst), 0);
+    }
+    struct HangingPid;
+    #[async_trait]
+    impl PidClientTrait for HangingPid {
+        async fn fetch_pid(&self, _: &WorkloadUid) -> Result<WorkloadPid, std::io::Error> {
+            std::future::pending().await
+        }
+    }
+    #[tokio::test]
+    async fn initial_cri_deadline_prevents_any_spire_request() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let alive = Arc::new(AtomicBool::new(true));
+        let leases = Arc::new(AtomicUsize::new(0));
+        let mut api = MockDelegatedIdentityApi::new();
+        api.expect_get_x509_svids().times(0);
+        let mut client = guarded_client(api, Box::new(HangingPid), alive, leases.clone());
+        Arc::get_mut(&mut client.cfg).unwrap().spire_timeout = std::time::Duration::from_millis(30);
+        let error = client.fetch_certificate(&test_key()).await.unwrap_err();
+        assert!(error.to_string().contains("deadline exceeded across CRI"));
+        assert_eq!(leases.load(Ordering::SeqCst), 0);
     }
 
     fn ca_params(cn: &str) -> Result<CertificateParams, rcgen::Error> {
