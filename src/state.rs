@@ -55,6 +55,7 @@ use self::workload::ApplicationTunnel;
 
 pub mod policy;
 pub mod service;
+pub(crate) mod source_binding;
 pub mod workload;
 
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -154,12 +155,24 @@ impl WorkloadInfo {
 #[derive(Educe, Debug, Clone, Eq, serde::Serialize)]
 #[educe(PartialEq, Hash)]
 pub struct ProxyRbacContext {
+    #[serde(skip_serializing)]
+    pub(crate) native_source: Option<Arc<source_binding::DirectSource>>,
     pub conn: rbac::Connection,
     #[educe(Hash(ignore), PartialEq(ignore))]
     pub dest_workload: Arc<Workload>,
 }
 
 impl ProxyRbacContext {
+    /// Construct an ordinary context without authenticated native source proof.
+    /// Strict native authorization requires the internal TLS capture path.
+    pub fn new(conn: rbac::Connection, dest_workload: Arc<Workload>) -> Self {
+        Self {
+            native_source: None,
+            conn,
+            dest_workload,
+        }
+    }
+
     pub fn into_conn(self) -> rbac::Connection {
         self.conn
     }
@@ -524,6 +537,8 @@ pub struct DemandProxyState {
     /// Immutable process requirement; cannot disappear during an xDS resync.
     #[serde(skip_serializing)]
     require_inbound_mtls: bool,
+    #[serde(skip_serializing)]
+    native_source_ranges: Option<Arc<config::MeshEgressConfig>>,
     /// Tracks whether strict-mode authorization data belongs to the current,
     /// fully accepted xDS snapshot and whether old inbound streams were drained.
     #[serde(skip_serializing)]
@@ -588,6 +603,7 @@ impl DemandProxyState {
         let dns_resolver = rb.build().expect("dns resolver config should be valid");
         Self {
             require_inbound_mtls: false,
+            native_source_ranges: None,
             xds_session: None,
             profile_provider: None,
             state,
@@ -659,6 +675,7 @@ impl DemandProxyState {
             return Err(proxy::AuthorizationRejectionError::XdsSessionUnavailable);
         }
         let state = self.read();
+        self.validate_native_source(ctx, &state)?;
         if self.require_inbound_mtls {
             for required in &wl.authorization_policies {
                 if state.policies.get(required).is_none() {
@@ -1334,6 +1351,11 @@ impl ProxyStateManager {
                 proxy_metrics,
             )
             .with_require_inbound_mtls(config.require_inbound_mtls)
+            .with_native_source_ranges(
+                config
+                    .require_mesh_hbone
+                    .then(|| config.mesh_egress.clone()),
+            )
             .with_xds_session(xds_session)
             .with_profile_provider(profile_provider),
         })
@@ -1777,6 +1799,7 @@ mod tests {
         let key: Strng = format!("{dest_uid}").into();
         let workload = &state.read().workloads.by_uid[&key];
         crate::state::ProxyRbacContext {
+            native_source: None,
             conn: rbac::Connection {
                 src_identity: Some(Identity::Spiffe {
                     trust_domain: "cluster.local".into(),

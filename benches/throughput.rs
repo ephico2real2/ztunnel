@@ -383,15 +383,15 @@ pub fn rbac(c: &mut Criterion) {
         ResolverOpts::default(),
         metrics,
     );
-    let rc = ProxyRbacContext {
-        conn: rbac::Connection {
+    let rc = ProxyRbacContext::new(
+        rbac::Connection {
             src: "127.0.0.1:12345".parse().unwrap(),
             dst: "127.0.0.2:12345".parse().unwrap(),
             src_identity: None,
             dst_network: "".into(),
         },
-        dest_workload: Arc::new(test_default_workload()),
-    };
+        Arc::new(test_default_workload()),
+    );
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

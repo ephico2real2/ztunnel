@@ -42,7 +42,7 @@ mod namespaced {
     use tracing::{error, info};
 
     use ztunnel::state::workload::NetworkAddress;
-    use ztunnel::test_helpers::app::{ParsedMetrics, TestApp};
+    use ztunnel::test_helpers::app::{ParsedMetrics, TestApp, metrics_schema};
     use ztunnel::test_helpers::linux::TestMode::{Dedicated, Shared};
     use ztunnel::test_helpers::linux::WorkloadManager;
     use ztunnel::test_helpers::netns::{Namespace, Resolver};
@@ -2177,14 +2177,16 @@ mod namespaced {
     }
 
     async fn verify_metrics_compression(ztunnel: &TestApp) {
-        let expected = ztunnel.get_metrics("").await.unwrap().len();
+        let expected = metrics_schema(&ztunnel.get_metrics("").await.unwrap()).unwrap();
+        assert!(expected.contains("# TYPE istio_build gauge"));
+        // Each live request encodes a new registry snapshot. Tokio and process
+        // sample values can change while these HTTP requests are in flight.
+        // Header/status validation and decoding happen in get_metrics; compare
+        // the parsed descriptor contract here, not volatile values or lengths.
+        // The server unit tests compare exact bytes for one frozen body.
         for encoding in ["gzip", "zstd", "br"] {
-            let actual = ztunnel.get_metrics(encoding).await.unwrap().len();
-            assert_eq!(
-                actual, expected,
-                "decompression mismatch got: {} want: {}",
-                actual, expected
-            );
+            let actual = metrics_schema(&ztunnel.get_metrics(encoding).await.unwrap()).unwrap();
+            assert_eq!(actual, expected, "metrics schema changed for {encoding}");
         }
     }
 

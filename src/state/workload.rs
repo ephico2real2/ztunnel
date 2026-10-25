@@ -804,6 +804,8 @@ impl From<&Identity> for WorkloadIdentity {
 #[derive(Debug)]
 pub struct WorkloadStore {
     local_node: Option<Strng>,
+    source_observations: HashMap<Strng, u64>,
+    next_source_observation: Option<u64>,
     // TODO this could be expanded to Sender<Workload> + a full subscriber/streaming
     // model, but for now just notifying watchers to wake when _any_ insert happens
     // is simpler (and only requires a channelsize of 1)
@@ -970,6 +972,8 @@ impl WorkloadStore {
     pub fn new(local_node: Option<Strng>) -> Self {
         WorkloadStore {
             local_node,
+            source_observations: Default::default(),
+            next_source_observation: Some(1),
             insert_notifier: Sender::new(()),
             by_addr: Default::default(),
             node_local_by_identity: Default::default(),
@@ -979,7 +983,7 @@ impl WorkloadStore {
     }
 
     // Returns a new subscriber. Note that subscribers are only guaranteed to be notified on
-    // new values sent _after_ their creation, so callers should create, check current state,
+    // inserts/removals sent _after_ their creation, so callers should create, check current state,
     // then sub.
     pub fn new_subscriber(&self) -> Receiver<()> {
         self.insert_notifier.subscribe()
@@ -997,6 +1001,10 @@ impl WorkloadStore {
                     .and_modify(|ws| ws.insert(w.clone()))
                     .or_insert_with(|| WorkloadByAddr::Single(w.clone()));
             }
+        }
+        if let Some(observation) = self.next_source_observation {
+            self.source_observations.insert(w.uid.clone(), observation);
+            self.next_source_observation = observation.checked_add(1);
         }
         self.by_uid.insert(w.uid.clone(), w.clone());
         // Only track local nodes to avoid overhead
@@ -1024,6 +1032,7 @@ impl WorkloadStore {
                 None
             }
             Some(prev) => {
+                self.source_observations.remove(uid);
                 if prev.network_mode != NetworkMode::HostNetwork {
                     for wip in prev.workload_ips.iter() {
                         if let Entry::Occupied(mut o) =
@@ -1049,6 +1058,9 @@ impl WorkloadStore {
                     }
                 }
 
+                // Deletion must wake source leases and active-flow revalidation,
+                // including a remove/reinsert with identical visible fields.
+                self.insert_notifier.send_replace(());
                 Some(prev.deref().clone())
             }
         }
@@ -1057,6 +1069,27 @@ impl WorkloadStore {
     /// Finds the workload by address, as an arc.
     pub fn find_address(&self, addr: &NetworkAddress) -> Option<Arc<Workload>> {
         self.by_addr.get(addr).map(WorkloadByAddr::get)
+    }
+
+    /// Authorization requires one owner; the general routing lookup deliberately
+    /// ranks duplicate owners and is not a source-identity proof.
+    pub(crate) fn find_unique_address(&self, addr: &NetworkAddress) -> Option<Arc<Workload>> {
+        match self.by_addr.get(addr)? {
+            WorkloadByAddr::Single(workload) => Some(workload.clone()),
+            WorkloadByAddr::Many(_) => None,
+        }
+    }
+
+    /// A process-local mutation incarnation, including same-Arc remove/reinsert.
+    /// Exhaustion permanently closes native source admission until restart.
+    pub(crate) fn unique_address_observation(
+        &self,
+        addr: &NetworkAddress,
+    ) -> Option<(Arc<Workload>, u64)> {
+        self.next_source_observation?;
+        let workload = self.find_unique_address(addr)?;
+        let observation = *self.source_observations.get(&workload.uid)?;
+        Some((workload, observation))
     }
 
     /// Finds the workload by workload information, as an arc.
@@ -2333,5 +2366,35 @@ mod tests {
         };
         // Make sure we get a valid VIP
         assert_eq!(port, 8080);
+    }
+    #[test]
+    fn direct_source_observation_never_reuses_same_arc_or_wraps_counter() {
+        let mut store = WorkloadStore::new(None);
+        let workload = Arc::new(Workload {
+            uid: "source".into(),
+            workload_ips: vec!["10.1.0.1".parse().unwrap()],
+            ..crate::test_helpers::test_default_workload()
+        });
+        let address = network_addr(workload.network.clone(), workload.workload_ips[0]);
+        store.insert(workload.clone());
+        let (_, first) = store.unique_address_observation(&address).unwrap();
+        store.remove(&workload.uid);
+        assert!(store.unique_address_observation(&address).is_none());
+        assert!(store.source_observations.is_empty());
+        store.insert(workload.clone());
+        let (_, second) = store.unique_address_observation(&address).unwrap();
+        assert!(
+            second > first,
+            "reusing the identical Arc is still a new observation"
+        );
+        store.next_source_observation = Some(u64::MAX);
+        store.insert(workload.clone());
+        assert!(store.next_source_observation.is_none());
+        assert!(store.unique_address_observation(&address).is_none());
+        store.insert(workload);
+        assert!(
+            store.unique_address_observation(&address).is_none(),
+            "overflow cannot reopen source admission"
+        );
     }
 }

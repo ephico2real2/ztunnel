@@ -1867,6 +1867,7 @@ mod tests {
                         dst_network: "".into(),
                     };
                     let rbac_ctx = crate::state::ProxyRbacContext {
+                        native_source: None,
                         conn: conn.clone(),
                         dest_workload: Arc::new(test_default_workload()),
                     };
@@ -1879,6 +1880,7 @@ mod tests {
                         ..conn
                     };
                     let rbac_ctx = crate::state::ProxyRbacContext {
+                        native_source: None,
                         conn,
                         dest_workload: Arc::new(test_default_workload()),
                     };
@@ -2825,6 +2827,7 @@ mod tests {
             .find_uid(&strng::new("default/foo0"))
             .unwrap();
         let ctx = crate::state::ProxyRbacContext {
+            native_source: None,
             dest_workload: destination,
             conn: crate::rbac::Connection {
                 src: "10.0.0.9:42000".parse().unwrap(),

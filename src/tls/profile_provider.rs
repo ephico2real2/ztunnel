@@ -2480,4 +2480,335 @@ mod tests {
             assert_eq!(&data, b"fresh");
         }
     }
+    // These are real loopback TCP + native TLS + HTTP/2 tests. The fixture's
+    // independently supplied ranges admit loopback only here; the native
+    // Cilium publisher continues rejecting loopback workload Addresses.
+    #[cfg(target_os = "linux")]
+    async fn direct_source_tls_fixture() -> (
+        ClientTls<TcpStream>,
+        ServerTls<TcpStream>,
+        crate::rbac::Connection,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<WorkloadCertificate>,
+        Arc<WorkloadCertificate>,
+        Arc<ProfileProvider>,
+        Arc<ProfileProvider>,
+    ) {
+        let root = ca("root", None);
+        let a = ca("a", Some(&root));
+        let b = ca("b", Some(&root));
+        let ca = workload("cmtc-a.mesh.example", &a);
+        let cb = workload("cmtc-b.mesh.example", &b);
+        let wa = live_wire("cmtc-a", &root, &a, &b);
+        let wb = live_wire("cmtc-b", &root, &a, &b);
+        let da = dir();
+        let db = dir();
+        let (pa, ga, sa) = opened(da.path(), &expected(&wa), SystemTime::now);
+        let (pb, gb, sb) = opened(db.path(), &expected(&wb), SystemTime::now);
+        pa.commit(decode(&wa, &expected(&wa), SystemTime::now))
+            .unwrap();
+        pb.commit(decode(&wb, &expected(&wb), SystemTime::now))
+            .unwrap();
+        ready(&pa, &ga, sa);
+        ready(&pb, &gb, sb);
+        let (client, server, connection) = direct_source_tls_again(&ca, &cb, &pa, &pb).await;
+        (client, server, connection, da, db, ca, cb, pa, pb)
+    }
+    #[cfg(target_os = "linux")]
+    async fn direct_source_tls_again(
+        ca: &Arc<WorkloadCertificate>,
+        cb: &Arc<WorkloadCertificate>,
+        pa: &Arc<ProfileProvider>,
+        pb: &Arc<ProfileProvider>,
+    ) -> (
+        ClientTls<TcpStream>,
+        ServerTls<TcpStream>,
+        crate::rbac::Connection,
+    ) {
+        let listener = TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = async {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            connect(
+                ca.clone(),
+                Some(pa.acquire().unwrap()),
+                socket.connect(address).await.unwrap(),
+                vec![cb.identity().unwrap()],
+                None,
+            )
+            .await
+            .unwrap()
+            .0
+        };
+        let server = async {
+            let (raw, peer) = listener.accept().await.unwrap();
+            let destination = raw.local_addr().unwrap();
+            let server = accept(cb.clone(), Some(pb.acquire().unwrap()), raw, None)
+                .await
+                .unwrap()
+                .0;
+            let (_, ssl) = server.get_ref().get_ref();
+            let certificate = tls::certificate_from_connection(ssl);
+            let connection = crate::rbac::Connection {
+                src: peer,
+                dst: destination,
+                dst_network: crate::strng::EMPTY,
+                src_identity: tls::identity(&certificate),
+            };
+            (server, connection)
+        };
+        let (client, (server, connection)) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(client, server)
+        })
+        .await
+        .unwrap();
+        (client, server, connection)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn native_kernel_peer_and_verified_uri_reject_mismatch_and_ambiguous_xds() {
+        let (_client, _server, connection, _da, _db, _ca, _cb, _pa, _pb) =
+            direct_source_tls_fixture().await;
+        assert_eq!(
+            connection.src.ip(),
+            "127.0.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            connection.src_identity.as_ref().unwrap().to_string(),
+            "spiffe://cmtc-a.mesh.example/ns/orders/sa/api"
+        );
+        let (state, ctx, _) = crate::state::source_binding::tests::fixture(connection);
+        assert!(state.assert_rbac(&ctx).await.is_ok());
+        let old = state
+            .read()
+            .workloads
+            .find_uid(&"source-pod-uid".into())
+            .unwrap();
+        let mut wrong = (*old).clone();
+        wrong.service_account = "wrong-label-owner".into();
+        crate::state::source_binding::tests::insert_workload(&state, Arc::new(wrong));
+        assert!(state.capture_native_source(&ctx.conn).is_err());
+        crate::state::source_binding::tests::insert_workload(&state, old.clone());
+        let mut duplicate = (*old).clone();
+        duplicate.uid = "ambiguous-other-pod".into();
+        crate::state::source_binding::tests::insert_workload(&state, Arc::new(duplicate));
+        assert!(state.capture_native_source(&ctx.conn).is_err());
+        assert!(state.assert_rbac(&ctx).await.is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn native_source_delta_closes_actual_idle_and_active_tls_h2_then_fresh_tls_recovers() {
+        for active in [false, true] {
+            for recovered in [false, true] {
+                let (client, server, mut connection, _da, _db, ca, cb, pa, pb) =
+                    direct_source_tls_fixture().await;
+                // RBAC sees the application target port, not outer HBONE port.
+                connection.dst.set_port(8080);
+                let (state, ctx, _) = crate::state::source_binding::tests::fixture(connection);
+                let source = state
+                    .read()
+                    .workloads
+                    .find_uid(&"source-pod-uid".into())
+                    .unwrap();
+                let (_global, global) = watch::channel(());
+                let (shutdown, _source_owner) =
+                    state.native_source_shutdown(ctx.native_source.clone(), global);
+                let (_drain_owner, drain) = crate::drain::new();
+                let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (dropped, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel();
+                struct AckDrop(tokio::sync::mpsc::UnboundedSender<()>);
+                impl Drop for AckDrop {
+                    fn drop(&mut self) {
+                        let _ = self.0.send(());
+                    }
+                }
+                let handler_state = state.clone();
+                let handler_ctx = ctx.clone();
+                let server_task = tokio::spawn(crate::proxy::h2::server::serve_connection(
+                    Arc::new(crate::test_helpers::test_config()),
+                    server,
+                    drain,
+                    shutdown,
+                    None,
+                    move |req| {
+                        let state = handler_state.clone();
+                        let ctx = handler_ctx.clone();
+                        let entered = entered.clone();
+                        let drop_ack = AckDrop(dropped.clone());
+                        async move {
+                            let _drop_ack = drop_ack;
+                            // Forged telemetry never rewrites the captured kernel
+                            // address or verified TLS principal in this native join.
+                            assert!(req.headers().contains_key("forwarded"));
+                            assert!(state.assert_rbac(&ctx).await.is_ok());
+                            let stream = req
+                                .send_response(
+                                    http::Response::builder().status(200).body(()).unwrap(),
+                                )
+                                .await
+                                .unwrap();
+                            let mut stream = crate::proxy::h2::TokioH2Stream::new(stream);
+                            entered.send(()).unwrap();
+                            let mut data = [0; 5];
+                            stream.read_exact(&mut data).await.unwrap();
+                            assert_eq!(&data, b"proof");
+                            stream.write_all(&data).await.unwrap();
+                            std::future::pending::<()>().await;
+                        }
+                    },
+                ));
+                let (mut send, mut driver) = h2::client::handshake(client).await.unwrap();
+                let mut ping = driver.ping_pong().unwrap();
+                let driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(driver));
+                tokio::time::timeout(Duration::from_secs(2), ping.ping(h2::Ping::opaque()))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut data = if active {
+                    let request = http::Request::builder()
+                        .method(http::Method::CONNECT)
+                        .uri("127.0.0.2:8080")
+                        .header("forwarded", "for=10.9.9.9")
+                        .header(
+                            "baggage",
+                            "k8s.cluster.name=foreign,service.name=privileged",
+                        )
+                        .body(())
+                        .unwrap();
+                    let (response, mut stream) = send.send_request(request, false).unwrap();
+                    stream
+                        .send_data(bytes::Bytes::from_static(b"proof"), false)
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let response = tokio::time::timeout(Duration::from_secs(2), response)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(response.status(), 200);
+                    let mut body = response.into_body();
+                    assert_eq!(
+                        &tokio::time::timeout(Duration::from_secs(2), body.data())
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap()[..],
+                        b"proof"
+                    );
+                    Some((body, stream))
+                } else {
+                    None
+                };
+                // Workload-only mutation; no policy event or direct close_all.
+                crate::state::source_binding::tests::remove_workload(&state, &source.uid);
+                if recovered {
+                    crate::state::source_binding::tests::insert_workload(&state, source);
+                    assert!(
+                        state.assert_rbac(&ctx).await.is_err(),
+                        "old TLS witness cannot rebind after ABA"
+                    );
+                    let mut new_ctx = ctx.clone();
+                    new_ctx.native_source = state.capture_native_source(&ctx.conn).unwrap();
+                    assert!(
+                        state.assert_rbac(&new_ctx).await.is_ok(),
+                        "a fresh qualified TLS connection can bind restored state"
+                    );
+                }
+                let result = tokio::time::timeout(Duration::from_secs(2), server_task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(result.is_err(), "idle outer driver must stop");
+                if let Some((ref mut body, _)) = data {
+                    let closed = tokio::time::timeout(Duration::from_secs(2), body.data())
+                        .await
+                        .unwrap();
+                    assert!(closed.is_none() || closed.is_some_and(|value| value.is_err()));
+                    tokio::time::timeout(Duration::from_secs(2), dropped_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                }
+                let _ = tokio::time::timeout(Duration::from_secs(2), driver)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                drop(send);
+                if recovered {
+                    // A real NEW TCP/TLS/H2 connection uses the SAME native
+                    // providers and SAME restored workload/policy state.
+                    let (client, server, mut conn) =
+                        direct_source_tls_again(&ca, &cb, &pa, &pb).await;
+                    conn.dst.set_port(8080);
+                    let mut fresh_ctx = ctx.clone();
+                    fresh_ctx.conn = conn;
+                    fresh_ctx.native_source = state.capture_native_source(&fresh_ctx.conn).unwrap();
+                    assert!(state.assert_rbac(&ctx).await.is_err());
+                    assert!(state.assert_rbac(&fresh_ctx).await.is_ok());
+                    let (_global, global) = watch::channel(());
+                    let (shutdown, owner) =
+                        state.native_source_shutdown(fresh_ctx.native_source.clone(), global);
+                    let (_drain, drain) = crate::drain::new();
+                    let serving_state = state.clone();
+                    let serving = tokio::spawn(crate::proxy::h2::server::serve_connection(
+                        Arc::new(crate::test_helpers::test_config()),
+                        server,
+                        drain,
+                        shutdown,
+                        None,
+                        move |req| {
+                            let state = serving_state.clone();
+                            let ctx = fresh_ctx.clone();
+                            async move {
+                                assert!(state.assert_rbac(&ctx).await.is_ok());
+                                let _stream = req
+                                    .send_response(
+                                        http::Response::builder().status(200).body(()).unwrap(),
+                                    )
+                                    .await
+                                    .unwrap();
+                                std::future::pending::<()>().await;
+                            }
+                        },
+                    ));
+                    let (mut sender, driver) = h2::client::handshake(client).await.unwrap();
+                    let driver = tokio_util::task::AbortOnDropHandle::new(tokio::spawn(driver));
+                    let request = http::Request::builder()
+                        .method(http::Method::CONNECT)
+                        .uri("127.0.0.2:8080")
+                        .body(())
+                        .unwrap();
+                    let (response, _body) = sender.send_request(request, false).unwrap();
+                    assert_eq!(
+                        tokio::time::timeout(Duration::from_secs(2), response)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .status(),
+                        200
+                    );
+                    // Owner cancellation is a real cleanup event, never an allow.
+                    drop(owner);
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(2), serving)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .is_err()
+                    );
+                    let _ = tokio::time::timeout(Duration::from_secs(2), driver)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    drop(sender);
+                }
+            }
+        }
+    }
 }

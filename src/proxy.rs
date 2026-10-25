@@ -405,6 +405,7 @@ pub struct Addresses {
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthorizationRejectionError {
     AuthenticationRequired,
+    NativeSourceBinding(Strng),
     XdsSessionUnavailable,
     UnclassifiedEgress(SocketAddr),
     UnknownProtectedDestination(SocketAddr),
@@ -422,6 +423,9 @@ impl fmt::Display for AuthorizationRejectionError {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AuthenticationRequired => write!(fmt, "verified TLS peer required"),
+            Self::NativeSourceBinding(reason) => {
+                write!(fmt, "native direct source binding rejected: {reason}")
+            }
             Self::XdsSessionUnavailable => {
                 write!(fmt, "current xDS authorization snapshot unavailable")
             }

@@ -402,6 +402,7 @@ pub struct PolicyWatcher {
     stop: DrainWatcher,
     connection_manager: ConnectionManager,
     drain_participant: Option<crate::xds::DrainParticipant>,
+    workloads_changed: tokio::sync::watch::Receiver<()>,
     policies_changed: tokio::sync::watch::Receiver<()>,
 }
 
@@ -414,6 +415,7 @@ impl PolicyWatcher {
         // Subscribe before the watcher task is spawned so policy changes cannot
         // be lost between construction and its first poll.
         let policies_changed = state.read().policies.subscribe();
+        let workloads_changed = state.read().workloads.new_subscriber();
         let drain_participant = state
             .xds_session()
             .map(|gate| gate.register_drain_participant());
@@ -423,11 +425,13 @@ impl PolicyWatcher {
             connection_manager,
             drain_participant,
             policies_changed,
+            workloads_changed,
         }
     }
 
     pub async fn run(self) {
         let mut policies_changed = self.policies_changed;
+        let mut workloads_changed = self.workloads_changed;
         let session_gate = self.state.xds_session();
         let mut session_changes = session_gate.as_ref().map(|gate| gate.subscribe());
         if let (Some(gate), Some(participant)) = (&session_gate, self.drain_participant) {
@@ -468,12 +472,17 @@ impl PolicyWatcher {
                         }
                     }
                 }
-                _ = policies_changed.changed() => {
+                _ = async {
+                    tokio::select! {
+                        _ = policies_changed.changed() => {},
+                        _ = workloads_changed.changed() => {},
+                    }
+                } => {
                     let connections = self.connection_manager.connections();
                     for conn in connections {
                         if self.state.assert_rbac(&conn.ctx).await.is_err() {
                             self.connection_manager.close(&conn).await;
-                            info!("connection {} closed because it's no longer allowed after a policy update", conn.ctx);
+                            info!("connection {} closed because it's no longer allowed after a policy/workload update", conn.ctx);
                         }
                     }
                 }
@@ -529,6 +538,7 @@ mod tests {
         // track a new connection
         let rbac_ctx1 = InboundConnection {
             ctx: crate::state::ProxyRbacContext {
+                native_source: None,
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -563,6 +573,7 @@ mod tests {
         // track a second connection
         let rbac_ctx2 = InboundConnection {
             ctx: crate::state::ProxyRbacContext {
+                native_source: None,
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -632,6 +643,7 @@ mod tests {
         // create a new connection
         let conn1 = InboundConnection {
             ctx: crate::state::ProxyRbacContext {
+                native_source: None,
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -652,6 +664,7 @@ mod tests {
         // create a second connection
         let conn2 = InboundConnection {
             ctx: crate::state::ProxyRbacContext {
+                native_source: None,
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -748,6 +761,7 @@ mod tests {
         // create a test connection
         let conn1 = InboundConnection {
             ctx: crate::state::ProxyRbacContext {
+                native_source: None,
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -824,6 +838,7 @@ mod tests {
         .with_xds_session(Some(session.clone()));
         let connection = |source_port| InboundConnection {
             ctx: crate::state::ProxyRbacContext {
+                native_source: None,
                 conn: Connection {
                     src_identity: None,
                     src: std::net::SocketAddr::new(
@@ -976,6 +991,7 @@ mod tests {
 
         let connection = InboundConnection {
             ctx: crate::state::ProxyRbacContext {
+                native_source: None,
                 conn: Connection {
                     src_identity: Some(Identity::Spiffe {
                         trust_domain: "cluster.local".into(),
@@ -1156,6 +1172,7 @@ mod tests {
         let manager = ConnectionManager::default();
         let connection = InboundConnection {
             ctx: crate::state::ProxyRbacContext {
+                native_source: None,
                 conn: Connection {
                     src: "10.1.2.3:42000".parse().unwrap(),
                     dst: "10.1.2.4:8080".parse().unwrap(),

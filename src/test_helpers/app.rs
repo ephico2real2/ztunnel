@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use anyhow::anyhow;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::ops::Deref;
@@ -23,7 +23,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZstdDecoder};
-use http::header::CONTENT_ENCODING;
+use http::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use http_body_util::Empty;
 use http_body_util::{BodyExt, BodyStream};
 use hyper::body::Incoming;
@@ -174,6 +174,16 @@ impl TestApp {
             .unwrap();
         let client = hyper_util::pooling_client();
         let (parts, body) = client.request(req).await?.into_parts();
+        if parts.status != http::StatusCode::OK {
+            anyhow::bail!("metrics returned HTTP {}", parts.status);
+        }
+        let content_type = parts
+            .headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+        if content_type != Some("text/plain; charset=utf-8") {
+            anyhow::bail!("unexpected metrics content type: {content_type:?}");
+        }
         let frame_stream = BodyStream::new(body);
         let byte_stream = frame_stream.map(|item| {
             item.map(|frame| frame.into_data().unwrap_or_else(|_| Bytes::new()))
@@ -388,6 +398,45 @@ pub async fn socks5_connect(
     Ok(stream)
 }
 
+/// Parse a complete scrape and return its stable metric descriptors. Sample
+/// values and labelsets are deliberately excluded: live collectors can change
+/// them between two HTTP requests even when compression is correct.
+pub fn metrics_schema(text: &str) -> anyhow::Result<BTreeSet<String>> {
+    // Scrape::parse is permissive about malformed lines. Require each data
+    // line to be recognized with a valid sample value before using its schema.
+    for line in text
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+    {
+        match prometheus_parse::LineInfo::parse(line) {
+            prometheus_parse::LineInfo::Sample { value, .. }
+                if matches!(value, "+Inf" | "Inf" | "-Inf" | "NaN")
+                    || value.parse::<f64>().is_ok() => {}
+            _ => anyhow::bail!("metrics response contains an invalid sample line: {line}"),
+        }
+    }
+    let scrape = Scrape::parse(
+        text.lines()
+            .map(|line| Ok::<_, io::Error>(line.to_string())),
+    )?;
+    if scrape.docs.is_empty() || scrape.samples.is_empty() {
+        anyhow::bail!("metrics response contains no parsed descriptors or samples");
+    }
+    let schema: BTreeSet<_> = text
+        .lines()
+        .filter(|line| {
+            line.starts_with("# HELP ")
+                || line.starts_with("# TYPE ")
+                || line.starts_with("# UNIT ")
+        })
+        .map(str::to_string)
+        .collect();
+    if !schema.iter().any(|line| line.starts_with("# TYPE ")) {
+        anyhow::bail!("metrics response contains no metric types");
+    }
+    Ok(schema)
+}
+
 #[derive(Debug)]
 pub struct ParsedMetrics {
     scrape: Scrape,
@@ -453,4 +502,48 @@ fn superset_of(base: &HashMap<String, String>, check: &HashMap<String, String>) 
         }
     }
     true
+}
+
+#[cfg(test)]
+mod compression_schema_tests {
+    use super::metrics_schema;
+
+    #[test]
+    fn metrics_schema_ignores_values_but_preserves_types_and_help() {
+        let original =
+            "# HELP example Work in progress.\n# TYPE example gauge\nexample{worker=\"0\"} 9\n";
+        let changed = "# HELP example Work in progress.\n# TYPE example gauge\nexample{worker=\"0\"} 10\nexample{worker=\"1\"} 11\n";
+        assert_ne!(original.len(), changed.len());
+        assert_eq!(
+            metrics_schema(original).unwrap(),
+            metrics_schema(changed).unwrap()
+        );
+        let changed_type = original.replace("# TYPE example gauge", "# TYPE example counter");
+        assert_ne!(
+            metrics_schema(original).unwrap(),
+            metrics_schema(&changed_type).unwrap()
+        );
+        let changed_help = original.replace("Work in progress.", "A different contract.");
+        assert_ne!(
+            metrics_schema(original).unwrap(),
+            metrics_schema(&changed_help).unwrap()
+        );
+    }
+
+    #[test]
+    fn metrics_schema_rejects_empty_unparsed_or_missing_type() {
+        for invalid in [
+            "",
+            "not a metrics scrape",
+            "# HELP example Missing sample.\n# TYPE example gauge\n",
+            "# HELP example Missing type.\nexample 1\n",
+            "# HELP example Invalid sample.\n# TYPE example gauge\nexample 1\ngarbage\n",
+            "# HELP example Invalid value.\n# TYPE example gauge\nexample 1\nexample broken\n",
+        ] {
+            assert!(
+                metrics_schema(invalid).is_err(),
+                "accepted invalid metrics response: {invalid}"
+            );
+        }
+    }
 }

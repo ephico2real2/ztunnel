@@ -140,6 +140,12 @@ impl Inbound {
                             dst_network: pi.cfg.network.clone(), // inbound request must be on our network
                             dst,
                         };
+                        let native_source = pi.state.capture_native_source(&conn)
+                            .map_err(Error::AuthorizationPolicyRejection)
+                            .inspect_err(|error| metrics::log_early_deny(src, dst, Reporter::destination, error))?;
+                        let (force_shutdown, _native_source_owner) = pi.state.native_source_shutdown(
+                            native_source.clone(), force_shutdown,
+                        );
                         debug!(%conn, "accepted connection");
                         let cfg = pi.cfg.clone();
                         // Enforce CRL revocation on this existing connection when a CRL is configured
@@ -148,15 +154,17 @@ impl Inbound {
                         let request_handler = move |req| {
                             let id = Self::extract_traceparent(&req);
                             let peer = conn.src;
-                            let req_handler = Self::serve_connect(
+                            let req_handler = Box::pin(Self::serve_connect(
                                 pi.clone(),
                                 conn.clone(),
+                                native_source.clone(),
                                 self.enable_orig_src,
                                 req,
-                            )
+                            ))
                             .instrument(info_span!("inbound", %id, %peer));
-                            // This is for each user connection, so most important to keep small
-                            assertions::size_between_ref(1500, 2750, &req_handler);
+                            // Keep the per-application task small by boxing its expanded body.
+                            // The original upper task-size bound remains unchanged.
+                            assertions::size_between_ref(8, 2750, &req_handler);
                             req_handler
                         };
 
@@ -231,6 +239,7 @@ impl Inbound {
     async fn serve_connect(
         pi: Arc<ProxyInputs>,
         conn: Connection,
+        native_source: Option<Arc<crate::state::source_binding::DirectSource>>,
         enable_original_source: bool,
         req: H2Request,
     ) {
@@ -243,7 +252,7 @@ impl Inbound {
         // phases.
 
         // Initial phase, build up context about the request.
-        let ri = match Self::build_inbound_request(&pi, conn, req.get_request()).await {
+        let mut ri = match Self::build_inbound_request(&pi, conn, req.get_request()).await {
             Ok(i) => i,
             Err(InboundError(e, code)) => {
                 // At this point in processing, we never built up full context to log a complete access log.
@@ -257,6 +266,8 @@ impl Inbound {
                 return;
             }
         };
+
+        ri.rbac_ctx.native_source = native_source;
 
         // Now we have enough context to properly report logs and metrics. Group everything else that
         // can fail before we send the OK response here.
@@ -374,6 +385,32 @@ impl Inbound {
         ri.result_tracker.record(res);
     }
 
+    fn validate_native_direct_target(
+        conn: &Connection,
+        destination: &Workload,
+        hbone: &HboneAddress,
+        headers: &http::HeaderMap,
+    ) -> Result<(), Error> {
+        let direct = matches!(hbone, HboneAddress::SocketAddr(addr)
+            if addr.ip() == conn.dst.ip() && destination.workload_ips.contains(&addr.ip()));
+        if !direct
+            || headers.contains_key(X_FORWARDED_NETWORK_HEADER)
+            || destination.waypoint.is_some()
+            || destination.network_gateway.is_some()
+            || destination.application_tunnel.is_some()
+            || destination.native_tunnel
+        {
+            return Err(Error::AuthorizationPolicyRejection(
+                proxy::AuthorizationRejectionError::NativeSourceBinding(
+                    "strict native policy supports only direct Pod-address CONNECT".into(),
+                ),
+            ));
+        }
+        // Forwarded and baggage remain telemetry. Neither can substitute for
+        // the kernel socket or the captured verified TLS peer witness.
+        Ok(())
+    }
+
     // build_inbound_request builds up the context for an inbound request.
     async fn build_inbound_request<T: RequestParts>(
         pi: &Arc<ProxyInputs>,
@@ -401,6 +438,16 @@ impl Inbound {
             // At this point we already fetched the local workload for TLS, so it should be infallible.
             .map_err(InboundError::build(StatusCode::SERVICE_UNAVAILABLE))?;
 
+        if pi.state.native_source_required() {
+            Self::validate_native_direct_target(
+                &conn,
+                &destination_workload,
+                &hbone_addr,
+                req.headers(),
+            )
+            .map_err(InboundError::build(StatusCode::UNAUTHORIZED))?;
+        }
+
         // Check the request is allowed by verifying the destination
         Self::validate_destination(&pi.state, &conn, &destination_workload, &hbone_addr)
             .await
@@ -424,6 +471,7 @@ impl Inbound {
         };
 
         let rbac_ctx = ProxyRbacContext {
+            native_source: None,
             conn,
             dest_workload: destination_workload.clone(),
         };
@@ -1203,5 +1251,56 @@ mod tests {
         assert_eq!(baggage_disabled.cluster_id, None);
         assert_eq!(baggage_disabled.namespace, None);
         assert_eq!(baggage_disabled.workload_name, None);
+    }
+    #[test]
+    fn native_direct_target_ignores_telemetry_identity_and_rejects_gateway_targets() {
+        let conn = Connection {
+            src: "10.1.0.1:12345".parse().unwrap(),
+            dst: "10.2.0.1:15008".parse().unwrap(),
+            src_identity: None,
+            dst_network: "".into(),
+        };
+        let destination = Workload {
+            workload_ips: vec![conn.dst.ip()],
+            ..crate::test_helpers::test_default_workload()
+        };
+        let direct = HboneAddress::SocketAddr("10.2.0.1:8080".parse().unwrap());
+        let mut headers = http::HeaderMap::new();
+        headers.insert("forwarded", http::HeaderValue::from_static("for=10.99.0.1"));
+        headers.insert(
+            "baggage",
+            http::HeaderValue::from_static("k8s.cluster.name=foreign,service.name=admin"),
+        );
+        assert!(
+            Inbound::validate_native_direct_target(&conn, &destination, &direct, &headers).is_ok()
+        );
+        assert_eq!(conn.src, "10.1.0.1:12345".parse().unwrap());
+        assert!(
+            conn.src_identity.is_none(),
+            "headers do not create a verified principal"
+        );
+        let mismatch = HboneAddress::SocketAddr("10.9.0.1:8080".parse().unwrap());
+        assert!(
+            Inbound::validate_native_direct_target(&conn, &destination, &mismatch, &headers)
+                .is_err()
+        );
+        let hostname = HboneAddress::SvcHostname("server.example".into(), 8080);
+        assert!(
+            Inbound::validate_native_direct_target(&conn, &destination, &hostname, &headers)
+                .is_err()
+        );
+        headers.insert(
+            crate::proxy::X_FORWARDED_NETWORK_HEADER,
+            http::HeaderValue::from_static("foreign-network"),
+        );
+        assert!(
+            Inbound::validate_native_direct_target(&conn, &destination, &direct, &headers).is_err()
+        );
+        headers.remove(crate::proxy::X_FORWARDED_NETWORK_HEADER);
+        let mut destination = destination;
+        destination.native_tunnel = true;
+        assert!(
+            Inbound::validate_native_direct_target(&conn, &destination, &direct, &headers).is_err()
+        );
     }
 }

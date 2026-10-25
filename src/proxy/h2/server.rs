@@ -119,7 +119,7 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let mut builder = h2::server::Builder::new();
-    let mut conn = builder
+    let handshake = builder
         .initial_window_size(cfg.window_size)
         .initial_connection_window_size(cfg.connection_window_size)
         .max_frame_size(cfg.frame_size)
@@ -131,8 +131,12 @@ where
         // default from hyper
         .max_concurrent_streams(200)
         .data_frame_budget(usize::MAX)
-        .handshake(s)
-        .await?;
+        .handshake(s);
+    let mut conn = tokio::select! {
+        biased;
+        _ = force_shutdown.changed() => return Err(Error::DrainTimeOut),
+        result = handshake => result?,
+    };
 
     let ping_pong = conn
         .ping_pong()
@@ -155,6 +159,15 @@ where
     loop {
         let drain = drain.clone();
         tokio::select! {
+            biased;
+            // This also terminates an idle outer connection. Child stream
+            // tasks share this receiver and cancel their application I/O.
+            _ = force_shutdown.changed() => {
+                dropped.store(true, Ordering::Relaxed);
+                teardown.set(Teardown::Transport("immediate shutdown or native source invalidation".into()));
+                conn.abrupt_shutdown(h2::Reason::NO_ERROR);
+                return Err(Error::DrainTimeOut);
+            }
             request = conn.accept() => {
                 let Some(request) = request else {
                     // done!
