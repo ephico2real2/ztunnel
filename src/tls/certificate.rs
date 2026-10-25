@@ -61,6 +61,26 @@ pub struct WorkloadCertificate {
     pub roots: Vec<Certificate>,
 }
 
+// Explicitly disable stateless resumption for both TLS1.2 and TLS1.3. Do not
+// inherit a future rustls/provider ticket default in this security boundary.
+#[derive(Debug)]
+struct NoPinnedSessionTickets;
+
+impl rustls::server::ProducesTickets for NoPinnedSessionTickets {
+    fn enabled(&self) -> bool {
+        false
+    }
+    fn lifetime(&self) -> u32 {
+        0
+    }
+    fn encrypt(&self, _plain: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+    fn decrypt(&self, _cipher: &[u8]) -> Option<Vec<u8>> {
+        None
+    }
+}
+
 pub fn certificate_from_connection(conn: &CommonState) -> X509Result<'_, X509Certificate<'_>> {
     use x509_parser::prelude::*;
     conn.peer_certificates()
@@ -432,6 +452,59 @@ impl WorkloadCertificate {
         })
     }
 
+    /// Builds an inbound mTLS config against the explicitly published
+    /// trust-domain issuer pins. The local SPIRE roots are not used to verify peers.
+    pub fn pinned_server_config(
+        &self,
+        publication: Arc<crate::tls::domain_anchors::AnchorPublication>,
+        crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
+    ) -> Result<ServerConfig, Error> {
+        let client_verifier = crate::tls::PinnedTrustDomainVerifier::new(publication, crl_manager);
+        let mut config = ServerConfig::builder_with_provider(crate::tls::lib::provider())
+            .with_protocol_versions(tls::tls_versions())
+            .expect("server config protocol versions must be valid")
+            .with_client_cert_verifier(client_verifier)
+            .with_single_cert(
+                self.cert_and_intermediates_der(),
+                self.private_key.clone_key(),
+            )?;
+        config.alpn_protocols = vec![b"h2".into()];
+        // Every inbound connection must execute the current pin, time, client
+        // certificate and CRL verification. An independent client may resume
+        // even though our outbound helper disables its own session cache.
+        config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+        config.ticketer = Arc::new(NoPinnedSessionTickets);
+        config.send_tls13_tickets = 0;
+        config.max_tls13_tickets = 0;
+        config.max_early_data_size = 0;
+        Ok(config)
+    }
+
+    /// Builds an outbound mTLS config against explicit peer issuer pins and
+    /// exact expected SPIFFE identities. The local SPIRE roots are not a fallback.
+    pub fn pinned_client_config(
+        &self,
+        identities: Vec<Identity>,
+        publication: Arc<crate::tls::domain_anchors::AnchorPublication>,
+        crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
+    ) -> Result<ClientConfig, rustls::Error> {
+        let verifier =
+            crate::tls::PinnedIdentityVerifier::new(publication, identities, crl_manager);
+        let mut config = ClientConfig::builder_with_provider(crate::tls::lib::provider())
+            .with_protocol_versions(tls::tls_versions())
+            .expect("client config protocol versions must be valid")
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(
+                self.cert_and_intermediates_der(),
+                self.private_key.clone_key(),
+            )?;
+        config.alpn_protocols = vec![b"h2".into()];
+        config.resumption = Resumption::disabled();
+        config.enable_sni = false;
+        Ok(config)
+    }
+
     pub fn dump_chain(&self) -> Bytes {
         self.chain.iter().map(|c| c.as_pem()).join("\n").into()
     }
@@ -489,6 +562,7 @@ fn der_to_pem(der: &[u8], label: &str) -> String {
 mod test {
     use crate::identity::Identity;
     use crate::test_helpers::helpers;
+    use crate::tls::domain_anchors::AnchorError;
     use crate::tls::mock::{
         TEST_ROOT, TEST_ROOT_KEY, TEST_ROOT2, TEST_ROOT2_KEY, TestIdentity, crl_pem_revoking_cert,
         generate_intermediate_ca,
@@ -800,5 +874,1149 @@ mod test {
             .await
             .expect_err("connection should fail: intermediate cert is revoked");
         assert!(io_error_is_cert_revoked(&err));
+    }
+
+    type TestIssuer = rcgen::CertifiedIssuer<'static, rcgen::KeyPair>;
+
+    const URI_A: &str = "spiffe://cmtc-a.mesh.example/ns/orders/sa/api";
+    const URI_B: &str = "spiffe://cmtc-b.mesh.example/ns/orders/sa/api";
+    const URI_C: &str = "spiffe://cmtc-c.mesh.example/ns/orders/sa/api";
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+    fn ca_params(name: &str) -> rcgen::CertificateParams {
+        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyUsagePurpose};
+
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.distinguished_name.push(DnType::CommonName, name);
+        params
+    }
+
+    fn issuer(name: &str) -> TestIssuer {
+        rcgen::CertifiedIssuer::self_signed(ca_params(name), rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+    }
+
+    fn issued(name: &str, parent: &TestIssuer) -> TestIssuer {
+        rcgen::CertifiedIssuer::signed_by(
+            ca_params(name),
+            rcgen::KeyPair::generate().unwrap(),
+            parent,
+        )
+        .unwrap()
+    }
+
+    fn leaf_with(
+        uris: &[&str],
+        signer: &TestIssuer,
+        serial: u64,
+        usages: &[rcgen::ExtendedKeyUsagePurpose],
+        not_before: time::OffsetDateTime,
+        not_after: time::OffsetDateTime,
+    ) -> (rcgen::KeyPair, rcgen::Certificate) {
+        use rcgen::{CertificateParams, IsCa, KeyPair, KeyUsagePurpose, SanType, SerialNumber};
+
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = IsCa::ExplicitNoCa;
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = usages.to_vec();
+        params.serial_number = Some(SerialNumber::from(serial));
+        params.not_before = not_before;
+        params.not_after = not_after;
+        params.subject_alt_names = uris
+            .iter()
+            .map(|uri| SanType::URI(rcgen::string::Ia5String::try_from(uri.to_string()).unwrap()))
+            .collect();
+        let cert = params.signed_by(&key, &**signer).unwrap();
+        (key, cert)
+    }
+
+    fn leaf(
+        uris: &[&str],
+        signer: &TestIssuer,
+        serial: u64,
+        usages: &[rcgen::ExtendedKeyUsagePurpose],
+    ) -> (rcgen::KeyPair, rcgen::Certificate) {
+        let now = time::OffsetDateTime::now_utc();
+        leaf_with(
+            uris,
+            signer,
+            serial,
+            usages,
+            now - time::Duration::days(1),
+            now + time::Duration::days(30),
+        )
+    }
+
+    fn workload(
+        key: &rcgen::KeyPair,
+        cert: &rcgen::Certificate,
+        unused_root: &TestIssuer,
+    ) -> WorkloadCertificate {
+        let root_pem = unused_root.pem();
+        WorkloadCertificate::new(
+            key.serialize_pem().as_bytes(),
+            cert.pem().as_bytes(),
+            vec![root_pem.as_bytes()],
+        )
+        .unwrap()
+    }
+
+    fn publication_of(
+        root: &TestIssuer,
+        a: &TestIssuer,
+        b: &TestIssuer,
+    ) -> Arc<crate::tls::domain_anchors::AnchorPublication> {
+        use crate::tls::domain_anchors::{
+            AnchorPublication, DomainAnchorSet, pin_from_certificate,
+        };
+
+        let set = DomainAnchorSet::try_new(
+            "cmtc-a.mesh.example".into(),
+            root.der().clone(),
+            1,
+            vec![
+                pin_from_certificate("cmtc-a.mesh.example".into(), a.der().clone()).unwrap(),
+                pin_from_certificate("cmtc-b.mesh.example".into(), b.der().clone()).unwrap(),
+            ],
+        )
+        .unwrap();
+        Arc::new(AnchorPublication::initial(set))
+    }
+
+    fn error_text(error: &std::io::Error) -> String {
+        let mut text = format!("{error} {error:?}");
+        let mut source = std::error::Error::source(error);
+        while let Some(item) = source {
+            text.push_str(&format!(" {item} {item:?}"));
+            source = std::error::Error::source(item);
+        }
+        text
+    }
+
+    fn anchor_error(error: &std::io::Error) -> &AnchorError {
+        let tls = error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<rustls::Error>())
+            .expect("I/O error must retain the actual rustls verifier error");
+        let rustls::Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(
+            cause,
+        ))) = tls
+        else {
+            panic!("expected a typed issuer/identity verifier error, got {tls:?}");
+        };
+        cause
+            .downcast_ref::<AnchorError>()
+            .expect("typed anchor error")
+    }
+
+    fn server_name() -> rustls::pki_types::ServerName<'static> {
+        rustls::pki_types::ServerName::IpAddress(std::net::Ipv4Addr::new(0, 0, 0, 0).into())
+    }
+
+    fn no_client_auth_config(
+        publication: Arc<crate::tls::domain_anchors::AnchorPublication>,
+        expected_server: Identity,
+    ) -> rustls::ClientConfig {
+        let verifier =
+            crate::tls::PinnedIdentityVerifier::new(publication, vec![expected_server], None);
+        let mut config = rustls::ClientConfig::builder_with_provider(crate::tls::lib::provider())
+            .with_protocol_versions(crate::tls::tls_versions())
+            .expect("client config protocol versions must be valid")
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        config.alpn_protocols = vec![b"h2".into()];
+        config
+    }
+
+    async fn exchange(
+        server: WorkloadCertificate,
+        client: WorkloadCertificate,
+        publication: Arc<crate::tls::domain_anchors::AnchorPublication>,
+        expected_server: Identity,
+        server_crl: Option<Arc<crate::tls::crl::CrlManager>>,
+        client_crl: Option<Arc<crate::tls::crl::CrlManager>>,
+    ) -> (Identity, Identity) {
+        helpers::initialize_telemetry();
+        let server_config = server
+            .pinned_server_config(publication.clone(), server_crl)
+            .unwrap();
+        let client_config = client
+            .pinned_client_config(vec![expected_server], publication, client_crl)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server_task = async move {
+            let (stream, _) = listener.accept().await?;
+            let mut tls = acceptor.accept(stream).await?;
+            let (_, state) = tls.get_ref();
+            let client_identity =
+                crate::tls::identity(&crate::tls::certificate_from_connection(state))
+                    .ok_or_else(|| std::io::Error::other("missing client identity"))?;
+            let mut request = [0; 2];
+            tls.read_exact(&mut request).await?;
+            if &request != b"hi" {
+                return Err(std::io::Error::other("client payload mismatch"));
+            }
+            tls.write_all(b"serv").await?;
+            Ok::<Identity, std::io::Error>(client_identity)
+        };
+
+        let client_task = async move {
+            let stream = TcpStream::connect(address).await?;
+            let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client_config))
+                .connect(server_name(), stream)
+                .await?;
+            tls.write_all(b"hi").await?;
+            let mut response = [0; 4];
+            tls.read_exact(&mut response).await?;
+            if &response != b"serv" {
+                return Err(std::io::Error::other("server payload mismatch"));
+            }
+            let (_, state) = tls.get_ref();
+            crate::tls::identity(&crate::tls::certificate_from_connection(state))
+                .ok_or_else(|| std::io::Error::other("missing server identity"))
+        };
+
+        let (server_result, client_result) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            tokio::join!(server_task, client_task)
+        })
+        .await
+        .expect("both TLS handshake tasks must finish");
+        let client_identity = client_result.unwrap();
+        let server_identity = server_result.unwrap();
+        (server_identity, client_identity)
+    }
+
+    async fn client_rejection(
+        server: WorkloadCertificate,
+        client: WorkloadCertificate,
+        publication: Arc<crate::tls::domain_anchors::AnchorPublication>,
+        expected_server: Identity,
+        server_crl: Option<Arc<crate::tls::crl::CrlManager>>,
+        client_crl: Option<Arc<crate::tls::crl::CrlManager>>,
+    ) -> std::io::Error {
+        helpers::initialize_telemetry();
+        let server_config = server
+            .pinned_server_config(publication.clone(), server_crl)
+            .unwrap();
+        let client_config = client
+            .pinned_client_config(vec![expected_server], publication, client_crl)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server_task = async move {
+            let (stream, _) = listener.accept().await?;
+            match acceptor.accept(stream).await {
+                Ok(mut tls) => {
+                    let mut request = [0; 2];
+                    let _ = tls.read_exact(&mut request).await;
+                    let _ = tls.write_all(b"serv").await;
+                    Ok::<(), std::io::Error>(())
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let client_task = async move {
+            let stream = TcpStream::connect(address).await?;
+            let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client_config))
+                .connect(server_name(), stream)
+                .await?;
+            tls.write_all(b"hi").await?;
+            let mut response = [0; 4];
+            tls.read_exact(&mut response).await?;
+            Ok::<(), std::io::Error>(())
+        };
+
+        let (server_result, client_result) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            tokio::join!(server_task, client_task)
+        })
+        .await
+        .expect("both TLS handshake tasks must finish");
+        let _server_result = server_result;
+        client_result.expect_err("the outbound verifier must reject this peer")
+    }
+
+    async fn server_rejection(
+        server: WorkloadCertificate,
+        client_config: rustls::ClientConfig,
+        publication: Arc<crate::tls::domain_anchors::AnchorPublication>,
+        server_crl: Option<Arc<crate::tls::crl::CrlManager>>,
+    ) -> std::io::Error {
+        helpers::initialize_telemetry();
+        let server_config = server
+            .pinned_server_config(publication, server_crl)
+            .unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server_task = async move {
+            let (stream, _) = listener.accept().await?;
+            let mut tls = acceptor.accept(stream).await?;
+            let mut request = [0; 2];
+            tls.read_exact(&mut request).await?;
+            if &request != b"hi" {
+                return Err(std::io::Error::other("client payload mismatch"));
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        let client_task = async move {
+            let stream = TcpStream::connect(address).await?;
+            let mut tls = tokio_rustls::TlsConnector::from(Arc::new(client_config))
+                .connect(server_name(), stream)
+                .await?;
+            tls.write_all(b"hi").await?;
+            Ok::<(), std::io::Error>(())
+        };
+
+        let (server_result, client_result) = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+            tokio::join!(server_task, client_task)
+        })
+        .await
+        .expect("both TLS handshake tasks must finish");
+        let _client_result = client_result;
+        server_result.expect_err("the inbound verifier must reject this peer")
+    }
+
+    fn crl_pem(issuer: &TestIssuer, serials: &[u64]) -> String {
+        crl_pem_number(issuer, serials, 1)
+    }
+
+    fn crl_pem_number(issuer: &TestIssuer, serials: &[u64], number: u64) -> String {
+        use rcgen::{
+            CertificateRevocationListParams, KeyIdMethod, RevocationReason, RevokedCertParams,
+            SerialNumber,
+        };
+
+        let now = time::OffsetDateTime::now_utc();
+        CertificateRevocationListParams {
+            this_update: now,
+            next_update: now + time::Duration::days(30),
+            crl_number: SerialNumber::from(number),
+            issuing_distribution_point: None,
+            revoked_certs: serials
+                .iter()
+                .map(|serial| RevokedCertParams {
+                    serial_number: SerialNumber::from(*serial),
+                    revocation_time: now,
+                    reason_code: Some(RevocationReason::KeyCompromise),
+                    invalidity_date: None,
+                })
+                .collect(),
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(issuer)
+        .unwrap()
+        .pem()
+        .unwrap()
+    }
+
+    fn write_crl(file: &mut NamedTempFile, pem: &str) {
+        use std::io::{Seek, SeekFrom};
+
+        file.as_file_mut().set_len(0).unwrap();
+        file.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+        file.write_all(pem.as_bytes()).unwrap();
+        file.flush().unwrap();
+    }
+
+    fn crl_manager(file: &NamedTempFile) -> Arc<crate::tls::crl::CrlManager> {
+        Arc::new(
+            crate::tls::crl::CrlManager::new(
+                file.path().to_path_buf(),
+                helpers::test_proxy_metrics(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_accepts_remote_domain_and_both_application_directions() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ClientAuth, ServerAuth]);
+        let (server_key, server_cert) = leaf(&[URI_B], &b, 22, &[ClientAuth, ServerAuth]);
+
+        let (client_identity, server_identity) = exchange(
+            workload(&server_key, &server_cert, &b),
+            workload(&client_key, &client_cert, &a),
+            publication,
+            Identity::from_str(URI_B).unwrap(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(client_identity, Identity::from_str(URI_A).unwrap());
+        assert_eq!(server_identity, Identity::from_str(URI_B).unwrap());
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_rejects_same_root_wrong_server_issuer() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ClientAuth, ServerAuth]);
+        let (server_key, server_cert) = leaf(&[URI_A], &b, 44, &[ClientAuth, ServerAuth]);
+
+        let err = client_rejection(
+            workload(&server_key, &server_cert, &b),
+            workload(&client_key, &client_cert, &a),
+            publication,
+            Identity::from_str(URI_A).unwrap(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            anchor_error(&err),
+            &AnchorError::AmbiguousIssuer("cmtc-a.mesh.example".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_inbound_rejects_same_root_wrong_client_issuer() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &b, 11, &[ClientAuth, ServerAuth]);
+        let (server_key, server_cert) = leaf(&[URI_B], &b, 22, &[ClientAuth, ServerAuth]);
+        let client = workload(&client_key, &client_cert, &b);
+        let client_config = client
+            .pinned_client_config(
+                vec![Identity::from_str(URI_B).unwrap()],
+                publication.clone(),
+                None,
+            )
+            .unwrap();
+
+        let err = server_rejection(
+            workload(&server_key, &server_cert, &b),
+            client_config,
+            publication,
+            None,
+        )
+        .await;
+        assert_eq!(
+            anchor_error(&err),
+            &AnchorError::AmbiguousIssuer("cmtc-a.mesh.example".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_inbound_rejects_client_without_certificate() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (server_key, server_cert) = leaf(&[URI_B], &b, 22, &[ClientAuth, ServerAuth]);
+
+        let err = server_rejection(
+            workload(&server_key, &server_cert, &b),
+            no_client_auth_config(publication.clone(), Identity::from_str(URI_B).unwrap()),
+            publication,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            err.get_ref()
+                .and_then(|cause| cause.downcast_ref::<rustls::Error>()),
+            Some(rustls::Error::NoCertificatesPresented)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_rejects_malformed_server_san() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ClientAuth, ServerAuth]);
+        let (server_key, server_cert) = leaf(
+            &["spiffe://cmtc-b.mesh.example/not-an-identity"],
+            &b,
+            22,
+            &[ClientAuth, ServerAuth],
+        );
+
+        let err = client_rejection(
+            workload(&server_key, &server_cert, &b),
+            workload(&client_key, &client_cert, &a),
+            publication,
+            Identity::from_str(URI_B).unwrap(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(anchor_error(&err), &AnchorError::MalformedIdentity);
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_rejects_duplicate_server_san() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ClientAuth, ServerAuth]);
+        let (server_key, server_cert) = leaf(&[URI_B, URI_A], &b, 22, &[ClientAuth, ServerAuth]);
+
+        let err = client_rejection(
+            workload(&server_key, &server_cert, &b),
+            workload(&client_key, &client_cert, &a),
+            publication,
+            Identity::from_str(URI_B).unwrap(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(anchor_error(&err), &AnchorError::PeerIdentityCount(2));
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_rejects_unpublished_server_domain() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ClientAuth, ServerAuth]);
+        let (server_key, server_cert) = leaf(&[URI_C], &b, 22, &[ClientAuth, ServerAuth]);
+
+        let err = client_rejection(
+            workload(&server_key, &server_cert, &b),
+            workload(&client_key, &client_cert, &a),
+            publication,
+            Identity::from_str(URI_C).unwrap(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            anchor_error(&err),
+            &AnchorError::UntrustedTrustDomain("cmtc-c.mesh.example".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_empty_expected_identity_rejects_every_server() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ClientAuth, ServerAuth]);
+        let (server_key, server_cert) = leaf(&[URI_B], &b, 22, &[ClientAuth, ServerAuth]);
+        let server = workload(&server_key, &server_cert, &b);
+        let client = workload(&client_key, &client_cert, &a);
+        let server_config = Arc::new(
+            server
+                .pinned_server_config(publication.clone(), None)
+                .unwrap(),
+        );
+        let client_config = Arc::new(
+            client
+                .pinned_client_config(Vec::new(), publication, None)
+                .unwrap(),
+        );
+        let (_server_result, client_result) =
+            exchange_pinned_configs(server_config, client_config).await;
+        let err =
+            client_result.expect_err("missing expected identity cannot mean any trusted server");
+        assert_eq!(
+            anchor_error(&err),
+            &AnchorError::UnexpectedPeer {
+                authenticated: URI_B.into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_rejects_wrong_expected_server_identity() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ClientAuth, ServerAuth]);
+        let (server_key, server_cert) = leaf(&[URI_B], &b, 22, &[ClientAuth, ServerAuth]);
+
+        let err = client_rejection(
+            workload(&server_key, &server_cert, &b),
+            workload(&client_key, &client_cert, &a),
+            publication,
+            Identity::from_str(URI_A).unwrap(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            anchor_error(&err),
+            &AnchorError::UnexpectedPeer {
+                authenticated: URI_B.into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_rejects_expired_issuer_pin() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let now = time::OffsetDateTime::now_utc();
+        let mut params = ca_params("issuer-b-expired");
+        params.not_before = now - time::Duration::hours(2);
+        params.not_after = now - time::Duration::minutes(1);
+        let b =
+            rcgen::CertifiedIssuer::signed_by(params, rcgen::KeyPair::generate().unwrap(), &root)
+                .unwrap();
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ClientAuth, ServerAuth]);
+        let (server_key, server_cert) = leaf(&[URI_B], &b, 22, &[ClientAuth, ServerAuth]);
+
+        let err = client_rejection(
+            workload(&server_key, &server_cert, &b),
+            workload(&client_key, &client_cert, &a),
+            publication,
+            Identity::from_str(URI_B).unwrap(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            anchor_error(&err),
+            &AnchorError::UntrustedTrustDomain("cmtc-b.mesh.example".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_rejects_expired_leaf() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ClientAuth, ServerAuth]);
+        let now = time::OffsetDateTime::now_utc();
+        let (server_key, server_cert) = leaf_with(
+            &[URI_B],
+            &b,
+            22,
+            &[ClientAuth, ServerAuth],
+            now - time::Duration::hours(2),
+            now - time::Duration::minutes(1),
+        );
+
+        let err = client_rejection(
+            workload(&server_key, &server_cert, &b),
+            workload(&client_key, &client_cert, &a),
+            publication,
+            Identity::from_str(URI_B).unwrap(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            anchor_error(&err),
+            &AnchorError::UnauthorizedIssuer("cmtc-b.mesh.example".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_rejects_server_with_client_only_eku() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ClientAuth, ServerAuth]);
+        let (server_key, server_cert) = leaf(&[URI_B], &b, 22, &[ClientAuth]);
+
+        let err = client_rejection(
+            workload(&server_key, &server_cert, &b),
+            workload(&client_key, &client_cert, &a),
+            publication,
+            Identity::from_str(URI_B).unwrap(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            anchor_error(&err),
+            &AnchorError::UnauthorizedIssuer("cmtc-b.mesh.example".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_inbound_rejects_client_with_server_only_eku() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ServerAuth]);
+        let (server_key, server_cert) = leaf(&[URI_B], &b, 22, &[ClientAuth, ServerAuth]);
+        let client = workload(&client_key, &client_cert, &a);
+        let client_config = client
+            .pinned_client_config(
+                vec![Identity::from_str(URI_B).unwrap()],
+                publication.clone(),
+                None,
+            )
+            .unwrap();
+
+        let err = server_rejection(
+            workload(&server_key, &server_cert, &b),
+            client_config,
+            publication,
+            None,
+        )
+        .await;
+        assert_eq!(
+            anchor_error(&err),
+            &AnchorError::UnauthorizedIssuer("cmtc-a.mesh.example".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_new_config_rejects_withdrawn_pin() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ClientAuth, ServerAuth]);
+        let (server_key, server_cert) = leaf(&[URI_B], &b, 22, &[ClientAuth, ServerAuth]);
+
+        exchange(
+            workload(&server_key, &server_cert, &b),
+            workload(&client_key, &client_cert, &a),
+            publication.clone(),
+            Identity::from_str(URI_B).unwrap(),
+            None,
+            None,
+        )
+        .await;
+
+        let domain_b: crate::strng::Strng = "cmtc-b.mesh.example".into();
+        let spki = publication.anchors().pin_spkis(&domain_b).pop().unwrap();
+        let withdrawn = publication.withdraw_pin(&domain_b, &spki, 2).unwrap();
+        assert!(withdrawn.bundle_fenced(&spki));
+
+        let err = client_rejection(
+            workload(&server_key, &server_cert, &b),
+            workload(&client_key, &client_cert, &a),
+            Arc::new(withdrawn),
+            Identity::from_str(URI_B).unwrap(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            anchor_error(&err),
+            &AnchorError::UntrustedTrustDomain("cmtc-b.mesh.example".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_outbound_crl_rejects_then_recovers() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ClientAuth, ServerAuth]);
+        let (server_key, server_cert) = leaf(&[URI_B], &b, 22, &[ClientAuth, ServerAuth]);
+        let server = workload(&server_key, &server_cert, &b);
+        let client = workload(&client_key, &client_cert, &a);
+
+        let mut crl_file = NamedTempFile::new().unwrap();
+        write_crl(&mut crl_file, &crl_pem(&b, &[22]));
+        let crl = crl_manager(&crl_file);
+        let err = client_rejection(
+            server,
+            workload(&client_key, &client_cert, &a),
+            publication.clone(),
+            Identity::from_str(URI_B).unwrap(),
+            None,
+            Some(crl.clone()),
+        )
+        .await;
+        assert!(io_error_is_cert_revoked(&err), "{:?}", error_text(&err));
+
+        write_crl(&mut crl_file, "");
+        crl.load_crl().unwrap();
+        let (seen_client, seen_server) = exchange(
+            workload(&server_key, &server_cert, &b),
+            client,
+            publication,
+            Identity::from_str(URI_B).unwrap(),
+            None,
+            Some(crl),
+        )
+        .await;
+        assert_eq!(seen_client, Identity::from_str(URI_A).unwrap());
+        assert_eq!(seen_server, Identity::from_str(URI_B).unwrap());
+    }
+
+    #[tokio::test]
+    async fn pinned_loopback_inbound_crl_rejects_then_recovers() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let root = issuer("organization-root");
+        let a = issued("issuer-a", &root);
+        let b = issued("issuer-b", &root);
+        let publication = publication_of(&root, &a, &b);
+        let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ClientAuth, ServerAuth]);
+        let (server_key, server_cert) = leaf(&[URI_B], &b, 22, &[ClientAuth, ServerAuth]);
+        let server = workload(&server_key, &server_cert, &b);
+        let client = workload(&client_key, &client_cert, &a);
+        let client_config = client
+            .pinned_client_config(
+                vec![Identity::from_str(URI_B).unwrap()],
+                publication.clone(),
+                None,
+            )
+            .unwrap();
+
+        let mut crl_file = NamedTempFile::new().unwrap();
+        write_crl(&mut crl_file, &crl_pem(&a, &[11]));
+        let crl = crl_manager(&crl_file);
+        let err = server_rejection(
+            server,
+            client_config,
+            publication.clone(),
+            Some(crl.clone()),
+        )
+        .await;
+        assert!(io_error_is_cert_revoked(&err), "{:?}", error_text(&err));
+
+        write_crl(&mut crl_file, "");
+        crl.load_crl().unwrap();
+        let (seen_client, seen_server) = exchange(
+            workload(&server_key, &server_cert, &b),
+            client,
+            publication,
+            Identity::from_str(URI_B).unwrap(),
+            Some(crl),
+            None,
+        )
+        .await;
+        assert_eq!(seen_client, Identity::from_str(URI_A).unwrap());
+        assert_eq!(seen_server, Identity::from_str(URI_B).unwrap());
+    }
+
+    // Reuse the exact configs across connections: rebuilding would conceal a
+    // verifier that froze CRLs or a server that resumed cached client identity.
+    // Directly joined futures are cancelled on timeout (no detached tasks).
+    async fn exchange_pinned_configs(
+        server_config: Arc<rustls::ServerConfig>,
+        client_config: Arc<rustls::ClientConfig>,
+    ) -> (
+        Result<rustls::HandshakeKind, std::io::Error>,
+        Result<rustls::HandshakeKind, std::io::Error>,
+    ) {
+        exchange_pinned_configs_at_version(server_config, client_config, None).await
+    }
+
+    async fn exchange_pinned_configs_at_version(
+        server_config: Arc<rustls::ServerConfig>,
+        client_config: Arc<rustls::ClientConfig>,
+        expected_version: Option<rustls::ProtocolVersion>,
+    ) -> (
+        Result<rustls::HandshakeKind, std::io::Error>,
+        Result<rustls::HandshakeKind, std::io::Error>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = async move {
+            let (stream, _) = listener.accept().await?;
+            let mut tls = TlsAcceptor::from(server_config).accept(stream).await?;
+            if let Some(expected) = expected_version {
+                assert_eq!(
+                    tls.get_ref().1.protocol_version(),
+                    Some(expected),
+                    "server negotiated wrong TLS version"
+                );
+                eprintln!(
+                    "pinned config-reuse server negotiated {:?}",
+                    tls.get_ref().1.protocol_version()
+                );
+            }
+            let kind = tls
+                .get_ref()
+                .1
+                .handshake_kind()
+                .expect("completed handshake kind");
+            let mut request = [0; 2];
+            tls.read_exact(&mut request).await?;
+            if &request != b"hi" {
+                return Err(std::io::Error::other("client payload mismatch"));
+            }
+            // Pending post-handshake tickets, if any, are processed before the
+            // client can finish this read. That client then reuses the same cache.
+            tls.write_all(b"serv").await?;
+            tls.shutdown().await?;
+            Ok(kind)
+        };
+        let client = async move {
+            let stream = TcpStream::connect(address).await?;
+            let mut tls = tokio_rustls::TlsConnector::from(client_config)
+                .connect(server_name(), stream)
+                .await?;
+            if let Some(expected) = expected_version {
+                assert_eq!(
+                    tls.get_ref().1.protocol_version(),
+                    Some(expected),
+                    "client negotiated wrong TLS version"
+                );
+                eprintln!(
+                    "pinned config-reuse client negotiated {:?}",
+                    tls.get_ref().1.protocol_version()
+                );
+            }
+            tls.write_all(b"hi").await?;
+            let mut response = [0; 4];
+            tls.read_exact(&mut response).await?;
+            if &response != b"serv" {
+                return Err(std::io::Error::other("server payload mismatch"));
+            }
+            Ok(tls
+                .get_ref()
+                .1
+                .handshake_kind()
+                .expect("completed handshake kind"))
+        };
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, async { tokio::join!(server, client) })
+            .await
+            .expect("both config-reuse handshake futures must finish")
+    }
+
+    fn assert_full_exchange(
+        result: (
+            Result<rustls::HandshakeKind, std::io::Error>,
+            Result<rustls::HandshakeKind, std::io::Error>,
+        ),
+    ) {
+        for side in [result.0, result.1] {
+            assert!(
+                matches!(
+                    side.unwrap(),
+                    rustls::HandshakeKind::Full | rustls::HandshakeKind::FullWithHelloRetryRequest
+                ),
+                "pinned mTLS must perform current certificate verification on every connection"
+            );
+        }
+    }
+
+    // Independent TLS1.2-only peers force negotiation without altering the
+    // pinned constructor under test or mutating a process-global environment.
+    // Run this profile in a separate TLS12_ENABLED=true process so the selected
+    // provider exposes the repository-approved TLS1.2 cipher suites.
+    fn independent_tls12_client(
+        client: &WorkloadCertificate,
+        publication: Arc<crate::tls::domain_anchors::AnchorPublication>,
+    ) -> rustls::ClientConfig {
+        let verifier = crate::tls::PinnedIdentityVerifier::new(
+            publication,
+            vec![Identity::from_str(URI_B).unwrap()],
+            None,
+        );
+        let mut config = rustls::ClientConfig::builder_with_provider(crate::tls::lib::provider())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .expect("TLS12_ENABLED=true must expose TLS1.2 provider suites")
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_auth_cert(
+                client.cert_and_intermediates_der(),
+                client.private_key.clone_key(),
+            )
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".into()];
+        config.enable_sni = false;
+        // Independent client permits both stateful and RFC5077 ticket reuse.
+        config.resumption = rustls::client::Resumption::in_memory_sessions(128);
+        config
+    }
+
+    fn independent_tls12_server(
+        server: &WorkloadCertificate,
+        publication: Arc<crate::tls::domain_anchors::AnchorPublication>,
+    ) -> rustls::ServerConfig {
+        let mut config = rustls::ServerConfig::builder_with_provider(crate::tls::lib::provider())
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .expect("TLS12_ENABLED=true must expose TLS1.2 provider suites")
+            .with_client_cert_verifier(crate::tls::PinnedTrustDomainVerifier::new(
+                publication,
+                None,
+            ))
+            .with_single_cert(
+                server.cert_and_intermediates_der(),
+                server.private_key.clone_key(),
+            )
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".into()];
+        config
+    }
+
+    #[tokio::test]
+    async fn pinned_configs_recheck_live_crls_with_signed_empty_and_optional_blank_recovery() {
+        use rcgen::ExtendedKeyUsagePurpose::{ClientAuth, ServerAuth};
+
+        let force_tls12 = *crate::TLS12_ENABLED;
+        let expected_version = Some(if force_tls12 {
+            rustls::ProtocolVersion::TLSv1_2
+        } else {
+            rustls::ProtocolVersion::TLSv1_3
+        });
+        for inbound in [true, false] {
+            let root = issuer("organization-root");
+            let a = issued("issuer-a", &root);
+            let b = issued("issuer-b", &root);
+            let publication = publication_of(&root, &a, &b);
+            let (client_key, client_cert) = leaf(&[URI_A], &a, 11, &[ClientAuth, ServerAuth]);
+            let (server_key, server_cert) = leaf(&[URI_B], &b, 22, &[ClientAuth, ServerAuth]);
+            let server = workload(&server_key, &server_cert, &b);
+            let client = workload(&client_key, &client_cert, &a);
+            let mut file = NamedTempFile::new().unwrap();
+            write_crl(&mut file, "");
+            let manager = crl_manager(&file);
+            let server_config = server
+                .pinned_server_config(publication.clone(), inbound.then(|| manager.clone()))
+                .unwrap();
+            assert!(!server_config.session_storage.can_cache());
+            assert!(!server_config.ticketer.enabled());
+            assert_eq!(server_config.ticketer.lifetime(), 0);
+            assert!(server_config.ticketer.encrypt(b"test").is_none());
+            assert!(
+                server_config
+                    .ticketer
+                    .decrypt(b"attacker-controlled")
+                    .is_none()
+            );
+            assert_eq!(server_config.send_tls13_tickets, 0);
+            assert_eq!(server_config.max_tls13_tickets, 0);
+            assert_eq!(server_config.max_early_data_size, 0);
+            let client_config = client
+                .pinned_client_config(
+                    vec![Identity::from_str(URI_B).unwrap()],
+                    publication.clone(),
+                    (!inbound).then(|| manager.clone()),
+                )
+                .unwrap();
+            // The constructor UNDER TEST stays untouched: for inbound use
+            // actual pinned_server_config plus a TLS1.2-only independent client;
+            // for outbound use actual pinned_client_config plus a TLS1.2-only
+            // independent server. Enabling TLS1.2 alone does not force it.
+            let server_config = if force_tls12 && !inbound {
+                independent_tls12_server(&server, publication.clone())
+            } else {
+                server_config
+            };
+            let mut client_config = if force_tls12 && inbound {
+                independent_tls12_client(&client, publication)
+            } else {
+                client_config
+            };
+            if inbound {
+                // An independent client can enable resumption. Server security
+                // cannot depend on our outbound constructor disabling it.
+                client_config.resumption = rustls::client::Resumption::in_memory_sessions(128);
+            }
+            let server_config = Arc::new(server_config);
+            let client_config = Arc::new(client_config);
+            assert_full_exchange(
+                exchange_pinned_configs_at_version(
+                    server_config.clone(),
+                    client_config.clone(),
+                    expected_version,
+                )
+                .await,
+            );
+            assert_full_exchange(
+                exchange_pinned_configs_at_version(
+                    server_config.clone(),
+                    client_config.clone(),
+                    expected_version,
+                )
+                .await,
+            );
+
+            let revoking = if inbound {
+                crl_pem(&a, &[11])
+            } else {
+                crl_pem(&b, &[22])
+            };
+            write_crl(&mut file, &revoking);
+            manager.load_crl().unwrap();
+            let (server_result, client_result) = exchange_pinned_configs_at_version(
+                server_config.clone(),
+                client_config.clone(),
+                expected_version,
+            )
+            .await;
+            let error = if inbound {
+                server_result.expect_err("current inbound verifier must reject revoked client")
+            } else {
+                client_result.expect_err("current outbound verifier must reject revoked server")
+            };
+            assert!(io_error_is_cert_revoked(&error), "{:?}", error_text(&error));
+
+            // Cryptographically valid, issuer-signed empty CRL with a newer
+            // number, using the SAME verifier/config/manager in both directions.
+            let empty_signed = crl_pem_number(if inbound { &a } else { &b }, &[], 2);
+            write_crl(&mut file, &empty_signed);
+            manager.load_crl().unwrap();
+            assert_eq!(manager.get_crls().len(), 1);
+            assert_full_exchange(
+                exchange_pinned_configs_at_version(
+                    server_config.clone(),
+                    client_config.clone(),
+                    expected_version,
+                )
+                .await,
+            );
+
+            // Separate optional-CRL blank-file semantics; this is not signed
+            // empty-CRL recovery and is not evidence of authenticated CRL feed.
+            write_crl(&mut file, "");
+            manager.load_crl().unwrap();
+            assert!(manager.get_crls().is_empty());
+            assert_full_exchange(
+                exchange_pinned_configs_at_version(server_config, client_config, expected_version)
+                    .await,
+            );
+        }
     }
 }

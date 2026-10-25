@@ -31,11 +31,13 @@ use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncWrite};
 use webpki::{CertRevocationList, KeyUsage};
 
 use crate::strng::Strng;
 use crate::tls;
+use crate::tls::domain_anchors::{AnchorError, AnchorPublication, PeerRole, verify_peer_evidence};
 use tokio::net::TcpStream;
 use tokio_rustls::client;
 use tracing::{debug, trace};
@@ -320,6 +322,247 @@ impl ServerCertVerifier for IdentityVerifier {
     }
 
     // Rest use the default implementations
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn anchor_to_rustls(error: AnchorError) -> rustls::Error {
+    rustls::Error::InvalidCertificate(rustls::CertificateError::Other(OtherError(Arc::new(error))))
+}
+
+fn system_time(now: UnixTime) -> Result<SystemTime, AnchorError> {
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(now.as_secs()))
+        .ok_or(AnchorError::BadEncoding)
+}
+
+fn pinned_chain(
+    publication: &AnchorPublication,
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+    now: UnixTime,
+    role: PeerRole,
+    expected: Option<&[Identity]>,
+    crl_manager: Option<&crate::tls::crl::CrlManager>,
+) -> Result<(), rustls::Error> {
+    let peer = verify_peer_evidence(end_entity, intermediates, publication.anchors(), now, role)
+        .map_err(anchor_to_rustls)?;
+
+    if expected.is_some_and(|identities| !identities.contains(peer.identity())) {
+        return Err(anchor_to_rustls(AnchorError::UnexpectedPeer {
+            authenticated: peer.identity().to_string(),
+        }));
+    }
+
+    // Resolve against the exact authenticated SAN domain and verification time.
+    // Never use the organizational root or the local SPIRE root store as fallback.
+    let signer = publication
+        .current_unfenced_signer(
+            &peer.identity().trust_domain(),
+            peer.signer_spki(),
+            system_time(now).map_err(anchor_to_rustls)?,
+        )
+        .ok_or_else(|| {
+            anchor_to_rustls(AnchorError::WithdrawnIssuer {
+                domain: peer.identity().trust_domain().to_string(),
+            })
+        })?;
+    let mut roots = RootCertStore::empty();
+    roots
+        .add(signer)
+        .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer))?;
+
+    let usage = match role {
+        PeerRole::Client => KeyUsage::client_auth(),
+        PeerRole::Server => KeyUsage::server_auth(),
+    };
+    let loaded = crl_manager.map(crate::tls::crl::CrlManager::get_crls);
+    let crls = loaded.as_deref().map(Vec::as_slice).unwrap_or(&[]);
+    crate::tls::revocation::verify_cert_chain(end_entity, intermediates, &roots, now, usage, crls)
+        .map_err(webpki_error_to_rustls)?;
+    Ok(())
+}
+
+fn hint_subjects(publication: &AnchorPublication) -> Vec<DistinguishedName> {
+    let mut roots = RootCertStore::empty();
+    for der in publication.current_signer_ders(SystemTime::now()) {
+        if roots.add(der).is_err() {
+            continue;
+        }
+    }
+    roots.subjects()
+}
+
+/// Outbound verifier. The publication is mandatory; the local workload root
+/// store is deliberately not a fallback.
+#[derive(Debug)]
+pub struct PinnedIdentityVerifier {
+    publication: Arc<AnchorPublication>,
+    expected: Vec<Identity>,
+    crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
+}
+
+impl PinnedIdentityVerifier {
+    pub fn new(
+        publication: Arc<AnchorPublication>,
+        expected: Vec<Identity>,
+        crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            publication,
+            expected,
+            crl_manager,
+        })
+    }
+}
+
+impl ServerCertVerifier for PinnedIdentityVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        pinned_chain(
+            &self.publication,
+            end_entity,
+            intermediates,
+            now,
+            PeerRole::Server,
+            Some(&self.expected),
+            self.crl_manager.as_deref(),
+        )?;
+        if !ocsp_response.is_empty() {
+            trace!(
+                ocsp_response_bytes = ocsp_response.len(),
+                "OCSP response is not validated by the pinned verifier"
+            );
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Inbound verifier. It always requires a client certificate; every presented
+/// workload must match a current, unfenced domain pin.
+#[derive(Debug)]
+pub struct PinnedTrustDomainVerifier {
+    publication: Arc<AnchorPublication>,
+    crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
+    root_hints: Vec<DistinguishedName>,
+}
+
+impl PinnedTrustDomainVerifier {
+    pub fn new(
+        publication: Arc<AnchorPublication>,
+        crl_manager: Option<Arc<crate::tls::crl::CrlManager>>,
+    ) -> Arc<Self> {
+        let root_hints = hint_subjects(&publication);
+        Arc::new(Self {
+            publication,
+            crl_manager,
+            root_hints,
+        })
+    }
+}
+
+impl ClientCertVerifier for PinnedTrustDomainVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &self.root_hints
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        pinned_chain(
+            &self.publication,
+            end_entity,
+            intermediates,
+            now,
+            PeerRole::Client,
+            None,
+            self.crl_manager.as_deref(),
+        )?;
+        Ok(ClientCertVerified::assertion())
+    }
 
     fn verify_tls12_signature(
         &self,

@@ -102,6 +102,9 @@ impl VerifiedPeer {
     pub fn deadline(&self) -> SystemTime {
         self.valid_until
     }
+    pub fn signer_spki(&self) -> &[u8] {
+        &self.signer_spki
+    }
     pub fn retained_tunnel(&self) -> RetainedTunnel {
         RetainedTunnel(self.clone())
     }
@@ -602,6 +605,38 @@ impl AnchorPublication {
     pub fn bundle_fenced(&self, spki: &[u8]) -> bool {
         self.bundle_fenced.contains(spki)
     }
+
+    /// Returns the exact current issuer certificate only for the authenticated
+    /// trust domain and only when it has not been withdrawn or fenced.
+    pub fn current_unfenced_signer(
+        &self,
+        domain: &Strng,
+        spki: &[u8],
+        now: SystemTime,
+    ) -> Option<CertificateDer<'static>> {
+        if self.bundle_fenced.contains(spki) {
+            return None;
+        }
+        self.set
+            .current_pins(domain, now)
+            .ok()?
+            .iter()
+            .find(|pin| pin.spki_der == spki && pin.current(now))
+            .map(|pin| pin.der.clone())
+    }
+
+    pub fn current_signer_ders(&self, now: SystemTime) -> Vec<CertificateDer<'static>> {
+        if now < self.set.root_not_before || now >= self.set.root_not_after {
+            return Vec::new();
+        }
+        self.set
+            .by_domain
+            .values()
+            .flatten()
+            .filter(|pin| pin.current(now) && !self.bundle_fenced.contains(&pin.spki_der))
+            .map(|pin| pin.der.clone())
+            .collect()
+    }
     fn require_newer(&self, generation: u64) -> Result<(), AnchorError> {
         if generation <= self.generation() {
             return Err(AnchorError::StaleGeneration {
@@ -886,6 +921,89 @@ mod tests {
         let set = profile(&root, &a, &b);
         (root, a, b, set)
     }
+    #[test]
+    fn signer_spki_cannot_be_assigned_to_two_trust_domains() {
+        let (root, a, _, _) = fixture();
+        let err = DomainAnchorSet::try_new(
+            A.into(),
+            root.der().clone(),
+            2,
+            vec![
+                pin_from_certificate(A.into(), a.der().clone()).unwrap(),
+                pin_from_certificate(B.into(), a.der().clone()).unwrap(),
+            ],
+        )
+        .unwrap_err();
+        assert!(matches!(err, AnchorError::InvalidPin(_)));
+    }
+
+    #[test]
+    fn current_signer_lookup_is_scoped_by_domain_time_and_withdrawal() {
+        let (_, _, _, set) = fixture();
+        let mut publication = AnchorPublication::initial(set);
+        let domain_b: Strng = B.into();
+        let domain_a: Strng = A.into();
+        let spki = publication.anchors().pin_spkis(&domain_b).pop().unwrap();
+        let now = SystemTime::now();
+
+        assert!(
+            publication
+                .current_unfenced_signer(&domain_b, &spki, now)
+                .is_some()
+        );
+        assert!(
+            publication
+                .current_unfenced_signer(&domain_a, &spki, now)
+                .is_none()
+        );
+        assert!(
+            publication
+                .current_unfenced_signer(&domain_b, &spki, UNIX_EPOCH)
+                .is_none()
+        );
+
+        publication = publication.withdraw_pin(&domain_b, &spki, 2).unwrap();
+        assert!(
+            publication
+                .current_unfenced_signer(&domain_b, &spki, now)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn signer_helpers_require_current_organizational_root() {
+        let mut params = ca_params("short-root");
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::hours(1);
+        params.not_after = now + time::Duration::hours(1);
+        let root = CertifiedIssuer::self_signed(params, KeyPair::generate().unwrap()).unwrap();
+        let a = CertifiedIssuer::signed_by(ca_params("a"), KeyPair::generate().unwrap(), &root)
+            .unwrap();
+        let pin = pin_from_certificate(A.into(), a.der().clone()).unwrap();
+        let spki = pin.spki_der.clone();
+        let set = DomainAnchorSet::try_new(A.into(), root.der().clone(), 1, vec![pin]).unwrap();
+        let before = set.root_not_before - Duration::from_secs(1);
+        let expired = set.root_not_after;
+        let publication = AnchorPublication::initial(set);
+        for time in [before, expired] {
+            assert!(
+                publication
+                    .current_unfenced_signer(&A.into(), &spki, time)
+                    .is_none()
+            );
+            assert!(publication.current_signer_ders(time).is_empty());
+        }
+        assert!(
+            publication
+                .current_unfenced_signer(&A.into(), &spki, SystemTime::now())
+                .is_some()
+        );
+        assert_eq!(
+            publication.current_signer_ders(SystemTime::now()),
+            vec![a.der().clone()]
+        );
+    }
+
     #[test]
     fn positive_roles_wrong_signer_and_expected_identity() {
         let (_, a, b, set) = fixture();
