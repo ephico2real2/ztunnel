@@ -144,6 +144,8 @@ const SPIRE_ENABLED: &str = "SPIRE_ENABLED";
 
 const SPIRE_TIMEOUT: &str = "SPIRE_TIMEOUT";
 
+const TLS_HANDSHAKE_TIMEOUT: &str = "TLS_HANDSHAKE_TIMEOUT";
+
 const SPIRE_ADMIN_SOCKET: &str = "SPIRE_ADMIN_ENDPOINT_SOCKET";
 
 const CONTAINER_RUNTIME_SOCK_PATH: &str = "CONTAINER_RUNTIME_SOCK_PATH";
@@ -370,6 +372,10 @@ pub struct Config {
     pub spire_timeout: Duration,
     pub spire_admin_socket: String,
     pub container_runtime_sock_path: String,
+
+    // Upper bound for one workload TLS handshake, including the peer binding.
+    // An unauthenticated peer cannot hold an accept/connect owner past it.
+    pub tls_handshake_timeout: Duration,
 }
 
 /// CIDR inventory used to classify destinations when `require_mesh_hbone` is enabled.
@@ -1300,11 +1306,21 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
             SPIRE_ADMIN_SOCKET,
             "unix:///run/spire/sockets/admin.sock".to_string(),
         )?,
+        tls_handshake_timeout: parse_duration_default(
+            TLS_HANDSHAKE_TIMEOUT,
+            Duration::from_secs(10),
+        )?,
     })
 }
 
 fn validate_config(cfg: Config) -> Result<Config, Error> {
     validate_mesh_egress_config(&cfg.mesh_egress, cfg.require_mesh_hbone)?;
+
+    if cfg.tls_handshake_timeout.is_zero() {
+        return Err(Error::ProxyConfig(anyhow!(
+            "{TLS_HANDSHAKE_TIMEOUT} must be greater than zero"
+        )));
+    }
 
     if cfg.dns_proxy && cfg.xds_on_demand {
         return Err(Error::ProxyConfig(anyhow!(
@@ -1568,6 +1584,18 @@ exceptions:
 
         let error = validate_config(config).expect_err("strict mode needs a full xDS snapshot");
         assert!(error.to_string().contains("complete xDS snapshot"));
+    }
+
+    #[test]
+    fn tls_handshake_timeout_defaults_and_rejects_zero() {
+        let mut config =
+            construct_config(ProxyConfig::default()).expect("default proxy config should be valid");
+        assert_eq!(config.tls_handshake_timeout, Duration::from_secs(10));
+        config.dns_proxy = false;
+        config.tls_handshake_timeout = Duration::ZERO;
+
+        let error = validate_config(config).expect_err("an unbounded handshake is refused");
+        assert!(error.to_string().contains("TLS_HANDSHAKE_TIMEOUT"));
     }
 
     #[test]

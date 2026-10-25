@@ -91,6 +91,15 @@ impl ConnSpawner {
         }
         debug!("spawning new pool conn for {}", key);
 
+        let source = self.local_workload.get_workload().await?;
+        let source_witness = crate::state::outbound_source::OutboundSource::capture(
+            &self.local_workload.state,
+            &self.cfg,
+            source,
+            key.src,
+            self.local_workload.bound_uid(),
+        )
+        .map_err(Error::AuthorizationPolicyRejection)?;
         let cert = self.local_workload.fetch_certificate().await?;
         let lease = self
             .local_workload
@@ -103,12 +112,17 @@ impl ConnSpawner {
                 _ => e.into(),
             })?;
 
+        let observer = crate::tls::handshake::HandshakeObserver::new(
+            self.metrics.clone(),
+            self.cfg.tls_handshake_timeout,
+        );
         let (tls_stream, revocation) = crate::tls::profile_provider::connect(
             cert,
             lease.clone(),
             tcp_stream,
             key.dst_id.clone(),
             self.crl_manager.clone(),
+            observer,
         )
         .await
         .inspect_err(|e| {
@@ -123,7 +137,7 @@ impl ConnSpawner {
         trace!("connector connected, handshaking");
         let mut sender = h2::client::spawn_owned_connection(
             self.cfg.clone(),
-            tls_stream,
+            crate::state::outbound_source::SourceIo::new(tls_stream, source_witness.clone())?,
             self.timeout_rx.clone(),
             key,
             revocation,
@@ -132,6 +146,7 @@ impl ConnSpawner {
         )
         .await?;
         sender.bind_profile(lease);
+        sender.bind_source(source_witness);
         Ok(sender)
     }
 }
@@ -427,6 +442,16 @@ impl WorkloadHBONEPool {
         workload_key: &WorkloadKey,
         request: http::Request<()>,
     ) -> Result<(H2Stream, Option<Baggage>), Error> {
+        self.send_request_pooled_with_source(workload_key, request, None)
+            .await
+    }
+
+    pub(crate) async fn send_request_pooled_with_source(
+        &mut self,
+        workload_key: &WorkloadKey,
+        request: http::Request<()>,
+        expected: Option<Arc<crate::state::outbound_source::OutboundSource>>,
+    ) -> Result<(H2Stream, Option<Baggage>), Error> {
         if self.state.closed.load(Ordering::Acquire) {
             return Err(Error::WorkloadHBONEPoolDraining);
         }
@@ -435,7 +460,35 @@ impl WorkloadHBONEPool {
             // legacy pool. Cached drivers have their own lease-bound I/O too.
             let _ = provider.acquire().map_err(Error::Anyhow)?;
         }
+        let source = self.state.spawner.local_workload.get_workload().await?;
+        let witness = crate::state::outbound_source::OutboundSource::capture(
+            &self.state.spawner.local_workload.state,
+            &self.state.spawner.cfg,
+            source,
+            workload_key.src,
+            self.state.spawner.local_workload.bound_uid(),
+        )
+        .map_err(Error::AuthorizationPolicyRejection)?;
+        if self.state.spawner.cfg.require_mesh_hbone
+            && !expected
+                .as_ref()
+                .zip(witness.as_ref())
+                .is_some_and(|(expected, current)| expected.same_observation(current))
+        {
+            return Err(Error::NativeOutboundSourceInvalidated);
+        }
         let mut connection = self.connect(workload_key).await?;
+        let witness = expected.or(witness);
+        if let Some(witness) = &witness {
+            witness
+                .check()
+                .map_err(|_| Error::NativeOutboundSourceInvalidated)?;
+        }
+        // Checkout already discarded withdrawn transports. A transport bound to
+        // a different observation is never used for this request.
+        if !connection.serves_source(witness.as_deref()) {
+            return Err(Error::NativeOutboundSourceInvalidated);
+        }
         connection.send_request(request).await
     }
 
@@ -654,6 +707,75 @@ mod test {
         // Once we drop the pool, we should drop the connections as well
         drop(pool);
         assert_opens_drops!(srv, 1, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pooled_reuse_records_one_actual_tls_handshake_per_connection() {
+        use crate::proxy::metrics::{Reporter, TlsHandshakeLabels, TlsHandshakeResult};
+        let (pool, mut srv) = setup_test(3).await;
+        let metrics = pool.state.spawner.metrics.clone();
+        let handshakes = |result| {
+            metrics
+                .tls_handshakes
+                .get_or_create(&TlsHandshakeLabels {
+                    reporter: Reporter::source,
+                    result,
+                })
+                .get()
+        };
+        // Read the histogram through its actual text encoding.
+        let mut exposition = Registry::default();
+        exposition.register_with_unit(
+            "tls_handshake_duration",
+            "test view",
+            prometheus_client::registry::Unit::Seconds,
+            metrics.tls_handshake_duration.clone(),
+        );
+        let observed = || {
+            let mut text = String::new();
+            prometheus_client::encoding::text::encode(&mut text, &exposition).unwrap();
+            text.lines()
+                .find_map(|line| {
+                    line.strip_prefix("tls_handshake_duration_seconds_count{reporter=\"source\"} ")
+                })
+                .unwrap_or_else(|| panic!("source duration count is not exposed:\n{text}"))
+                .parse::<u64>()
+                .unwrap()
+        };
+        let first = key(&srv, 2);
+
+        // Four HBONE requests share one pooled connection: one handshake.
+        spawn_clients_concurrently(pool.clone(), first.clone(), srv.addr, 2).await;
+        spawn_clients_concurrently(pool.clone(), first.clone(), srv.addr, 2).await;
+        assert_opens_drops!(srv, 1, 0);
+        assert_eq!(handshakes(TlsHandshakeResult::success), 1);
+        assert_eq!(observed(), 1);
+
+        // A different source key opens an actual new connection and handshake.
+        spawn_clients_concurrently(pool.clone(), key(&srv, 3), srv.addr, 1).await;
+        assert_opens_drops!(srv, 2, 0);
+        assert_eq!(handshakes(TlsHandshakeResult::success), 2);
+        assert_eq!(observed(), 2);
+        for result in [
+            TlsHandshakeResult::peer_verification_failed,
+            TlsHandshakeResult::protocol_error,
+            TlsHandshakeResult::timeout,
+        ] {
+            assert_eq!(handshakes(result), 0, "{result:?}");
+        }
+        // The server side of this fixture is not a ztunnel reporter.
+        assert_eq!(
+            metrics
+                .tls_handshakes
+                .get_or_create(&TlsHandshakeLabels {
+                    reporter: Reporter::destination,
+                    result: TlsHandshakeResult::success,
+                })
+                .get(),
+            0
+        );
+        drop(pool);
+        assert_opens_drops!(srv, 2, 2);
     }
 
     /// This is really a test for TokioH2Stream, but its nicer here because we have access to

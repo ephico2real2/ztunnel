@@ -445,6 +445,7 @@ impl WorkloadProxyManagerState {
                 Some(drain_rx),
                 workload_info.clone(),
                 Arc::from(self.inpod_config.socket_factory(netns)),
+                Some(workload_uid.0.clone().into()),
             )
             .await?;
 

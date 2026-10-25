@@ -227,14 +227,17 @@ impl OutboundConnection {
 
         let metrics = self.pi.metrics.clone();
         let hbone_target = req.hbone_target_destination.clone();
-        let connection_result_builder = Box::new(ConnectionResultBuilder::new(
-            source_addr,
-            req.actual_destination,
-            hbone_target,
-            start,
-            Self::conn_metrics_from_request(&req),
-            metrics,
-        ));
+        let connection_result_builder = Box::new(
+            ConnectionResultBuilder::new(
+                source_addr,
+                req.actual_destination,
+                hbone_target,
+                start,
+                Self::conn_metrics_from_request(&req),
+                metrics,
+            )
+            .with_native_source(req.source_witness.clone()),
+        );
 
         let proxy = async {
             match req.protocol {
@@ -256,6 +259,25 @@ impl OutboundConnection {
                     self.proxy_to_tcp(source_stream, &req, connection_result_builder)
                         .await
                 }
+            }
+        };
+        let source_invalidated = async {
+            match req.source_witness.clone() {
+                Some(source) => {
+                    source.invalidated().await;
+                    tracing::warn!(component="outbound", stage="native-source-withdrawal",
+                        source=%source_addr, destination=%dest_addr,
+                        error=%Error::NativeOutboundSourceInvalidated,
+                        "closing outbound connection for invalidated source; not a policy DENY");
+                }
+                None => std::future::pending().await,
+            }
+        };
+        let proxy = async {
+            tokio::select! {
+                biased;
+                _ = source_invalidated => {},
+                _ = proxy => {},
             }
         };
         if let Some(watch) = conn_guard.watcher() {
@@ -308,12 +330,17 @@ impl OutboundConnection {
                 .local_workload_information
                 .profile_lease(&cert, tls::domain_anchors::PeerRole::Client)
                 .await?;
+            let observer = tls::handshake::HandshakeObserver::new(
+                self.pi.metrics.clone(),
+                self.pi.cfg.tls_handshake_timeout,
+            );
             let (tls_stream, revocation) = tls::profile_provider::connect(
                 cert,
                 lease.clone(),
                 upgraded,
                 wl_key.dst_id.clone(),
                 self.pi.crl_manager.clone(),
+                observer,
             )
             .await
             .inspect_err(|e| {
@@ -452,9 +479,13 @@ impl OutboundConnection {
             src: remote_addr.ip(),
             dst: req.actual_destination,
         });
-        Box::pin(self.pool.send_request_pooled(&pool_key, request))
-            .instrument(trace_span!("outbound connect"))
-            .await
+        Box::pin(self.pool.send_request_pooled_with_source(
+            &pool_key,
+            request,
+            req.source_witness.clone(),
+        ))
+        .instrument(trace_span!("outbound connect"))
+        .await
     }
 
     async fn proxy_to_tcp(
@@ -585,6 +616,7 @@ impl OutboundConnection {
                 final_sans: upstream.service_sans(),
                 protected_mesh: false,
                 xds_generation: None,
+                source_witness: None,
             })
         } else {
             // Do not try to send cross-network traffic without network gateway.
@@ -597,6 +629,28 @@ impl OutboundConnection {
     // build_request computes all information about the request we should send
     // TODO: Do we want a single lock for source and upstream...?
     async fn build_request(
+        &self,
+        source_workload: Arc<Workload>,
+        downstream: IpAddr,
+        target: SocketAddr,
+    ) -> Result<Request, Error> {
+        let mut request = self
+            .build_request_inner(source_workload.clone(), downstream, target)
+            .await?;
+        if request.protected_mesh {
+            request.source_witness = crate::state::outbound_source::OutboundSource::capture(
+                &self.pi.state,
+                &self.pi.cfg,
+                source_workload,
+                downstream,
+                self.pi.local_workload_information.bound_uid(),
+            )
+            .map_err(Error::AuthorizationPolicyRejection)?;
+        }
+        Ok(request)
+    }
+
+    async fn build_request_inner(
         &self,
         source_workload: Arc<Workload>,
         downstream: IpAddr,
@@ -700,6 +754,7 @@ impl OutboundConnection {
                     final_sans: vec![],
                     protected_mesh: false,
                     xds_generation: None,
+                    source_witness: None,
                 });
             }
             // this was service addressed but we did not find a waypoint
@@ -759,6 +814,7 @@ impl OutboundConnection {
                 final_sans: vec![],
                 protected_mesh: false,
                 xds_generation: None,
+                source_witness: None,
             });
         };
 
@@ -836,6 +892,7 @@ impl OutboundConnection {
                     final_sans: vec![],
                     protected_mesh: false,
                     xds_generation: None,
+                    source_witness: None,
                 });
             }
             // Workload doesn't have a waypoint; send directly
@@ -888,6 +945,7 @@ impl OutboundConnection {
             final_sans,
             protected_mesh: request_generation.is_some(),
             xds_generation: request_generation,
+            source_witness: None,
         })
     }
 
@@ -962,6 +1020,7 @@ struct Request {
     /// mesh request. Checked again after the connection is registered for
     /// draining and immediately before forwarding starts.
     xds_generation: Option<u64>,
+    source_witness: Option<Arc<crate::state::outbound_source::OutboundSource>>,
     protocol: OutboundProtocol,
     // Source workload sending the request
     source: Arc<Workload>,
@@ -1069,7 +1128,7 @@ mod tests {
         session: Option<crate::xds::XdsSessionGate>,
     ) -> Result<Request, Error> {
         let cfg = Arc::new(config);
-        let source = XdsWorkload {
+        let mut source = XdsWorkload {
             uid: "cluster1//v1/Pod/ns/source-workload".to_string(),
             name: "source-workload".to_string(),
             namespace: "ns".to_string(),
@@ -1080,6 +1139,11 @@ mod tests {
             node: "local-node".to_string(),
             ..Default::default()
         };
+        if cfg.require_mesh_hbone {
+            source.cluster_id = cfg.cluster_id.clone();
+            source.trust_domain = "alpha.mesh.example".into();
+            source.tunnel_protocol = XdsProtocol::Hbone as i32;
+        }
         let waypoint = XdsWorkload {
             uid: "cluster1//v1/Pod/ns/waypoint-workload".to_string(),
             name: "waypoint-workload".to_string(),
@@ -1121,12 +1185,15 @@ mod tests {
             namespace: "ns".to_string(),
             service_account: "default".to_string(),
         };
-        let local_workload_information = Arc::new(LocalWorkloadInformation::new(
-            Arc::new(wi.clone()),
-            state.clone(),
-            identity::mock::new_secret_manager(Duration::from_secs(10)),
-            cfg.clone(),
-        ));
+        let local_workload_information = Arc::new(
+            LocalWorkloadInformation::new(
+                Arc::new(wi.clone()),
+                state.clone(),
+                identity::mock::new_secret_manager(Duration::from_secs(10)),
+                cfg.clone(),
+            )
+            .with_uid(Some("cluster1//v1/Pod/ns/source-workload".into())),
+        );
         let outbound = OutboundConnection {
             pi: Arc::new(ProxyInputs {
                 state: state.clone(),
@@ -1190,11 +1257,17 @@ mod tests {
     fn strict_mesh_config() -> Config {
         let mut config = crate::config::parse_config().unwrap();
         config.require_mesh_hbone = true;
+        config.cluster_id = "cluster-alpha".into();
+        config.local_node = Some("local-node".into());
         config.mesh_egress = MeshEgressConfig {
             clusters: vec![MeshClusterRanges {
                 cluster_id: "cluster-alpha".to_string(),
                 trust_domain: "alpha.mesh.example".to_string(),
-                pod_cidrs: vec!["10.244.0.0/16".parse().unwrap()],
+                pod_cidrs: vec![
+                    "10.244.0.0/16".parse().unwrap(),
+                    "127.0.0.1/32".parse().unwrap(),
+                    "::1/128".parse().unwrap(),
+                ],
                 service_cidrs: vec!["10.96.0.0/12".parse().unwrap()],
                 gateway_cidrs: vec![],
             }],
@@ -2564,6 +2637,7 @@ mod tests {
         let req = Request {
             protected_mesh: false,
             xds_generation: None,
+            source_witness: None,
             protocol: OutboundProtocol::HBONE,
             source: source_workload,
             hbone_target_destination: Some(HboneAddress::SocketAddr(

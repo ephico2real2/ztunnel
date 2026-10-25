@@ -20,6 +20,7 @@ use tokio::sync::{Notify, watch};
 use tokio::time::Instant;
 
 use super::domain_anchors::{AnchorPublication, PeerRole, VerifiedPeer, verify_peer_evidence};
+use super::handshake::HandshakeObserver;
 use super::issuer_profile_wire::{Decoded, Expected};
 use super::profile_checkpoint::{
     Binding, CheckpointStore, Floors, Installation, Observation, OpenMode, ProfileCheckpoint,
@@ -704,6 +705,8 @@ pub(crate) struct ProfileIo<IO> {
     invalid: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     flow: Option<Flow>,
     crl_coverage: Option<Arc<super::native_crl::Coverage>>,
+    // Set only on the application (upper) owner after a successful handshake.
+    session: Option<super::handshake::ActiveSession>,
 }
 impl<IO: Unpin> ProfileIo<IO> {
     /// Inspect TLS metadata without exposing mutable unchecked application I/O.
@@ -746,7 +749,11 @@ impl<IO: Unpin> ProfileIo<IO> {
             invalid,
             flow,
             crl_coverage: None,
+            session: None,
         })
+    }
+    fn track_session(&mut self, session: super::handshake::ActiveSession) {
+        self.session = Some(session);
     }
     fn set_peer(&mut self, peer: VerifiedPeer) {
         self.peer = Some(peer.clone());
@@ -827,11 +834,13 @@ impl<IO: Unpin> ProfileIo<IO> {
                 .is_some_and(|f| f.as_mut().poll(cx).is_ready())
         {
             // Drop the socket first, then release the drain-registration owner.
+            // The live-session count ends with the decrypted stream.
             self.io.take();
+            self.session.take();
             self.flow.take();
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "authenticated issuer profile/session expired or changed",
+                super::handshake::AuthorityInvalidated,
             ));
         }
         Ok(())
@@ -883,11 +892,16 @@ pub(crate) type ServerTls<IO> = ProfileIo<tokio_rustls::server::TlsStream<Profil
 pub(crate) type ClientTls<IO> = ProfileIo<tokio_rustls::client::TlsStream<ProfileIo<IO>>>;
 /// The ordinary constructor is used only when the independently configured
 /// native provider is absent. A configured but unavailable provider is an error.
+///
+/// The handshake observation starts when the transport reaches the TLS
+/// acceptor. It ends after the verified peer is bound to the current lease,
+/// CRL and session, so `success` never precedes the native peer checks.
 pub(crate) async fn accept<IO: AsyncRead + AsyncWrite + Unpin>(
     cert: Arc<WorkloadCertificate>,
     lease: Option<Lease>,
     io: IO,
     crl: Option<Arc<tls::crl::CrlManager>>,
+    observer: HandshakeObserver,
 ) -> Result<(ServerTls<IO>, Option<RevocationHandle>), tls::TlsError> {
     let config = match &lease {
         Some(l) => cert.pinned_server_config(
@@ -900,10 +914,24 @@ pub(crate) async fn accept<IO: AsyncRead + AsyncWrite + Unpin>(
     let deadline = cert.cert.expiry.not_after;
     let wrapped = ProfileIo::new(io, lease.clone(), deadline)
         .map_err(|e| tls::TlsError::Handshake(io_error(e)))?;
-    let mut stream = tokio_rustls::TlsAcceptor::from(Arc::new(config))
-        .accept(wrapped)
+    let (binding, stream) = observer
+        .start(Reporter::destination)
+        .drive(tokio_rustls::TlsAcceptor::from(Arc::new(config)).accept(wrapped))
         .await
         .map_err(tls::TlsError::Handshake)?;
+    let (mut application, revocation) =
+        binding.complete(bind_server_peer(&cert, lease, stream, crl, deadline))?;
+    application.track_session(observer.active(Reporter::destination));
+    Ok((application, revocation))
+}
+
+fn bind_server_peer<IO: AsyncRead + AsyncWrite + Unpin>(
+    cert: &WorkloadCertificate,
+    lease: Option<Lease>,
+    mut stream: tokio_rustls::server::TlsStream<ProfileIo<IO>>,
+    crl: Option<Arc<tls::crl::CrlManager>>,
+    deadline: SystemTime,
+) -> Result<(ServerTls<IO>, Option<RevocationHandle>), tls::TlsError> {
     let (peer, revocation, coverage) = if let Some(lease) = &lease {
         let (peer, revocation, coverage) = lease
             .peer(
@@ -959,12 +987,14 @@ pub(crate) async fn accept<IO: AsyncRead + AsyncWrite + Unpin>(
     }
     Ok((application, revocation))
 }
+
 pub(crate) async fn connect<IO: AsyncRead + AsyncWrite + Unpin>(
     cert: Arc<WorkloadCertificate>,
     lease: Option<Lease>,
     io: IO,
     expected: Vec<Identity>,
     crl: Option<Arc<tls::crl::CrlManager>>,
+    observer: HandshakeObserver,
 ) -> io::Result<(ClientTls<IO>, Option<RevocationHandle>)> {
     let config = match &lease {
         Some(l) => cert.pinned_client_config(
@@ -978,15 +1008,31 @@ pub(crate) async fn connect<IO: AsyncRead + AsyncWrite + Unpin>(
     let deadline = cert.cert.expiry.not_after;
     let wrapped = ProfileIo::new(io, lease.clone(), deadline).map_err(io_error)?;
     let name = rustls::pki_types::ServerName::IpAddress(std::net::Ipv4Addr::UNSPECIFIED.into());
-    let mut stream = tokio_rustls::TlsConnector::from(Arc::new(config))
-        .connect(name, wrapped)
+    let (binding, stream) = observer
+        .start(Reporter::source)
+        .drive(tokio_rustls::TlsConnector::from(Arc::new(config)).connect(name, wrapped))
         .await?;
+    let (mut application, revocation) = binding.complete(bind_client_peer(
+        &cert, lease, stream, &expected, crl, deadline,
+    ))?;
+    application.track_session(observer.active(Reporter::source));
+    Ok((application, revocation))
+}
+
+fn bind_client_peer<IO: AsyncRead + AsyncWrite + Unpin>(
+    cert: &WorkloadCertificate,
+    lease: Option<Lease>,
+    mut stream: tokio_rustls::client::TlsStream<ProfileIo<IO>>,
+    expected: &[Identity],
+    crl: Option<Arc<tls::crl::CrlManager>>,
+    deadline: SystemTime,
+) -> io::Result<(ClientTls<IO>, Option<RevocationHandle>)> {
     let (peer, revocation, coverage) = if let Some(lease) = &lease {
         let (peer, revocation, coverage) = lease
             .peer(
                 stream.get_ref().1,
                 PeerRole::Server,
-                &expected,
+                expected,
                 crl.as_ref(),
                 Reporter::source,
             )
@@ -1066,6 +1112,12 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
+    fn hs() -> HandshakeObserver {
+        HandshakeObserver::new(
+            crate::test_helpers::helpers::test_proxy_metrics(),
+            Duration::from_secs(10),
+        )
+    }
     fn dir() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1411,6 +1463,519 @@ mod tests {
             {"clusterID":"cmtc-b","trustDomain":"cmtc-b.mesh.example","issuers":[{"certificateDER":STANDARD.encode(b.der()),"spkiSHA256":sha(&super::super::domain_anchors::spki_der(b.der()).unwrap())}]}
         ]})
     }
+    /// One proxy metrics registry, as one node ztunnel exposes it.
+    fn tls_metrics() -> (
+        prometheus_client::registry::Registry,
+        Arc<crate::proxy::Metrics>,
+    ) {
+        let mut registry = prometheus_client::registry::Registry::default();
+        let metrics = Arc::new(crate::proxy::Metrics::new(crate::metrics::sub_registry(
+            &mut registry,
+        )));
+        (registry, metrics)
+    }
+    /// Read one sample from the actual text exposition.
+    fn scraped(registry: &prometheus_client::registry::Registry, series: &str) -> f64 {
+        let mut text = String::new();
+        prometheus_client::encoding::text::encode(&mut text, registry).unwrap();
+        text.lines()
+            .find_map(|line| line.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+            .unwrap_or_else(|| panic!("series {series} is not exposed:\n{text}"))
+    }
+    fn handshakes(
+        registry: &prometheus_client::registry::Registry,
+        reporter: &str,
+        result: &str,
+    ) -> f64 {
+        scraped(
+            registry,
+            &format!("istio_tls_handshakes_total{{reporter=\"{reporter}\",result=\"{result}\"}}"),
+        )
+    }
+    fn durations(registry: &prometheus_client::registry::Registry, reporter: &str) -> f64 {
+        scraped(
+            registry,
+            &format!("istio_tls_handshake_duration_seconds_count{{reporter=\"{reporter}\"}}"),
+        )
+    }
+    fn within<F: Future>(step: F) -> tokio::time::Timeout<F> {
+        tokio::time::timeout(Duration::from_secs(5), step)
+    }
+    fn active(registry: &prometheus_client::registry::Registry, reporter: &str) -> f64 {
+        scraped(
+            registry,
+            &format!("istio_tls_connections_active{{reporter=\"{reporter}\"}}"),
+        )
+    }
+    #[tokio::test]
+    async fn native_tls_active_session_gauge_follows_exact_stream_owner() {
+        let root = ca("root", None);
+        let a = ca("a", Some(&root));
+        let b = ca("b", Some(&root));
+        let ca_cert = workload("cmtc-a.mesh.example", &a);
+        let cb = workload("cmtc-b.mesh.example", &b);
+        let wa = live_wire("cmtc-a", &root, &a, &b);
+        let wb = live_wire("cmtc-b", &root, &a, &b);
+        let (ea, eb) = (expected(&wa), expected(&wb));
+        let (da, db) = (dir(), dir());
+        let (pa, ga, sa) = opened(da.path(), &ea, SystemTime::now);
+        let (pb, gb, sb) = opened(db.path(), &eb, SystemTime::now);
+        pa.commit(decode(&wa, &ea, SystemTime::now)).unwrap();
+        pb.commit(decode(&wb, &eb, SystemTime::now)).unwrap();
+        ready(&pa, &ga, sa);
+        ready(&pb, &gb, sb);
+        let (client_registry, client_metrics) = tls_metrics();
+        let (server_registry, server_metrics) = tls_metrics();
+        let client_hs = HandshakeObserver::new(client_metrics, Duration::from_secs(10));
+        let server_hs = HandshakeObserver::new(server_metrics, Duration::from_secs(10));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let session = async || {
+            let (client, server) = within(async {
+                tokio::join!(
+                    async {
+                        connect(
+                            ca_cert.clone(),
+                            Some(pa.acquire().unwrap()),
+                            TcpStream::connect(address).await.unwrap(),
+                            vec![cb.identity().unwrap()],
+                            None,
+                            client_hs.clone(),
+                        )
+                        .await
+                    },
+                    async {
+                        let (raw, _) = listener.accept().await.unwrap();
+                        accept(
+                            cb.clone(),
+                            Some(pb.acquire().unwrap()),
+                            raw,
+                            None,
+                            server_hs.clone(),
+                        )
+                        .await
+                    }
+                )
+            })
+            .await
+            .unwrap();
+            (client.unwrap().0, server.unwrap().0)
+        };
+        assert_eq!(active(&client_registry, "source"), 0.0);
+        assert_eq!(active(&server_registry, "destination"), 0.0);
+
+        // 1. One live session is counted once at each reporter.
+        let (client, mut server) = session().await;
+        assert_eq!(active(&client_registry, "source"), 1.0);
+        assert_eq!(active(&client_registry, "destination"), 0.0);
+        assert_eq!(active(&server_registry, "destination"), 1.0);
+        // The client owner drops: its count ends at once.
+        drop(client);
+        assert_eq!(active(&client_registry, "source"), 0.0);
+        // The server observes EOF but still owns the stream: still live there.
+        let mut b1 = [0];
+        let eof = within(server.read(&mut b1)).await.unwrap();
+        assert!(matches!(eof, Ok(0) | Err(_)), "{eof:?}");
+        assert_eq!(active(&server_registry, "destination"), 1.0);
+        drop(server);
+        assert_eq!(active(&server_registry, "destination"), 0.0);
+
+        // 2. A failed handshake never becomes a live session.
+        let (client, server) = within(async {
+            tokio::join!(
+                async {
+                    connect(
+                        ca_cert.clone(),
+                        Some(pa.acquire().unwrap()),
+                        TcpStream::connect(address).await.unwrap(),
+                        vec![ca_cert.identity().unwrap()],
+                        None,
+                        client_hs.clone(),
+                    )
+                    .await
+                },
+                async {
+                    let (raw, _) = listener.accept().await.unwrap();
+                    accept(
+                        cb.clone(),
+                        Some(pb.acquire().unwrap()),
+                        raw,
+                        None,
+                        server_hs.clone(),
+                    )
+                    .await
+                }
+            )
+        })
+        .await
+        .unwrap();
+        assert!(client.is_err() && server.is_err());
+        assert_eq!(active(&client_registry, "source"), 0.0);
+        assert_eq!(active(&server_registry, "destination"), 0.0);
+
+        // 3. Session withdrawal ends the count while the owner object is alive.
+        let (mut client, server) = session().await;
+        assert_eq!(active(&client_registry, "source"), 1.0);
+        ga.mark_stale(sa);
+        let withdrawn = within(client.read(&mut b1)).await.unwrap();
+        assert!(withdrawn.is_err(), "{withdrawn:?}");
+        assert_eq!(active(&client_registry, "source"), 0.0);
+        drop(client);
+        assert_eq!(
+            active(&client_registry, "source"),
+            0.0,
+            "no double decrement"
+        );
+        drop(server);
+        assert_eq!(active(&server_registry, "destination"), 0.0);
+        assert!(pa.inner.lock().unwrap().flows.is_empty());
+        assert!(pb.inner.lock().unwrap().flows.is_empty());
+    }
+    #[tokio::test]
+    async fn native_tls_handshake_metrics_count_actual_results_at_both_reporters() {
+        let root = ca("root", None);
+        let a = ca("a", Some(&root));
+        let b = ca("b", Some(&root));
+        // Same organization root, but never approved for any cluster.
+        let rogue = ca("rogue", Some(&root));
+        let ca_cert = workload("cmtc-a.mesh.example", &a);
+        let cb = workload("cmtc-b.mesh.example", &b);
+        let unapproved = workload("cmtc-a.mesh.example", &rogue);
+        let wa = live_wire("cmtc-a", &root, &a, &b);
+        let wb = live_wire("cmtc-b", &root, &a, &b);
+        let (ea, eb) = (expected(&wa), expected(&wb));
+        let (da, db) = (dir(), dir());
+        let (pa, ga, sa) = opened(da.path(), &ea, SystemTime::now);
+        let (pb, gb, sb) = opened(db.path(), &eb, SystemTime::now);
+        pa.commit(decode(&wa, &ea, SystemTime::now)).unwrap();
+        pb.commit(decode(&wb, &eb, SystemTime::now)).unwrap();
+        ready(&pa, &ga, sa);
+        ready(&pb, &gb, sb);
+        // Two registries model the client-node and server-node ztunnels.
+        // Cluster and node are scrape-target labels, never emitted here.
+        let (client_registry, client_metrics) = tls_metrics();
+        let (server_registry, server_metrics) = tls_metrics();
+        let client_hs = HandshakeObserver::new(client_metrics, Duration::from_secs(10));
+        let server_hs = HandshakeObserver::new(server_metrics, Duration::from_secs(10));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        // 1. Success at both reporters. Application records are not handshakes.
+        let (client, server) = within(async {
+            tokio::join!(
+                async {
+                    connect(
+                        ca_cert.clone(),
+                        Some(pa.acquire().unwrap()),
+                        TcpStream::connect(address).await.unwrap(),
+                        vec![cb.identity().unwrap()],
+                        None,
+                        client_hs.clone(),
+                    )
+                    .await
+                },
+                async {
+                    let (raw, _) = listener.accept().await.unwrap();
+                    accept(
+                        cb.clone(),
+                        Some(pb.acquire().unwrap()),
+                        raw,
+                        None,
+                        server_hs.clone(),
+                    )
+                    .await
+                }
+            )
+        })
+        .await
+        .unwrap();
+        let (mut client, _) = client.unwrap();
+        let (mut server, _) = server.unwrap();
+        let mut buf = [0; 2];
+        for _ in 0..3 {
+            client.write_all(b"ok").await.unwrap();
+            server.read_exact(&mut buf).await.unwrap();
+        }
+        drop((client, server));
+
+        // 2. The client rejects an authenticated but unexpected server
+        // identity. The server receives an alert: protocol_error there.
+        let (client, server) = within(async {
+            tokio::join!(
+                async {
+                    connect(
+                        ca_cert.clone(),
+                        Some(pa.acquire().unwrap()),
+                        TcpStream::connect(address).await.unwrap(),
+                        vec![ca_cert.identity().unwrap()],
+                        None,
+                        client_hs.clone(),
+                    )
+                    .await
+                },
+                async {
+                    let (raw, _) = listener.accept().await.unwrap();
+                    accept(
+                        cb.clone(),
+                        Some(pb.acquire().unwrap()),
+                        raw,
+                        None,
+                        server_hs.clone(),
+                    )
+                    .await
+                }
+            )
+        })
+        .await
+        .unwrap();
+        assert!(client.is_err() && server.is_err());
+
+        // 3. An unapproved issuer under the same organization root. TLS 1.3
+        // completes the client handshake first; only the server rejects it.
+        let (client, server) = within(async {
+            tokio::join!(
+                async {
+                    connect(
+                        unapproved.clone(),
+                        Some(pa.acquire().unwrap()),
+                        TcpStream::connect(address).await.unwrap(),
+                        vec![cb.identity().unwrap()],
+                        None,
+                        client_hs.clone(),
+                    )
+                    .await
+                },
+                async {
+                    let (raw, _) = listener.accept().await.unwrap();
+                    accept(
+                        cb.clone(),
+                        Some(pb.acquire().unwrap()),
+                        raw,
+                        None,
+                        server_hs.clone(),
+                    )
+                    .await
+                }
+            )
+        })
+        .await
+        .unwrap();
+        assert!(server.is_err());
+        let (mut client, _) = client.expect("TLS 1.3 client completes before server verification");
+        let mut b1 = [0];
+        let refused = within(client.read(&mut b1)).await.unwrap();
+        assert!(matches!(refused, Err(_) | Ok(0)), "{refused:?}");
+        drop(client);
+
+        // 4. An unenrolled client presents no certificate at all.
+        let unenrolled = {
+            let verifier = crate::tls::IdentityVerifier {
+                roots: cb.root_store(),
+                identity: vec![cb.identity().unwrap()],
+                crl_manager: None,
+            };
+            let mut config = rustls::ClientConfig::builder_with_provider(tls::lib::provider())
+                .with_protocol_versions(tls::tls_versions())
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(verifier))
+                .with_no_client_auth();
+            config.alpn_protocols = vec![b"h2".into()];
+            tokio_rustls::TlsConnector::from(Arc::new(config))
+        };
+        let (_client, server) = within(async {
+            tokio::join!(
+                async {
+                    let raw = TcpStream::connect(address).await.unwrap();
+                    let name = rustls::pki_types::ServerName::IpAddress(
+                        std::net::Ipv4Addr::UNSPECIFIED.into(),
+                    );
+                    if let Ok(mut tls) = unenrolled.connect(name, raw).await {
+                        let mut b1 = [0];
+                        let _ = tls.read(&mut b1).await;
+                    }
+                },
+                async {
+                    let (raw, _) = listener.accept().await.unwrap();
+                    accept(
+                        cb.clone(),
+                        Some(pb.acquire().unwrap()),
+                        raw,
+                        None,
+                        server_hs.clone(),
+                    )
+                    .await
+                }
+            )
+        })
+        .await
+        .unwrap();
+        assert!(server.is_err());
+
+        // 5. Non-TLS bytes at both reporters are protocol errors.
+        let (_, server) = within(async {
+            tokio::join!(
+                async {
+                    let mut raw = TcpStream::connect(address).await.unwrap();
+                    raw.write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut sink = Vec::new();
+                    let _ = raw.read_to_end(&mut sink).await;
+                },
+                async {
+                    let (raw, _) = listener.accept().await.unwrap();
+                    accept(
+                        cb.clone(),
+                        Some(pb.acquire().unwrap()),
+                        raw,
+                        None,
+                        server_hs.clone(),
+                    )
+                    .await
+                }
+            )
+        })
+        .await
+        .unwrap();
+        assert!(server.is_err());
+        let (client, _) = within(async {
+            tokio::join!(
+                connect(
+                    ca_cert.clone(),
+                    Some(pa.acquire().unwrap()),
+                    TcpStream::connect(address).await.unwrap(),
+                    vec![cb.identity().unwrap()],
+                    None,
+                    client_hs.clone(),
+                ),
+                async {
+                    let (mut raw, _) = listener.accept().await.unwrap();
+                    let mut hello = [0; 5];
+                    raw.read_exact(&mut hello).await.unwrap();
+                    raw.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+                        .await
+                        .unwrap();
+                    raw
+                }
+            )
+        })
+        .await
+        .unwrap();
+        assert!(client.is_err());
+
+        // 6. A silent peer reaches the deadline at both reporters.
+        let (_idle, server) = within(async {
+            tokio::join!(TcpStream::connect(address), async {
+                let (raw, _) = listener.accept().await.unwrap();
+                accept(
+                    cb.clone(),
+                    Some(pb.acquire().unwrap()),
+                    raw,
+                    None,
+                    server_hs.with_timeout(Duration::from_millis(200)),
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
+        let Err(tls::TlsError::Handshake(error)) = server else {
+            panic!("silent client must time out");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let (client, _silent) = within(async {
+            tokio::join!(
+                async {
+                    connect(
+                        ca_cert.clone(),
+                        Some(pa.acquire().unwrap()),
+                        TcpStream::connect(address).await.unwrap(),
+                        vec![cb.identity().unwrap()],
+                        None,
+                        client_hs.with_timeout(Duration::from_millis(200)),
+                    )
+                    .await
+                },
+                async { listener.accept().await.unwrap() }
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(client.err().unwrap().kind(), io::ErrorKind::TimedOut);
+
+        // 7. Cancelled handshakes are not completed events at either reporter.
+        let _idle = TcpStream::connect(address).await.unwrap();
+        let (raw, _) = listener.accept().await.unwrap();
+        let pending = accept(
+            cb.clone(),
+            Some(pb.acquire().unwrap()),
+            raw,
+            None,
+            server_hs.clone(),
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), pending)
+                .await
+                .is_err()
+        );
+        let (client, _silent) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                connect(
+                    ca_cert.clone(),
+                    Some(pa.acquire().unwrap()),
+                    TcpStream::connect(address).await.unwrap(),
+                    vec![cb.identity().unwrap()],
+                    None,
+                    client_hs.clone(),
+                ),
+            ),
+            async { listener.accept().await.unwrap() }
+        );
+        assert!(client.is_err());
+
+        // Client-node exposition: source results only.
+        for (result, want) in [
+            ("success", 2.0),
+            ("peer_verification_failed", 1.0),
+            ("protocol_error", 1.0),
+            ("timeout", 1.0),
+        ] {
+            assert_eq!(
+                handshakes(&client_registry, "source", result),
+                want,
+                "{result}"
+            );
+            assert_eq!(handshakes(&client_registry, "destination", result), 0.0);
+        }
+        assert_eq!(durations(&client_registry, "source"), 2.0);
+        assert_eq!(durations(&client_registry, "destination"), 0.0);
+        // Server-node exposition: destination results only.
+        for (result, want) in [
+            ("success", 1.0),
+            ("peer_verification_failed", 2.0),
+            ("protocol_error", 2.0),
+            ("timeout", 1.0),
+        ] {
+            assert_eq!(
+                handshakes(&server_registry, "destination", result),
+                want,
+                "{result}"
+            );
+            assert_eq!(handshakes(&server_registry, "source", result), 0.0);
+        }
+        // Only the one successful server handshake is a duration sample.
+        assert_eq!(durations(&server_registry, "destination"), 1.0);
+        assert!(
+            scraped(
+                &server_registry,
+                "istio_tls_handshake_duration_seconds_sum{reporter=\"destination\"}"
+            ) > 0.0
+        );
+        assert!(pa.inner.lock().unwrap().flows.is_empty());
+        assert!(pb.inner.lock().unwrap().flows.is_empty());
+    }
     #[tokio::test]
     async fn native_both_roles_tls_rejects_wrong_local_domain_and_drains_idle_live_sockets() {
         let root = ca("root", None);
@@ -1444,14 +2009,17 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let client = async {
             let raw = TcpStream::connect(address).await.unwrap();
-            connect(ca, Some(la), raw, vec![cb.identity().unwrap()], None)
+            connect(ca, Some(la), raw, vec![cb.identity().unwrap()], None, hs())
                 .await
                 .unwrap()
                 .0
         };
         let server = async {
             let (raw, _) = listener.accept().await.unwrap();
-            accept(cb.clone(), Some(lb), raw, None).await.unwrap().0
+            accept(cb.clone(), Some(lb), raw, None, hs())
+                .await
+                .unwrap()
+                .0
         };
         let (mut client, mut server) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(client, server)
@@ -1571,6 +2139,7 @@ mod tests {
                 TcpStream::connect(address).await.unwrap(),
                 vec![cb.identity().unwrap()],
                 None,
+                hs(),
             )
             .await
             .unwrap()
@@ -1578,7 +2147,7 @@ mod tests {
         };
         let server = async {
             let (raw, _) = listener.accept().await.unwrap();
-            accept(cb.clone(), Some(pb.acquire().unwrap()), raw, None)
+            accept(cb.clone(), Some(pb.acquire().unwrap()), raw, None, hs())
                 .await
                 .unwrap()
                 .0
@@ -1642,8 +2211,15 @@ mod tests {
             client_inner,
             vec![cb.identity().unwrap()],
             None,
+            hs(),
         );
-        let server = accept(cb.clone(), Some(pb.acquire().unwrap()), server_inner, None);
+        let server = accept(
+            cb.clone(),
+            Some(pb.acquire().unwrap()),
+            server_inner,
+            None,
+            hs(),
+        );
         let (client, server) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(client, server)
         })
@@ -1766,6 +2342,7 @@ mod tests {
                         TcpStream::connect(address).await.unwrap(),
                         vec![cb.identity().unwrap()],
                         (!inbound).then(|| manager.clone()),
+                        hs(),
                     )
                     .await
                     .unwrap()
@@ -1777,6 +2354,7 @@ mod tests {
                         Some(pb.acquire().unwrap()),
                         raw,
                         inbound.then(|| manager.clone()),
+                        hs(),
                     )
                     .await
                     .unwrap()
@@ -1930,6 +2508,7 @@ mod tests {
                         TcpStream::connect(address).await.unwrap(),
                         vec![cb.identity().unwrap()],
                         None,
+                        hs(),
                     )
                     .await
                     .unwrap()
@@ -1937,7 +2516,7 @@ mod tests {
                 };
                 let server = async {
                     let (raw, _) = listener.accept().await.unwrap();
-                    accept(cb.clone(), Some(pb.acquire().unwrap()), raw, None)
+                    accept(cb.clone(), Some(pb.acquire().unwrap()), raw, None, hs())
                         .await
                         .unwrap()
                         .0
@@ -2030,6 +2609,7 @@ mod tests {
                     TcpStream::connect(address).await.unwrap(),
                     vec![cb.identity().unwrap()],
                     (!inbound).then(|| manager.clone()),
+                    hs(),
                 )
                 .await
                 .unwrap()
@@ -2041,6 +2621,7 @@ mod tests {
                     Some(pb.acquire().unwrap()),
                     raw,
                     inbound.then(|| manager.clone()),
+                    hs(),
                 )
                 .await
                 .unwrap()
@@ -2373,6 +2954,7 @@ mod tests {
                     TcpStream::connect(address).await.unwrap(),
                     vec![cb.identity().unwrap()],
                     (!inbound).then(|| manager.clone()),
+                    hs(),
                 )
                 .await
                 .unwrap()
@@ -2384,6 +2966,7 @@ mod tests {
                     Some(pb.acquire().unwrap()),
                     raw,
                     inbound.then(|| manager.clone()),
+                    hs(),
                 )
                 .await
                 .unwrap()
@@ -2453,6 +3036,7 @@ mod tests {
                     TcpStream::connect(address).await.unwrap(),
                     vec![cb.identity().unwrap()],
                     (!inbound).then(|| manager.clone()),
+                    hs(),
                 )
                 .await
                 .unwrap()
@@ -2464,6 +3048,7 @@ mod tests {
                     Some(pb.acquire().unwrap()),
                     raw,
                     inbound.then(|| manager.clone()),
+                    hs(),
                 )
                 .await
                 .unwrap()
@@ -2537,6 +3122,7 @@ mod tests {
                 socket.connect(address).await.unwrap(),
                 vec![cb.identity().unwrap()],
                 None,
+                hs(),
             )
             .await
             .unwrap()
@@ -2545,7 +3131,7 @@ mod tests {
         let server = async {
             let (raw, peer) = listener.accept().await.unwrap();
             let destination = raw.local_addr().unwrap();
-            let server = accept(cb.clone(), Some(pb.acquire().unwrap()), raw, None)
+            let server = accept(cb.clone(), Some(pb.acquire().unwrap()), raw, None, hs())
                 .await
                 .unwrap()
                 .0;

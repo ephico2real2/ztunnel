@@ -1281,7 +1281,7 @@ mod namespaced {
             namespace: "default".into(),
         };
 
-        let _ = manager.deploy_ztunnel(DEFAULT_NODE).await?;
+        let zt = manager.deploy_ztunnel(DEFAULT_NODE).await?;
         run_tcp_server(
             manager
                 .workload_builder("server", DEFAULT_NODE)
@@ -1315,6 +1315,25 @@ mod namespaced {
             })?
             .join()
             .unwrap()?;
+        // The destination reporter rejected the client credential. TLS 1.3
+        // completed the client handshake first, so the source reports success.
+        verify_metrics(
+            &zt,
+            &[(TLS_HANDSHAKES, 1)],
+            &handshake_labels("destination", "peer_verification_failed"),
+        )
+        .await;
+        let metrics = zt.metrics().await.unwrap();
+        assert_eq!(
+            metrics.query_sum(TLS_HANDSHAKES, &handshake_labels("destination", "success")),
+            0
+        );
+        assert_eq!(
+            metrics.query_sum(TLS_HANDSHAKES, &handshake_labels("source", "success")),
+            1,
+            "{}",
+            metrics.dump()
+        );
         Ok(())
     }
 
@@ -1946,6 +1965,7 @@ mod namespaced {
     const CONNECTIONS_CLOSED: &str = "istio_tcp_connections_closed_total";
     const BYTES_RECV: &str = "istio_tcp_received_bytes_total";
     const BYTES_SENT: &str = "istio_tcp_sent_bytes_total";
+    const TLS_HANDSHAKES: &str = "istio_tls_handshakes_total";
     const REQ_SIZE: u64 = b"hello world".len() as u64;
     const HBONE_REQ_SIZE: u64 = b"hello world".len() as u64 + b"waypoint\n".len() as u64;
 
@@ -2037,8 +2057,18 @@ mod namespaced {
             (BYTES_RECV, REQ_SIZE),
             (BYTES_SENT, REQ_SIZE * 2),
         ];
+        // A workload TLS handshake is a distinct quantity from a TCP connection.
+        let mesh = client_ztunnel.is_some() && server_ztunnel.is_some();
         if let Some(ref zt) = server_ztunnel {
             let _remote_metrics = verify_metrics(zt, &metrics, &destination_labels()).await;
+            if mesh {
+                verify_metrics(
+                    zt,
+                    &[(TLS_HANDSHAKES, 1)],
+                    &handshake_labels("destination", "success"),
+                )
+                .await;
+            }
             let mut want = HashMap::from([
                 ("scope", "access"),
                 ("src.workload", "client"),
@@ -2065,7 +2095,23 @@ mod namespaced {
             verify_metrics_compression(zt).await;
         }
         if let Some(zt) = client_ztunnel {
-            let _remote_metrics = verify_metrics(&zt, &metrics, &source_labels()).await;
+            let remote_metrics = verify_metrics(&zt, &metrics, &source_labels()).await;
+            if mesh {
+                verify_metrics(
+                    &zt,
+                    &[(TLS_HANDSHAKES, 1)],
+                    &handshake_labels("source", "success"),
+                )
+                .await;
+            } else {
+                // Plaintext to an uncaptured server opens TCP without TLS.
+                assert_eq!(
+                    remote_metrics.query_sum(TLS_HANDSHAKES, &source_labels()),
+                    0,
+                    "{}",
+                    remote_metrics.dump()
+                );
+            }
             let mut want = HashMap::from([
                 ("scope", "access"),
                 ("src.workload", "client"),
@@ -2117,6 +2163,13 @@ mod namespaced {
 
     fn source_labels() -> HashMap<String, String> {
         HashMap::from([("reporter".to_string(), "source".to_string())])
+    }
+
+    fn handshake_labels(reporter: &str, result: &str) -> HashMap<String, String> {
+        HashMap::from([
+            ("reporter".to_string(), reporter.to_string()),
+            ("result".to_string(), result.to_string()),
+        ])
     }
 
     async fn verify_metrics(

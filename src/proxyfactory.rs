@@ -109,7 +109,7 @@ impl ProxyFactory {
             } else {
                 Arc::new(base)
             };
-        self.new_proxies_from_factory(None, proxy_workload_info, factory)
+        self.new_proxies_from_factory(None, proxy_workload_info, factory, None)
             .await
     }
 
@@ -118,18 +118,22 @@ impl ProxyFactory {
         proxy_drain: Option<DrainWatcher>,
         proxy_workload_info: WorkloadInfo,
         socket_factory: Arc<dyn crate::proxy::SocketFactory + Send + Sync>,
+        original_uid: Option<crate::strng::Strng>,
     ) -> Result<ProxyResult, Error> {
         let mut result: ProxyResult = Default::default();
         let drain = proxy_drain.unwrap_or_else(|| self.drain.clone());
 
         let mut resolver = None;
 
-        let local_workload_information = Arc::new(LocalWorkloadInformation::new(
-            Arc::new(proxy_workload_info),
-            self.state.clone(),
-            self.cert_manager.clone(),
-            self.config.clone(),
-        ));
+        let local_workload_information = Arc::new(
+            LocalWorkloadInformation::new(
+                Arc::new(proxy_workload_info),
+                self.state.clone(),
+                self.cert_manager.clone(),
+                self.config.clone(),
+            )
+            .with_uid(original_uid),
+        );
 
         // Optionally create the DNS proxy.
         if self.config.dns_proxy {

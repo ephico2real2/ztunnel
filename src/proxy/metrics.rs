@@ -16,7 +16,7 @@ use std::fmt::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, atomic};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use prometheus_client::encoding::{
     EncodeLabelSet, EncodeLabelValue, LabelSetEncoder, LabelValueEncoder,
@@ -24,7 +24,8 @@ use prometheus_client::encoding::{
 use prometheus_client::metrics::counter::{Atomic, Counter};
 use prometheus_client::metrics::family::Family;
 use prometheus_client::metrics::gauge::Gauge;
-use prometheus_client::registry::Registry;
+use prometheus_client::metrics::histogram::Histogram;
+use prometheus_client::registry::{Registry, Unit};
 
 use tracing::event;
 use tracing_core::field::Value;
@@ -52,6 +53,13 @@ pub struct Metrics {
     pub crl_policy_rejections: Family<CrlLabels, Counter>,
 
     pub crl_untracked_connections: Family<CrlLabels, Counter>,
+
+    // Completed workload TLS handshakes at the actual accept/connect owner.
+    pub tls_handshakes: Family<TlsHandshakeLabels, Counter>,
+    // Successful workload TLS handshake duration only.
+    pub tls_handshake_duration: Family<TlsHandshakeDurationLabels, Histogram>,
+    // Live verified workload TLS sessions, owned by the decrypted stream owner.
+    pub tls_connections_active: Family<TlsConnectionLabels, Gauge>,
 }
 
 #[derive(Clone, Copy, Default, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
@@ -255,6 +263,64 @@ pub struct CrlLabels {
     pub reporter: Reporter,
 }
 
+/// Closed result set of one completed workload TLS handshake at one reporter.
+///
+/// - `success`: the TLS handshake completed and this reporter bound the
+///   verified peer to the current issuer profile, CRL and session state.
+/// - `peer_verification_failed`: this reporter rejected the peer credential
+///   (chain, SAN, approved issuer, fence, revocation or missing certificate),
+///   or its verification authority ended before the peer was bound.
+/// - `protocol_error`: the handshake ended without a local verification
+///   decision: malformed or incompatible TLS, a received alert, EOF or reset.
+///   A remote rejection of this reporter's credential arrives as an alert.
+/// - `timeout`: the handshake deadline elapsed, or the transport timed out.
+///
+/// TLS 1.3 completes the client handshake before the server verifies the
+/// client certificate. A server rejection of a client is therefore counted at
+/// `reporter=destination` only; the client reports `success` and then fails
+/// on its first read. A cancelled handshake is not a completed event.
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum TlsHandshakeResult {
+    success,
+    peer_verification_failed,
+    protocol_error,
+    timeout,
+}
+
+impl TlsHandshakeResult {
+    pub const ALL: [TlsHandshakeResult; 4] = [
+        TlsHandshakeResult::success,
+        TlsHandshakeResult::peer_verification_failed,
+        TlsHandshakeResult::protocol_error,
+        TlsHandshakeResult::timeout,
+    ];
+}
+
+/// Bounded labels: cluster and node come from the scrape target, never from
+/// a principal, workload UID or address label.
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct TlsHandshakeLabels {
+    pub reporter: Reporter,
+    pub result: TlsHandshakeResult,
+}
+
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct TlsHandshakeDurationLabels {
+    pub reporter: Reporter,
+}
+
+/// One live verified workload TLS session at one reporter. Select a single
+/// reporter in queries; a source-plus-destination sum counts a session twice.
+#[derive(Clone, Copy, Hash, Debug, PartialEq, Eq, EncodeLabelSet)]
+pub struct TlsConnectionLabels {
+    pub reporter: Reporter,
+}
+
+/// Seconds. The upper buckets cover the default 10s handshake deadline.
+const TLS_HANDSHAKE_BUCKETS: [f64; 13] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
 #[derive(Clone, Hash, Default, Debug, PartialEq, Eq, EncodeLabelSet)]
 pub struct CommonTrafficLabels {
     reporter: Reporter,
@@ -411,6 +477,38 @@ impl Metrics {
             crl_untracked_connections.clone(),
         );
 
+        let tls_handshakes = Family::default();
+        registry.register(
+            "tls_handshakes",
+            "The total number of completed workload TLS handshakes at the ztunnel accept/connect boundary, by reporter and result (unstable)",
+            tls_handshakes.clone(),
+        );
+        let tls_handshake_duration =
+            Family::<TlsHandshakeDurationLabels, Histogram>::new_with_constructor(|| {
+                Histogram::new(TLS_HANDSHAKE_BUCKETS)
+            });
+        registry.register_with_unit(
+            "tls_handshake_duration",
+            "The duration of successful workload TLS handshakes at the ztunnel accept/connect boundary, including peer binding (unstable)",
+            Unit::Seconds,
+            tls_handshake_duration.clone(),
+        );
+        let tls_connections_active = Family::default();
+        registry.register(
+            "tls_connections_active",
+            "The current number of verified workload TLS sessions owned by this ztunnel, by reporter (unstable)",
+            tls_connections_active.clone(),
+        );
+        // Expose the complete closed label set at zero. A scraped zero then
+        // means this reporting process observed no such handshake.
+        for reporter in [Reporter::source, Reporter::destination] {
+            for result in TlsHandshakeResult::ALL {
+                let _ = tls_handshakes.get_or_create(&TlsHandshakeLabels { reporter, result });
+            }
+            let _ = tls_handshake_duration.get_or_create(&TlsHandshakeDurationLabels { reporter });
+            let _ = tls_connections_active.get_or_create(&TlsConnectionLabels { reporter });
+        }
+
         Self {
             connection_opens,
             connection_close,
@@ -421,6 +519,27 @@ impl Metrics {
             open_sockets,
             crl_policy_rejections,
             crl_untracked_connections,
+            tls_handshakes,
+            tls_handshake_duration,
+            tls_connections_active,
+        }
+    }
+
+    /// Record one completed workload TLS handshake. Only a successful
+    /// handshake contributes to the duration histogram.
+    pub fn record_tls_handshake(
+        &self,
+        reporter: Reporter,
+        result: TlsHandshakeResult,
+        duration: Duration,
+    ) {
+        self.tls_handshakes
+            .get_or_create(&TlsHandshakeLabels { reporter, result })
+            .inc();
+        if result == TlsHandshakeResult::success {
+            self.tls_handshake_duration
+                .get_or_create(&TlsHandshakeDurationLabels { reporter })
+                .observe(duration.as_secs_f64());
         }
     }
 
@@ -486,6 +605,7 @@ pub struct ConnectionResult {
     // in case logs were disabled.
     pub(crate) tl: CommonTrafficLabels,
     pub(crate) metrics: Arc<Metrics>,
+    native_source: Option<Arc<crate::state::outbound_source::OutboundSource>>,
 
     // sent records the number of bytes sent on this connection
     pub(crate) sent: AtomicU64,
@@ -574,6 +694,7 @@ pub struct ConnectionResultBuilder {
     start: Instant,
     tl: CommonTrafficLabels,
     metrics: Arc<Metrics>,
+    native_source: Option<Arc<crate::state::outbound_source::OutboundSource>>,
 }
 
 impl ConnectionResultBuilder {
@@ -604,7 +725,16 @@ impl ConnectionResultBuilder {
             start,
             tl,
             metrics,
+            native_source: None,
         }
+    }
+
+    pub(crate) fn with_native_source(
+        mut self,
+        source: Option<Arc<crate::state::outbound_source::OutboundSource>>,
+    ) -> Self {
+        self.native_source = source;
+        self
     }
 
     pub fn with_derived_source(mut self, w: &DerivedWorkload) -> Self {
@@ -667,6 +797,7 @@ impl ConnectionResultBuilder {
             start: self.start,
             tl: self.tl,
             metrics: self.metrics,
+            native_source: self.native_source,
             sent,
             sent_metric,
             recv,
@@ -699,6 +830,15 @@ impl ConnectionResult {
 
     // Record our final result.
     pub fn record<E: std::error::Error + 'static>(mut self, res: Result<(), E>) {
+        if self
+            .native_source
+            .as_ref()
+            .is_some_and(|source| source.check().is_err())
+        {
+            self.tl.response_flags = ResponseFlags::IdentityError;
+            self.record_internal(Err(proxy::Error::NativeOutboundSourceInvalidated));
+            return;
+        }
         // If no specific flag was set and we have an error, try to infer the failure reason
         if self.tl.response_flags == ResponseFlags::None
             && let Err(ref err) = res
@@ -806,7 +946,16 @@ impl ConnectionResult {
 impl Drop for ConnectionResult {
     fn drop(&mut self) {
         if !self.recorded {
-            self.record_internal(Err(proxy::Error::ClosedFromDrain))
+            if self
+                .native_source
+                .as_ref()
+                .is_some_and(|source| source.check().is_err())
+            {
+                self.tl.response_flags = ResponseFlags::IdentityError;
+                self.record_internal(Err(proxy::Error::NativeOutboundSourceInvalidated));
+            } else {
+                self.record_internal(Err(proxy::Error::ClosedFromDrain));
+            }
         }
     }
 }

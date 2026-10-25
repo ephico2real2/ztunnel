@@ -220,8 +220,18 @@ impl Inbound {
                     e.to_string(),
                 ))
             })?;
-        let (stream, revocation) =
-            tls::profile_provider::accept(cert, lease, raw_socket, pi.crl_manager.clone()).await?;
+        let observer = tls::handshake::HandshakeObserver::new(
+            pi.metrics.clone(),
+            pi.cfg.tls_handshake_timeout,
+        );
+        let (stream, revocation) = tls::profile_provider::accept(
+            cert,
+            lease,
+            raw_socket,
+            pi.crl_manager.clone(),
+            observer,
+        )
+        .await?;
         // Keep the guarded TLS owner and the handshake result off the per-connection future.
         Ok((Box::new(stream), revocation))
     }

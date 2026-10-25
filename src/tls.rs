@@ -17,6 +17,8 @@ mod control;
 pub mod crl;
 pub mod csr;
 pub mod domain_anchors;
+#[cfg(target_os = "linux")]
+pub(crate) mod handshake;
 pub mod issuer_profile_wire;
 mod lib;
 #[cfg(any(test, feature = "testing"))]

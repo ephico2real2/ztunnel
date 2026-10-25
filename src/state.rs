@@ -53,6 +53,7 @@ use tracing::{debug, trace, warn};
 
 use self::workload::ApplicationTunnel;
 
+pub(crate) mod outbound_source;
 pub mod policy;
 pub mod service;
 pub(crate) mod source_binding;

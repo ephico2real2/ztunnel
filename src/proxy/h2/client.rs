@@ -42,6 +42,9 @@ pub struct H2ConnectClient {
     stream_count: Arc<AtomicU16>,
     wl_key: WorkloadKey,
     profile_lease: Option<crate::tls::profile_provider::Lease>,
+    /// Exact local source observation this pooled transport was created for.
+    /// A different or withdrawn observation must never reuse it.
+    source_witness: Option<Arc<crate::state::outbound_source::OutboundSource>>,
     /// Set by the connection driver before it tears the connection down, for its streams to report.
     teardown: TeardownCause,
 }
@@ -72,6 +75,24 @@ impl H2ConnectClient {
     pub(crate) fn bind_profile(&mut self, lease: Option<crate::tls::profile_provider::Lease>) {
         self.profile_lease = lease;
     }
+    pub(crate) fn bind_source(
+        &mut self,
+        source: Option<Arc<crate::state::outbound_source::OutboundSource>>,
+    ) {
+        self.source_witness = source;
+    }
+    /// True only if this transport carries exactly the given observation. A
+    /// legacy (unwitnessed) transport matches only an unwitnessed request.
+    pub(crate) fn serves_source(
+        &self,
+        expected: Option<&crate::state::outbound_source::OutboundSource>,
+    ) -> bool {
+        match (self.source_witness.as_deref(), expected) {
+            (None, None) => true,
+            (Some(bound), Some(expected)) => bound.same_observation(expected),
+            _ => false,
+        }
+    }
     pub fn is_for_workload(&self, wl_key: &WorkloadKey) -> Result<(), crate::proxy::Error> {
         if !(self.wl_key == *wl_key) {
             Err(crate::proxy::Error::Generic(
@@ -100,6 +121,16 @@ impl H2ConnectClient {
         {
             return false;
         }
+        // The H2 driver observes a withdrawn source only when it is next
+        // polled. Checkout must not wait for that: a stale transport is
+        // discarded here so the caller opens a fresh one instead of failing.
+        if self
+            .source_witness
+            .as_ref()
+            .is_some_and(|source| source.check().is_err())
+        {
+            return false;
+        }
         let cx = &mut Context::from_waker(futures::task::noop_waker_ref());
         match self.sender.poll_ready(cx) {
             Poll::Ready(Ok(_)) => true,
@@ -120,6 +151,11 @@ impl H2ConnectClient {
     ) -> Result<(crate::proxy::h2::H2Stream, Option<Baggage>), Error> {
         if let Some(lease) = &self.profile_lease {
             lease.check_current().map_err(Error::Anyhow)?;
+        }
+        if let Some(source) = &self.source_witness {
+            source
+                .check()
+                .map_err(|_| Error::NativeOutboundSourceInvalidated)?;
         }
         let cur = self.stream_count.fetch_add(1, Ordering::SeqCst);
         trace!(current_streams = cur, "sending request");
@@ -244,6 +280,7 @@ pub(crate) async fn spawn_owned_connection(
         max_allowed_streams,
         wl_key,
         profile_lease: None,
+        source_witness: None,
         teardown,
     };
     Ok(c)

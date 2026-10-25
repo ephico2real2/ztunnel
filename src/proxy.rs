@@ -174,6 +174,8 @@ pub struct Proxy {
 
 pub struct LocalWorkloadInformation {
     wi: Arc<WorkloadInfo>,
+    // Original native ZDS owner; names and xDS are not its replacement authority.
+    bound_uid: Option<Strng>,
     state: DemandProxyState,
     // full_cert_manager gives access to the full SecretManager. This MUST only be given restricted
     // access to the appropriate certificates
@@ -190,14 +192,25 @@ impl LocalWorkloadInformation {
     ) -> LocalWorkloadInformation {
         LocalWorkloadInformation {
             wi,
+            bound_uid: None,
             state,
             full_cert_manager: cert_manager,
             cfg: cfg.clone(),
         }
     }
 
+    pub(crate) fn with_uid(mut self, uid: Option<Strng>) -> Self {
+        self.bound_uid = uid;
+        self
+    }
+    pub(crate) fn bound_uid(&self) -> Option<&Strng> {
+        self.bound_uid.as_ref()
+    }
     pub async fn get_workload(&self) -> Result<Arc<Workload>, Error> {
-        get_workload(&self.state, self.wi.clone()).await
+        if self.cfg.require_mesh_hbone && self.bound_uid.is_none() {
+            return Err(Error::UnknownSourceWorkload(self.wi.clone()));
+        }
+        get_bound_workload(&self.state, self.wi.clone(), self.bound_uid.as_ref()).await
     }
 
     pub async fn fetch_certificate(
@@ -248,7 +261,11 @@ impl LocalWorkloadInformation {
     }
 
     pub fn as_fetcher(&self) -> Arc<LocalWorkloadFetcher> {
-        LocalWorkloadFetcher::new(self.wi.clone(), self.state.clone())
+        Arc::new(LocalWorkloadFetcher {
+            wi: self.wi.clone(),
+            state: self.state.clone(),
+            bound_uid: self.bound_uid.clone(),
+        })
     }
 }
 
@@ -257,16 +274,37 @@ impl LocalWorkloadInformation {
 /// to certificates.
 pub struct LocalWorkloadFetcher {
     wi: Arc<WorkloadInfo>,
+    bound_uid: Option<Strng>,
     state: DemandProxyState,
 }
 
 impl LocalWorkloadFetcher {
     pub fn new(wi: Arc<WorkloadInfo>, state: DemandProxyState) -> Arc<Self> {
-        Arc::new(LocalWorkloadFetcher { wi, state })
+        Arc::new(LocalWorkloadFetcher {
+            wi,
+            state,
+            bound_uid: None,
+        })
     }
     pub async fn get_workload(&self) -> Result<Arc<Workload>, Error> {
-        get_workload(&self.state, self.wi.clone()).await
+        get_bound_workload(&self.state, self.wi.clone(), self.bound_uid.as_ref()).await
     }
+}
+
+async fn get_bound_workload(
+    state: &DemandProxyState,
+    wi: Arc<WorkloadInfo>,
+    bound_uid: Option<&Strng>,
+) -> Result<Arc<Workload>, Error> {
+    if let Some(uid) = bound_uid {
+        return state
+            .read()
+            .workloads
+            .find_uid(uid)
+            .filter(|workload| wi.matches(workload))
+            .ok_or_else(|| Error::UnknownSourceWorkload(wi.clone()));
+    }
+    get_workload(state, wi).await
 }
 
 async fn get_workload(
@@ -511,6 +549,9 @@ pub enum Error {
 
     #[error("connection closed due to policy rejection: {0}")]
     AuthorizationPolicyRejection(AuthorizationRejectionError),
+
+    #[error("native outbound source observation invalidated")]
+    NativeOutboundSourceInvalidated,
 
     #[error("pool draining")]
     WorkloadHBONEPoolDraining,
