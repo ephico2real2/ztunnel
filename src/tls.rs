@@ -21,6 +21,7 @@ pub mod issuer_profile_wire;
 mod lib;
 #[cfg(any(test, feature = "testing"))]
 pub mod mock;
+pub(crate) mod native_crl;
 #[cfg(target_os = "linux")]
 pub mod profile_checkpoint;
 #[cfg(target_os = "linux")]

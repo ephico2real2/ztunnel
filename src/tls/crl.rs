@@ -49,6 +49,7 @@ pub struct CrlManager {
     index: RevocationIndex,
     /// Monotonic counter bumped on every CRL set reload
     generation: Arc<AtomicU64>,
+    native_changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl std::fmt::Debug for CrlManager {
@@ -67,10 +68,37 @@ struct CrlManagerInner {
     /// None = not loaded, Some = loaded (may be empty)
     crl_ders: Option<Arc<Vec<CertificateRevocationListDer<'static>>>>,
     crl_path: PathBuf,
+    native_history: std::collections::VecDeque<NativeObservation>,
+    native_sequence: u64,
     // WARNING: must use FileIdMap, NOT NoCache. Kubernetes secret/configmap volume updates
     // use atomic symlink swaps — FileIdMap tracks inode identity across renames so these
     // are detected correctly. NoCache silently misses them, breaking CRL hot-reload entirely.
     _debouncer: Option<Debouncer<RecommendedWatcher, FileIdMap>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct NativeObservation {
+    pub sequence: u64,
+    pub ders: Option<Arc<Vec<CertificateRevocationListDer<'static>>>>,
+}
+impl CrlManagerInner {
+    fn record_native(
+        &mut self,
+        ders: Option<Arc<Vec<CertificateRevocationListDer<'static>>>>,
+    ) -> u64 {
+        self.native_sequence = self
+            .native_sequence
+            .checked_add(1)
+            .expect("native CRL sequence exhausted");
+        self.native_history.push_back(NativeObservation {
+            sequence: self.native_sequence,
+            ders,
+        });
+        while self.native_history.len() > 32 {
+            self.native_history.pop_front();
+        }
+        self.native_sequence
+    }
 }
 
 impl CrlManager {
@@ -84,10 +112,13 @@ impl CrlManager {
                 crls: None,
                 crl_ders: None,
                 crl_path: crl_path.clone(),
+                native_history: std::collections::VecDeque::new(),
+                native_sequence: 0,
                 _debouncer: None,
             })),
             index: RevocationIndex::new(metrics),
             generation: Arc::new(AtomicU64::new(0)),
+            native_changes: tokio::sync::watch::channel(0).0,
         };
 
         // try to load the CRL, but don't fail if the file doesn't exist yet
@@ -129,17 +160,73 @@ impl CrlManager {
         // Snapshot the path under a brief read lock, then release it before blocking on I/O.
         let crl_path = self.inner.read().unwrap().crl_path.clone();
 
-        let (crls, crl_ders) = Self::parse_crl_file(&crl_path)?;
+        let (crls, crl_ders) = match Self::parse_crl_file(&crl_path) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                // Native strict consumers cannot retain coverage after a
+                // failed observation. Legacy cached-good policy is unchanged.
+                let sequence = self.inner.write().unwrap().record_native(None);
+                self.native_changes.send_replace(sequence);
+                return Err(error);
+            }
+        };
 
         // Swap in the finished set under a brief write lock.
-        {
+        let sequence = {
             let mut inner = self.inner.write().unwrap();
             inner.crls = Some(Arc::new(crls));
-            inner.crl_ders = Some(Arc::new(crl_ders));
-        }
+            let der = Arc::new(crl_ders);
+            inner.crl_ders = Some(der.clone());
+            // Do not retain oversized generic sets in the bounded native log.
+            let bounded = der.len() <= 32
+                && der
+                    .iter()
+                    .try_fold(0usize, |n, d| n.checked_add(d.as_ref().len()))
+                    .is_some_and(|n| n <= 1024 * 1024);
+            inner.record_native(bounded.then_some(der))
+        };
         // bump generation so connections being simultaneously registered re-verify
         self.generation.fetch_add(1, Ordering::Release);
+        self.native_changes.send_replace(sequence);
         Ok(())
+    }
+
+    /// Bounded public observations; an unavailable observation is not erased
+    /// by a fast successful recovery before an idle owner gets scheduled.
+    pub(crate) fn native_snapshot(&self) -> anyhow::Result<NativeObservation> {
+        self.inner
+            .read()
+            .unwrap()
+            .native_history
+            .back()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("native CRL source not observed"))
+    }
+    pub(crate) fn native_since(&self, sequence: u64) -> anyhow::Result<Vec<NativeObservation>> {
+        let inner = self.inner.read().unwrap();
+        anyhow::ensure!(
+            sequence <= inner.native_sequence,
+            "native CRL observation rollback"
+        );
+        if sequence == inner.native_sequence {
+            return Ok(Vec::new());
+        }
+        anyhow::ensure!(
+            inner
+                .native_history
+                .front()
+                .is_some_and(|o| o.sequence <= sequence.saturating_add(1)),
+            "native CRL observation history overflow; owner must close"
+        );
+        Ok(inner
+            .native_history
+            .iter()
+            .filter(|o| o.sequence > sequence)
+            .cloned()
+            .collect())
+    }
+    pub(crate) fn subscribe_native(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.native_changes.subscribe()
     }
 
     /// Current CRL-reload generation.

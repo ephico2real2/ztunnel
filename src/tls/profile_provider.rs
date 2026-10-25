@@ -583,7 +583,11 @@ impl Lease {
         expected: &[Identity],
         crl: Option<&Arc<tls::crl::CrlManager>>,
         reporter: Reporter,
-    ) -> Result<(VerifiedPeer, Option<RevocationHandle>)> {
+    ) -> Result<(
+        VerifiedPeer,
+        Option<RevocationHandle>,
+        Option<Arc<super::native_crl::Coverage>>,
+    )> {
         let active = self.provider.current(self)?;
         let chain = ssl.peer_certificates().context("TLS peer chain missing")?;
         let (leaf, intermediates) = chain.split_first().context("TLS peer leaf missing")?;
@@ -607,15 +611,26 @@ impl Lease {
             .current_unfenced_signer(&peer.identity().trust_domain(), peer.signer_spki(), now)
             .context("peer issuer fenced")?;
         let mut roots = RootCertStore::empty();
-        roots.add(signer)?;
+        roots.add(signer.clone())?;
         let roots = Arc::new(roots);
         let usage = match role {
             PeerRole::Client => webpki::KeyUsage::client_auth(),
             PeerRole::Server => webpki::KeyUsage::server_auth(),
         };
-        let crls = crl.map(|c| c.get_crls()).unwrap_or_default();
-        verify_cert_chain(leaf, intermediates, &roots, time, usage, &crls)
-            .map_err(|e| anyhow::anyhow!("current peer CRL verification: {e:?}"))?;
+        let coverage = if let Some(manager) = crl {
+            Some(super::native_crl::Coverage::new(
+                manager.clone(),
+                leaf.clone().into_owned(),
+                signer,
+                role,
+                self.provider.clock,
+            )?)
+        } else {
+            // Feature disabled is explicit. Authority pins/session still apply.
+            verify_cert_chain(leaf, intermediates, &roots, time, usage, &[])
+                .map_err(|e| anyhow::anyhow!("current peer signature verification: {e:?}"))?;
+            None
+        };
         let revocation = crl.map(|c| {
             c.register(ConnRegistration::from_conn(
                 ssl,
@@ -628,7 +643,7 @@ impl Lease {
         // Registration and all crypto occurred while the publication could have
         // changed. Recheck current epoch/session before releasing application I/O.
         self.provider.current(self)?;
-        Ok((peer, revocation))
+        Ok((peer, revocation, coverage))
     }
     async fn invalidated(self, peer: Option<VerifiedPeer>, local_deadline: SystemTime) {
         let mut changes = self.provider.subscribe();
@@ -688,6 +703,7 @@ pub(crate) struct ProfileIo<IO> {
     peer: Option<VerifiedPeer>,
     invalid: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
     flow: Option<Flow>,
+    crl_coverage: Option<Arc<super::native_crl::Coverage>>,
 }
 impl<IO: Unpin> ProfileIo<IO> {
     /// Inspect TLS metadata without exposing mutable unchecked application I/O.
@@ -729,6 +745,7 @@ impl<IO: Unpin> ProfileIo<IO> {
             peer: None,
             invalid,
             flow,
+            crl_coverage: None,
         })
     }
     fn set_peer(&mut self, peer: VerifiedPeer) {
@@ -758,6 +775,22 @@ impl<IO: Unpin> ProfileIo<IO> {
             }
         }));
     }
+    fn set_crl_coverage(&mut self, coverage: Arc<super::native_crl::Coverage>) {
+        let clock = self
+            .lease
+            .as_ref()
+            .expect("native CRL requires profile lease")
+            .provider
+            .clock;
+        self.crl_coverage = Some(coverage.clone());
+        let previous = self.invalid.take();
+        self.invalid = Some(Box::pin(async move {
+            tokio::select! {
+                _=async {match previous {Some(f)=>f.await,None=>std::future::pending().await}}=>{},
+                _=coverage.invalidated(clock)=>{},
+            }
+        }));
+    }
     fn check(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
         // Do not rely solely on a sleeping future: wall time can jump or a VM
         // can resume while the monotonic timer has not fired. Recheck on every
@@ -776,8 +809,18 @@ impl<IO: Unpin> ProfileIo<IO> {
                     ) == super::domain_anchors::RetainedDecision::Drain
                 })
         });
+        let missing_coverage = self.crl_coverage.as_ref().is_some_and(|coverage| {
+            let clock = self
+                .lease
+                .as_ref()
+                .expect("native CRL lease")
+                .provider
+                .clock;
+            coverage.current(clock).is_err()
+        });
         if self.io.is_none()
             || invalid_now
+            || missing_coverage
             || self
                 .invalid
                 .as_mut()
@@ -861,8 +904,8 @@ pub(crate) async fn accept<IO: AsyncRead + AsyncWrite + Unpin>(
         .accept(wrapped)
         .await
         .map_err(tls::TlsError::Handshake)?;
-    let (peer, revocation) = if let Some(lease) = &lease {
-        let (peer, revocation) = lease
+    let (peer, revocation, coverage) = if let Some(lease) = &lease {
+        let (peer, revocation, coverage) = lease
             .peer(
                 stream.get_ref().1,
                 PeerRole::Client,
@@ -879,7 +922,10 @@ pub(crate) async fn accept<IO: AsyncRead + AsyncWrite + Unpin>(
                     .map_err(tls::TlsError::Handshake)?,
             );
         }
-        (Some(peer), revocation)
+        if let Some(coverage) = &coverage {
+            stream.get_mut().0.set_crl_coverage(coverage.clone());
+        }
+        (Some(peer), revocation, coverage)
     } else {
         (
             None,
@@ -892,6 +938,7 @@ pub(crate) async fn accept<IO: AsyncRead + AsyncWrite + Unpin>(
                     Reporter::destination,
                 ))
             }),
+            None,
         )
     };
     let configured = lease.is_some();
@@ -899,6 +946,9 @@ pub(crate) async fn accept<IO: AsyncRead + AsyncWrite + Unpin>(
         .map_err(|e| tls::TlsError::Handshake(io_error(e)))?;
     if let Some(peer) = peer {
         application.set_peer(peer);
+    }
+    if let Some(coverage) = coverage {
+        application.set_crl_coverage(coverage);
     }
     if configured && let Some(handle) = &revocation {
         application.set_revocation(
@@ -931,8 +981,8 @@ pub(crate) async fn connect<IO: AsyncRead + AsyncWrite + Unpin>(
     let mut stream = tokio_rustls::TlsConnector::from(Arc::new(config))
         .connect(name, wrapped)
         .await?;
-    let (peer, revocation) = if let Some(lease) = &lease {
-        let (peer, revocation) = lease
+    let (peer, revocation, coverage) = if let Some(lease) = &lease {
+        let (peer, revocation, coverage) = lease
             .peer(
                 stream.get_ref().1,
                 PeerRole::Server,
@@ -948,7 +998,10 @@ pub(crate) async fn connect<IO: AsyncRead + AsyncWrite + Unpin>(
                 .0
                 .set_revocation(handle.tracked_receiver()?);
         }
-        (Some(peer), revocation)
+        if let Some(coverage) = &coverage {
+            stream.get_mut().0.set_crl_coverage(coverage.clone());
+        }
+        (Some(peer), revocation, coverage)
     } else {
         (
             None,
@@ -961,12 +1014,16 @@ pub(crate) async fn connect<IO: AsyncRead + AsyncWrite + Unpin>(
                     Reporter::source,
                 ))
             }),
+            None,
         )
     };
     let configured = lease.is_some();
     let mut application = ProfileIo::new(stream, lease, deadline).map_err(io_error)?;
     if let Some(peer) = peer {
         application.set_peer(peer);
+    }
+    if let Some(coverage) = coverage {
+        application.set_crl_coverage(coverage);
     }
     if configured && let Some(handle) = &revocation {
         application.set_revocation(handle.tracked_receiver()?);
@@ -2110,6 +2167,317 @@ mod tests {
             let _ = stop_tx.send(true);
             server_task.abort();
             let _ = server_task.await;
+        }
+    }
+    fn native_crl_window(signer: &Ca, revoked: bool, number: u64, start: i64, end: i64) -> String {
+        use rcgen::{
+            CertificateRevocationListParams, KeyIdMethod, RevocationReason, RevokedCertParams,
+            SerialNumber,
+        };
+        let now = time::OffsetDateTime::now_utc();
+        CertificateRevocationListParams {
+            this_update: now + time::Duration::seconds(start),
+            next_update: now + time::Duration::seconds(end),
+            crl_number: SerialNumber::from(number),
+            issuing_distribution_point: None,
+            revoked_certs: if revoked {
+                vec![RevokedCertParams {
+                    serial_number: SerialNumber::from(42u64),
+                    revocation_time: now,
+                    reason_code: Some(RevocationReason::KeyCompromise),
+                    invalidity_date: None,
+                }]
+            } else {
+                vec![]
+            },
+            key_identifier_method: KeyIdMethod::Sha256,
+        }
+        .signed_by(signer)
+        .unwrap()
+        .pem()
+        .unwrap()
+    }
+
+    #[test]
+    fn native_strict_crl_denies_unknown_stale_wrong_key_ambiguous_and_recovers_signed_empty() {
+        use super::super::native_crl::Coverage;
+        let root = ca("root", None);
+        let signer = ca("same-issuer-name", Some(&root));
+        let wrong_key = ca("same-issuer-name", Some(&root));
+        let cert = workload("cmtc-a.mesh.example", &signer);
+        for case in [
+            "missing",
+            "empty",
+            "wrong-key-same-DN",
+            "expired",
+            "future",
+            "revoked",
+            "duplicate",
+            "oversized-count",
+        ] {
+            let directory = dir();
+            let path = directory.path().join("crl.pem");
+            let valid = native_crl_window(&signer, false, 1, -1, 86400);
+            let data = match case {
+                "missing" => None,
+                "empty" => Some(String::new()),
+                "wrong-key-same-DN" => Some(native_crl_window(&wrong_key, false, 1, -1, 86400)),
+                "expired" => Some(native_crl_window(&signer, false, 1, -172800, -86400)),
+                "future" => Some(native_crl_window(&signer, false, 1, 3600, 86400)),
+                "revoked" => Some(native_crl_window(&signer, true, 1, -1, 86400)),
+                "duplicate" => Some(valid.clone() + &valid),
+                "oversized-count" => Some(valid.repeat(33)),
+                _ => unreachable!(),
+            };
+            if let Some(data) = data {
+                std::fs::write(&path, data).unwrap();
+            }
+            let manager = Arc::new(
+                tls::crl::CrlManager::new(
+                    path.clone(),
+                    crate::test_helpers::helpers::test_proxy_metrics(),
+                )
+                .unwrap(),
+            );
+            for role in [PeerRole::Client, PeerRole::Server] {
+                assert!(
+                    Coverage::new(
+                        manager.clone(),
+                        cert.cert.der.clone(),
+                        signer.der().clone(),
+                        role,
+                        SystemTime::now
+                    )
+                    .is_err(),
+                    "native Some(manager) must deny {case}, role={role:?}"
+                );
+            }
+            std::fs::write(&path, native_crl_window(&signer, false, 2, -1, 86400)).unwrap();
+            manager.load_crl().unwrap();
+            for role in [PeerRole::Client, PeerRole::Server] {
+                let coverage = Coverage::new(
+                    manager.clone(),
+                    cert.cert.der.clone(),
+                    signer.der().clone(),
+                    role,
+                    SystemTime::now,
+                )
+                .unwrap();
+                coverage.current(SystemTime::now).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn native_strict_crl_retains_failure_observations_and_history_overflow_closes_old_owners() {
+        use super::super::native_crl::Coverage;
+        let root = ca("root", None);
+        let signer = ca("same", Some(&root));
+        let wrong = ca("same", Some(&root));
+        let cert = workload("cmtc-a.mesh.example", &signer);
+        for case in ["failed-read", "wrong-key", "overflow"] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let path = file.path();
+            std::fs::write(path, native_crl_window(&signer, false, 1, -1, 86400)).unwrap();
+            let manager = Arc::new(
+                tls::crl::CrlManager::new(
+                    path.to_path_buf(),
+                    crate::test_helpers::helpers::test_proxy_metrics(),
+                )
+                .unwrap(),
+            );
+            let old = Coverage::new(
+                manager.clone(),
+                cert.cert.der.clone(),
+                signer.der().clone(),
+                PeerRole::Client,
+                SystemTime::now,
+            )
+            .unwrap();
+            match case {
+                "failed-read" => {
+                    std::fs::write(path, b"invalid CRL DER").unwrap();
+                    assert!(manager.load_crl().is_err());
+                    // Native failure does not erase the existing generic legacy cache.
+                    assert!(!manager.get_crls().is_empty());
+                }
+                "wrong-key" => {
+                    std::fs::write(path, native_crl_window(&wrong, false, 2, -1, 86400)).unwrap();
+                    manager.load_crl().unwrap();
+                }
+                "overflow" => {
+                    for number in 2..36 {
+                        std::fs::write(path, native_crl_window(&signer, false, number, -1, 86400))
+                            .unwrap();
+                        manager.load_crl().unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            // A fast successful recovery must NOT erase the failed interval
+            // before a sleeping stream gets polled. New TLS is the recovery.
+            std::fs::write(path, native_crl_window(&signer, false, 40, -1, 86400)).unwrap();
+            manager.load_crl().unwrap();
+            assert!(
+                old.current(SystemTime::now).is_err(),
+                "old owner must close after {case}"
+            );
+            Coverage::new(
+                manager.clone(),
+                cert.cert.der.clone(),
+                signer.der().clone(),
+                PeerRole::Client,
+                SystemTime::now,
+            )
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn native_strict_crl_idle_expiry_closes_actual_tls_both_roles_then_new_signed_empty_recovers()
+     {
+        for inbound in [true, false] {
+            let root = ca("root", None);
+            let a = ca("a", Some(&root));
+            let b = ca("b", Some(&root));
+            let ca = workload("cmtc-a.mesh.example", &a);
+            let cb = workload("cmtc-b.mesh.example", &b);
+            let wa = live_wire("cmtc-a", &root, &a, &b);
+            let wb = live_wire("cmtc-b", &root, &a, &b);
+            let ea = expected(&wa);
+            let eb = expected(&wb);
+            let da = dir();
+            let db = dir();
+            let (pa, ga, sa) = opened(da.path(), &ea, SystemTime::now);
+            let (pb, gb, sb) = opened(db.path(), &eb, SystemTime::now);
+            pa.commit(decode(&wa, &ea, SystemTime::now)).unwrap();
+            pb.commit(decode(&wb, &eb, SystemTime::now)).unwrap();
+            ready(&pa, &ga, sa);
+            ready(&pb, &gb, sb);
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let signer = if inbound { &a } else { &b };
+            std::fs::write(file.path(), native_crl_window(signer, false, 1, -1, 5)).unwrap();
+            let manager = Arc::new(
+                tls::crl::CrlManager::new(
+                    file.path().to_path_buf(),
+                    crate::test_helpers::helpers::test_proxy_metrics(),
+                )
+                .unwrap(),
+            );
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = async {
+                connect(
+                    ca.clone(),
+                    Some(pa.acquire().unwrap()),
+                    TcpStream::connect(address).await.unwrap(),
+                    vec![cb.identity().unwrap()],
+                    (!inbound).then(|| manager.clone()),
+                )
+                .await
+                .unwrap()
+            };
+            let server = async {
+                let (raw, _) = listener.accept().await.unwrap();
+                accept(
+                    cb.clone(),
+                    Some(pb.acquire().unwrap()),
+                    raw,
+                    inbound.then(|| manager.clone()),
+                )
+                .await
+                .unwrap()
+            };
+            let ((mut client, client_handle), (mut server, server_handle)) =
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(client, server)
+                })
+                .await
+                .unwrap();
+            client.write_all(b"proof").await.unwrap();
+            let mut data = [0; 5];
+            server.read_exact(&mut data).await.unwrap();
+            assert_eq!(&data, b"proof");
+            // The configured side waits without application traffic. No file
+            // reload or forced invalidation drives this: signed nextUpdate does.
+            if inbound {
+                let waiting = tokio::spawn(async move {
+                    let _handle = server_handle;
+                    let mut byte = [0];
+                    server.read(&mut byte).await
+                });
+                tokio::task::yield_now().await;
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(6)).await;
+                let denied = waiting.await.unwrap();
+                tokio::time::resume();
+                assert!(denied.is_err());
+                let mut byte = [0];
+                let peer = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+                    .await
+                    .unwrap();
+                assert!(peer.is_err() || matches!(peer, Ok(0)));
+                drop(client_handle);
+            } else {
+                let waiting = tokio::spawn(async move {
+                    let _handle = client_handle;
+                    let mut byte = [0];
+                    client.read(&mut byte).await
+                });
+                tokio::task::yield_now().await;
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(6)).await;
+                let denied = waiting.await.unwrap();
+                tokio::time::resume();
+                assert!(denied.is_err());
+                let mut byte = [0];
+                let peer = tokio::time::timeout(Duration::from_secs(2), server.read(&mut byte))
+                    .await
+                    .unwrap();
+                assert!(peer.is_err() || matches!(peer, Ok(0)));
+                drop(server_handle);
+            }
+            assert!(
+                ga.is_open() && gb.is_open(),
+                "CRL expiry must not manufacture an ADS authority change"
+            );
+            std::fs::write(file.path(), native_crl_window(signer, false, 2, -1, 86400)).unwrap();
+            manager.load_crl().unwrap();
+            // Same provider/session, fresh signed CRL, completely new TLS flow.
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = async {
+                connect(
+                    ca.clone(),
+                    Some(pa.acquire().unwrap()),
+                    TcpStream::connect(address).await.unwrap(),
+                    vec![cb.identity().unwrap()],
+                    (!inbound).then(|| manager.clone()),
+                )
+                .await
+                .unwrap()
+            };
+            let server = async {
+                let (raw, _) = listener.accept().await.unwrap();
+                accept(
+                    cb.clone(),
+                    Some(pb.acquire().unwrap()),
+                    raw,
+                    inbound.then(|| manager.clone()),
+                )
+                .await
+                .unwrap()
+            };
+            let ((mut client, _client_handle), (mut server, _server_handle)) =
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::join!(client, server)
+                })
+                .await
+                .unwrap();
+            client.write_all(b"fresh").await.unwrap();
+            let mut data = [0; 5];
+            server.read_exact(&mut data).await.unwrap();
+            assert_eq!(&data, b"fresh");
         }
     }
 }
