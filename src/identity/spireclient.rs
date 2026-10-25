@@ -271,21 +271,20 @@ impl<C: DelegatedIdentityApi> SpireClient<C> {
                 Error::FailedToFetchCertificate(format!("Failed to stream X.509 SVIDs: {e}"))
             })?;
 
-            // SPIRE may deliver multiple responses, but we only need the first successful one
+            // The first response is authoritative for this fetch. In particular,
+            // the delegated API sends an empty response when no workload SVID
+            // matches. Do not wait through empty, malformed or failed responses
+            // and later accept a certificate on this same attestation attempt.
             tokio::pin!(stream);
-            while let Some(svid_response) = stream.next().await {
-                match svid_response {
-                    Ok(response) => {
-                        return Ok(response);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Error receiving SVID response: {}", e);
-                    }
-                }
+            match stream.next().await {
+                Some(Ok(response)) => Ok(response),
+                Some(Err(e)) => Err(Error::FailedToFetchCertificate(format!(
+                    "Failed to receive X.509 SVID: {e}"
+                ))),
+                None => Err(Error::FailedToFetchCertificate(
+                    "No SVIDs received in stream".to_string(),
+                )),
             }
-            Err(Error::FailedToFetchCertificate(
-                "No SVIDs received in stream".to_string(),
-            ))
         })
         .await;
 
@@ -928,7 +927,125 @@ pub mod spire_tests {
         assert!(result.is_err());
 
         let err = result.err().unwrap().to_string();
-        assert!(err.contains("Timeout while waiting for SVID stream"));
+        assert!(err.contains("Failed to receive X.509 SVID: empty Workload API response"));
+    }
+
+    fn stream_test_client(api: MockDelegatedIdentityApi) -> SpireClient<MockDelegatedIdentityApi> {
+        let mut cfg = config::parse_config().unwrap();
+        cfg.spire_enabled = true;
+        cfg.spire_timeout = std::time::Duration::from_secs(1);
+        SpireClient::new_with_test_binder(
+            api,
+            "example.org".into(),
+            Box::new(MockPidClientTrait::new()),
+            Arc::new(cfg),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_error_is_terminal_even_when_followed_by_valid_svid() {
+        for error in [
+            GrpcClientError::EmptyResponse,
+            GrpcClientError::Grpc(tonic::Status::permission_denied("no identity issued")),
+            GrpcClientError::Grpc(tonic::Status::unauthenticated("delegate rejected")),
+            GrpcClientError::Grpc(tonic::Status::unavailable("agent restarting")),
+        ] {
+            let expected = error.to_string();
+            let mut api = MockDelegatedIdentityApi::new();
+            let mut first = Some(error);
+            api.expect_get_x509_svids().times(1).returning(move |_| {
+                Ok(Box::new(tokio_stream::iter(vec![
+                    Err(first.take().unwrap()),
+                    Ok(generate_svid(
+                        "spiffe://example.org/ns/default/sa/test-sa",
+                        "example.org",
+                    )),
+                ])))
+            });
+            api.expect_get_x509_bundles().times(0);
+            let client = stream_test_client(api);
+            let start = tokio::time::Instant::now();
+            let error = client
+                .subscribe_and_wait_for_workload_cert(DelegateAttestationRequest::Pid(10))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("Failed to receive X.509 SVID: {expected}")));
+            assert!(!error.contains("Timeout"));
+            assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_response_does_not_wait_for_another_update() {
+        let mut api = MockDelegatedIdentityApi::new();
+        api.expect_get_x509_svids().times(1).returning(|_| {
+            Ok(Box::new(
+                tokio_stream::iter(vec![Err(GrpcClientError::EmptyResponse)])
+                    .chain(tokio_stream::pending()),
+            ))
+        });
+        let client = stream_test_client(api);
+        let start = tokio::time::Instant::now();
+        let error = client
+            .subscribe_and_wait_for_workload_cert(DelegateAttestationRequest::Pid(10))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("empty Workload API response"));
+        assert!(!error.contains("Timeout"));
+        assert_eq!(start.elapsed(), std::time::Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_stream_times_out_without_claiming_no_identity_or_denial() {
+        let mut api = MockDelegatedIdentityApi::new();
+        api.expect_get_x509_svids()
+            .times(1)
+            .returning(|_| Ok(Box::new(tokio_stream::pending())));
+        let client = stream_test_client(api);
+        let error = client
+            .subscribe_and_wait_for_workload_cert(DelegateAttestationRequest::Pid(10))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Timeout while waiting for SVID stream"));
+        assert!(!error.contains("empty Workload API response"));
+        assert!(!error.contains("permission"));
+        assert!(!error.contains("no identity issued"));
+    }
+
+    #[tokio::test]
+    async fn a_new_fetch_can_recover_after_an_explicit_empty_response() {
+        let mut api = MockDelegatedIdentityApi::new();
+        let mut calls = 0;
+        api.expect_get_x509_svids().times(2).returning(move |_| {
+            calls += 1;
+            if calls == 1 {
+                Ok(Box::new(tokio_stream::iter(vec![Err(
+                    GrpcClientError::EmptyResponse,
+                )])))
+            } else {
+                Ok(mock_stream_svid_success_response(
+                    "spiffe://example.org/ns/default/sa/test-sa".into(),
+                ))
+            }
+        });
+        let client = stream_test_client(api);
+        let error = client
+            .subscribe_and_wait_for_workload_cert(DelegateAttestationRequest::Pid(10))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("empty Workload API response"));
+        let svid = client
+            .subscribe_and_wait_for_workload_cert(DelegateAttestationRequest::Pid(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            svid.spiffe_id().to_string(),
+            "spiffe://example.org/ns/default/sa/test-sa"
+        );
     }
 
     fn test_workload_info() -> Arc<WorkloadInfo> {
@@ -982,8 +1099,6 @@ pub mod spire_tests {
     ) -> Box<dyn Stream<Item = Result<X509Svid, GrpcClientError>> + Send + Unpin> {
         let (mut tx, rx) = mpsc::channel(10);
         tokio::spawn(async move {
-            tx.send(Err(GrpcClientError::EmptyResponse)).await.unwrap();
-
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
             let svid = generate_svid(&spiffe_id, "example.org");
@@ -1193,6 +1308,32 @@ pub mod spire_tests {
         assert!(error.to_string().contains("changed after attestation"));
         assert_eq!(leases.load(Ordering::SeqCst), 0);
     }
+    #[tokio::test]
+    async fn stream_error_stops_fetch_before_bundle_and_releases_process_binding() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let alive = Arc::new(AtomicBool::new(true));
+        let leases = Arc::new(AtomicUsize::new(0));
+        let mut api = MockDelegatedIdentityApi::new();
+        api.expect_get_x509_svids().times(1).returning(|_| {
+            Ok(Box::new(tokio_stream::iter(vec![
+                Err(GrpcClientError::EmptyResponse),
+                Ok(generate_svid(
+                    "spiffe://example.org/ns/default/sa/test-sa",
+                    "example.org",
+                )),
+            ])))
+        });
+        api.expect_get_x509_bundles().times(0);
+        let mut pid = MockPidClientTrait::new();
+        pid.expect_fetch_pid()
+            .times(2)
+            .returning(|_| Ok(WorkloadPid::new(10)));
+        let client = guarded_client(api, Box::new(pid), alive, leases.clone());
+        let error = client.fetch_certificate(&test_key()).await.unwrap_err();
+        assert!(error.to_string().contains("empty Workload API response"));
+        assert_eq!(leases.load(Ordering::SeqCst), 0);
+    }
+
     struct HangingBundle;
     #[async_trait]
     impl DelegatedIdentityApi for HangingBundle {
