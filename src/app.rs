@@ -106,6 +106,11 @@ pub async fn build_with_cert(
         std::mem::drop(state_mgr_task);
     });
     let state = state_mgr.state();
+    if let Some(provider) = state.profile_provider() {
+        ready.register_dynamic("native issuer profile/session", move || {
+            provider.acquire().is_ok()
+        })?;
+    }
 
     // Run the XDS state manager in the current tokio worker pool.
     tokio::spawn(state_mgr.run());

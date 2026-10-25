@@ -110,6 +110,7 @@ pub struct Decoded {
     pub generation: u64,
     pub approval_digest: String,
     pub publication_digest: String,
+    pub published_at: SystemTime,
     pub valid_until: SystemTime,
     pub bindings: Vec<ClusterBinding>,
     // None is an explicit tombstone. Some is only verified material; runtime
@@ -293,6 +294,7 @@ pub fn decode(data: &[u8], expected: &Expected, now: SystemTime) -> Result<Decod
             generation,
             approval_digest: w.approval_digest,
             publication_digest: w.publication_digest,
+            published_at: at,
             valid_until: until,
             bindings: Vec::new(),
             candidate: None,
@@ -395,6 +397,7 @@ pub fn decode(data: &[u8], expected: &Expected, now: SystemTime) -> Result<Decod
         generation,
         approval_digest: w.approval_digest,
         publication_digest: w.publication_digest,
+        published_at: at,
         valid_until: until,
         bindings,
         candidate: Some(set),

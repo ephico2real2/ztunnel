@@ -528,6 +528,8 @@ pub struct DemandProxyState {
     /// fully accepted xDS snapshot and whether old inbound streams were drained.
     #[serde(skip_serializing)]
     xds_session: Option<crate::xds::XdsSessionGate>,
+    #[serde(skip_serializing)]
+    profile_provider: Option<Arc<crate::tls::profile_provider::ProfileProvider>>,
     #[serde(flatten)]
     state: Arc<RwLock<ProxyState>>,
 
@@ -587,6 +589,7 @@ impl DemandProxyState {
         Self {
             require_inbound_mtls: false,
             xds_session: None,
+            profile_provider: None,
             state,
             demand,
             dns_resolver,
@@ -604,6 +607,18 @@ impl DemandProxyState {
         self
     }
 
+    pub(crate) fn with_profile_provider(
+        mut self,
+        provider: Option<Arc<crate::tls::profile_provider::ProfileProvider>>,
+    ) -> Self {
+        self.profile_provider = provider;
+        self
+    }
+    pub(crate) fn profile_provider(
+        &self,
+    ) -> Option<Arc<crate::tls::profile_provider::ProfileProvider>> {
+        self.profile_provider.clone()
+    }
     pub(crate) fn xds_session(&self) -> Option<crate::xds::XdsSessionGate> {
         self.xds_session.clone()
     }
@@ -1243,13 +1258,48 @@ impl ProxyStateManager {
         )));
         let xds_session = (config.require_inbound_mtls || config.require_mesh_hbone)
             .then(crate::xds::XdsSessionGate::new);
+        anyhow::ensure!(
+            config.issuer_profile_checkpoint_dir.is_some()
+                || !config.issuer_profile_checkpoint_bootstrap,
+            "checkpoint bootstrap requires an explicit checkpoint directory"
+        );
+        let expected = xds::Config::issuer_profile_expected(&config)?;
+        let profile_provider = match &config.issuer_profile_checkpoint_dir {
+            Some(directory) => {
+                let pins = expected.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("native provider requires independent issuer-profile pins")
+                })?;
+                let gate = xds_session.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("native provider requires a strict xDS session")
+                })?;
+                let mode = if config.issuer_profile_checkpoint_bootstrap {
+                    crate::tls::profile_checkpoint::OpenMode::BootstrapEmptyDirectory
+                } else {
+                    crate::tls::profile_checkpoint::OpenMode::Existing
+                };
+                Some(crate::tls::profile_provider::ProfileProvider::open(
+                    directory,
+                    pins,
+                    mode,
+                    gate.clone(),
+                )?)
+            }
+            None => None,
+        };
         let xds_client = if config.xds_address.is_some() {
             let updater = ProxyStateUpdater::new(state.clone(), cert_fetcher.clone());
             let tls_client_fetcher = Box::new(tls::ControlPlaneAuthentication::RootCert(
                 config.xds_root_cert.clone(),
             ));
-            let xds_config = xds::Config::new(config.clone(), tls_client_fetcher)
-                .with_configured_issuer_profile_probe(&config)?;
+            let xds_config = xds::Config::new(config.clone(), tls_client_fetcher);
+            let xds_config = if let Some(provider) = &profile_provider {
+                xds_config.with_issuer_profile_provider(
+                    expected.ok_or_else(|| anyhow::anyhow!("native provider pins missing"))?,
+                    provider.clone(),
+                )
+            } else {
+                xds_config.with_configured_issuer_profile_probe(&config)?
+            };
             let xds_config = if let Some(session) = &xds_session {
                 xds_config.with_session_gate(session.clone())
             } else {
@@ -1284,7 +1334,8 @@ impl ProxyStateManager {
                 proxy_metrics,
             )
             .with_require_inbound_mtls(config.require_inbound_mtls)
-            .with_xds_session(xds_session),
+            .with_xds_session(xds_session)
+            .with_profile_provider(profile_provider),
         })
     }
 
@@ -1294,7 +1345,17 @@ impl ProxyStateManager {
 
     pub async fn run(self) -> anyhow::Result<()> {
         match self.xds_client {
-            Some(xds) => xds.run().await.map_err(|e| anyhow::anyhow!(e)),
+            Some(xds) => {
+                if let Some(provider) = self.state.profile_provider() {
+                    let _runtime_guard = provider.runtime_guard();
+                    tokio::select! {
+                        result = xds.run() => { provider.fail_closed(); result.map_err(|e| anyhow::anyhow!(e)) },
+                        result = provider.clone().supervise() => { provider.fail_closed(); result },
+                    }
+                } else {
+                    xds.run().await.map_err(|e| anyhow::anyhow!(e))
+                }
+            }
             None => Ok(()),
         }
     }

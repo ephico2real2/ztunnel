@@ -23,6 +23,8 @@ mod lib;
 pub mod mock;
 #[cfg(target_os = "linux")]
 pub mod profile_checkpoint;
+#[cfg(target_os = "linux")]
+pub(crate) mod profile_provider;
 pub mod revocation;
 mod workload;
 

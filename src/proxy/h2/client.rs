@@ -41,6 +41,7 @@ pub struct H2ConnectClient {
     pub max_allowed_streams: u16,
     stream_count: Arc<AtomicU16>,
     wl_key: WorkloadKey,
+    profile_lease: Option<crate::tls::profile_provider::Lease>,
     /// Set by the connection driver before it tears the connection down, for its streams to report.
     teardown: TeardownCause,
 }
@@ -68,6 +69,9 @@ impl Display for WorkloadKey {
 }
 
 impl H2ConnectClient {
+    pub(crate) fn bind_profile(&mut self, lease: Option<crate::tls::profile_provider::Lease>) {
+        self.profile_lease = lease;
+    }
     pub fn is_for_workload(&self, wl_key: &WorkloadKey) -> Result<(), crate::proxy::Error> {
         if !(self.wl_key == *wl_key) {
             Err(crate::proxy::Error::Generic(
@@ -89,6 +93,13 @@ impl H2ConnectClient {
     }
 
     pub fn ready_to_use(&mut self) -> bool {
+        if self
+            .profile_lease
+            .as_ref()
+            .is_some_and(|lease| lease.check_current().is_err())
+        {
+            return false;
+        }
         let cx = &mut Context::from_waker(futures::task::noop_waker_ref());
         match self.sender.poll_ready(cx) {
             Poll::Ready(Ok(_)) => true,
@@ -107,6 +118,9 @@ impl H2ConnectClient {
         &mut self,
         req: http::Request<()>,
     ) -> Result<(crate::proxy::h2::H2Stream, Option<Baggage>), Error> {
+        if let Some(lease) = &self.profile_lease {
+            lease.check_current().map_err(Error::Anyhow)?;
+        }
         let cur = self.stream_count.fetch_add(1, Ordering::SeqCst);
         trace!(current_streams = cur, "sending request");
         let (send, recv, baggage) = match self.internal_send(req).await {
@@ -141,8 +155,14 @@ impl H2ConnectClient {
         // "This function must return `Ready` before `send_request` is called"
         // We should always be ready though, because we make sure we don't go over the max stream limit out of band.
         futures::future::poll_fn(|cx| self.sender.poll_ready(cx)).await?;
+        if let Some(lease) = &self.profile_lease {
+            lease.check_current().map_err(Error::Anyhow)?;
+        }
         let (response, stream) = self.sender.send_request(req, false)?;
         let response = response.await?;
+        if let Some(lease) = &self.profile_lease {
+            lease.check_current().map_err(Error::Anyhow)?;
+        }
         if response.status() != 200 {
             return Err(Error::HttpStatus(response.status()));
         }
@@ -200,6 +220,7 @@ pub async fn spawn_connection(
         stream_count: Arc::new(AtomicU16::new(0)),
         max_allowed_streams,
         wl_key,
+        profile_lease: None,
         teardown,
     };
     Ok(c)

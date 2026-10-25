@@ -1,7 +1,7 @@
 // Copyright Istio Authors
 // SPDX-License-Identifier: Apache-2.0
-//! Native ADS transport probe. It validates a typed publication and always
-//! NACKs activation. No durable/provider implementation is substituted here.
+//! Native typed ADS issuer profile. Pins alone select a NACK-only probe.
+//! A separately configured native provider must durably commit before ACK.
 use super::{RawHandler, RejectedConfig, State};
 use crate::config::{Config, RootCert};
 use crate::strng::{self, Strng};
@@ -125,7 +125,7 @@ impl ProbeHandler {
     pub(super) fn new(expected: Expected, clock: fn() -> SystemTime) -> Self {
         Self { expected, clock }
     }
-    fn validate_and_refuse_activation(&self, res: &DeltaDiscoveryResponse) -> Result<()> {
+    fn decode(&self, res: &DeltaDiscoveryResponse) -> Result<issuer_profile_wire::Decoded> {
         ensure!(
             res.type_url == ISSUER_PROFILE_TYPE.to_string()
                 && !res.nonce.is_empty()
@@ -168,6 +168,10 @@ impl ProbeHandler {
             raw.version == version && res.system_version_info == version,
             "issuer-profile resource version mismatch"
         );
+        Ok(decoded)
+    }
+    fn validate_and_refuse_activation(&self, res: &DeltaDiscoveryResponse) -> Result<()> {
+        self.decode(res)?;
         // This is intentionally not a commit callback. A fresh publication,
         // an unavailability tombstone and a lease renewal all leave the live
         // trust/provider checkpoint untouched. The native session stays closed.
@@ -198,6 +202,86 @@ impl RawHandler for ProbeHandler {
         state.known_resources.remove(type_url);
         Ok(())
     }
+}
+
+pub(super) struct ProviderHandler {
+    decoder: ProbeHandler,
+    provider: std::sync::Arc<crate::tls::profile_provider::ProfileProvider>,
+}
+impl ProviderHandler {
+    pub(super) fn new(
+        expected: Expected,
+        provider: std::sync::Arc<crate::tls::profile_provider::ProfileProvider>,
+    ) -> Self {
+        Self {
+            decoder: ProbeHandler::new(expected, provider.clock()),
+            provider,
+        }
+    }
+}
+#[async_trait::async_trait]
+impl RawHandler for ProviderHandler {
+    fn handle(
+        &self,
+        _state: &mut State,
+        _res: DeltaDiscoveryResponse,
+    ) -> Result<(), Vec<RejectedConfig>> {
+        Err(vec![RejectedConfig::new(
+            ISSUER_PROFILE_TYPE,
+            anyhow::anyhow!("native durable handler requires its asynchronous commit path"),
+        )])
+    }
+    async fn handle_async(
+        &self,
+        state: &mut State,
+        res: DeltaDiscoveryResponse,
+    ) -> Result<(), Vec<RejectedConfig>> {
+        let name = res
+            .resources
+            .first()
+            .map(|r| strng::new(&r.name))
+            .unwrap_or(ISSUER_PROFILE_TYPE);
+        let version = res
+            .resources
+            .first()
+            .map(|r| strng::new(&r.version))
+            .unwrap_or_default();
+        let session = self.provider.session_generation();
+        let result = match self.decoder.decode(&res) {
+            Err(error) => Err(error),
+            Ok(decoded) => {
+                let provider = self.provider.clone();
+                match tokio::task::spawn_blocking(move || {
+                    provider.commit_for_session(decoded, session)
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::anyhow!(
+                        "native profile commit worker failed: {error}"
+                    )),
+                }
+            }
+        };
+        match result {
+            Ok(()) => {
+                state.add_resource(ISSUER_PROFILE_TYPE, name, version);
+                Ok(())
+            }
+            Err(error) => {
+                self.provider.fail_closed_for_session(session);
+                Err(vec![RejectedConfig::new(name, error)])
+            }
+        }
+    }
+    fn clear(&self, state: &mut State, type_url: &Strng) -> Result<(), Vec<RejectedConfig>> {
+        self.provider.reset_session();
+        state.known_resources.remove(type_url);
+        Ok(())
+    }
+}
+pub(crate) fn configured_expected(config: &Config) -> Result<Option<Expected>> {
+    load_config(config)
 }
 
 #[cfg(test)]

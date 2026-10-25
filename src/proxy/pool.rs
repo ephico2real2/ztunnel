@@ -84,7 +84,10 @@ impl ConnSpawner {
         debug!("spawning new pool conn for {}", key);
 
         let cert = self.local_workload.fetch_certificate().await?;
-        let connector = cert.outbound_connector(key.dst_id.clone(), self.crl_manager.clone())?;
+        let lease = self
+            .local_workload
+            .profile_lease(&cert, crate::tls::domain_anchors::PeerRole::Client)
+            .await?;
         let tcp_stream = super::freebind_connect(None, key.dst, self.socket_factory.as_ref())
             .await
             .map_err(|e: io::Error| match e.kind() {
@@ -92,29 +95,22 @@ impl ConnSpawner {
                 _ => e.into(),
             })?;
 
-        let tls_stream = connector.connect(tcp_stream).await.inspect_err(|e| {
+        let (tls_stream, revocation) = crate::tls::profile_provider::connect(
+            cert,
+            lease.clone(),
+            tcp_stream,
+            key.dst_id.clone(),
+            self.crl_manager.clone(),
+        )
+        .await
+        .inspect_err(|e| {
             if crate::tls::io_error_is_cert_revoked(e) {
                 self.metrics
                     .record_crl_rejection(crate::proxy::metrics::Reporter::source);
             }
         })?;
         trace!("connector connected, handshaking");
-        // Enforce CRL revocation on this tunnel for its whole lifetime
-        let revocation = self.crl_manager.as_ref().map(|crl_manager| {
-            let (_, ssl) = tls_stream.get_ref();
-            let peer_identity = {
-                let x509_cert = crate::tls::certificate_from_connection(ssl);
-                crate::tls::identity(&x509_cert)
-            };
-            crl_manager.register(crate::tls::revocation::ConnRegistration::from_conn(
-                ssl,
-                peer_identity,
-                cert.root_store(),
-                webpki::KeyUsage::server_auth(),
-                crate::proxy::metrics::Reporter::source,
-            ))
-        });
-        let sender = h2::client::spawn_connection(
+        let mut sender = h2::client::spawn_connection(
             self.cfg.clone(),
             tls_stream,
             self.timeout_rx.clone(),
@@ -123,6 +119,7 @@ impl ConnSpawner {
             Default::default(),
         )
         .await?;
+        sender.bind_profile(lease);
         Ok(sender)
     }
 }
@@ -400,6 +397,11 @@ impl WorkloadHBONEPool {
         workload_key: &WorkloadKey,
         request: http::Request<()>,
     ) -> Result<(H2Stream, Option<Baggage>), Error> {
+        if let Some(provider) = self.state.spawner.local_workload.state.profile_provider() {
+            // An unavailable configured provider is never a reason to try the
+            // legacy pool. Cached drivers have their own lease-bound I/O too.
+            let _ = provider.acquire().map_err(Error::Anyhow)?;
+        }
         let mut connection = self.connect(workload_key).await?;
         connection.send_request(request).await
     }

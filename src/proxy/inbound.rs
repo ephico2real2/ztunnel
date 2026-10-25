@@ -12,23 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures_util::TryFutureExt;
 use http::{Method, Response, StatusCode};
-use rustls::CommonState;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
-use tls_listener::AsyncTls;
 use tokio::sync::watch;
 
-use tracing::{Instrument, debug, error, info, info_span, trace_span, warn};
+use tracing::{Instrument, debug, error, info, info_span, trace_span};
 
-use super::{
-    ConnectionResult, ConnectionResultBuilder, Error, HboneAddress, LocalWorkloadInformation,
-    ResponseFlags, util,
-};
+use super::{ConnectionResult, ConnectionResultBuilder, Error, HboneAddress, ResponseFlags, util};
 use crate::baggage::{baggage_header_val, parse_baggage_header};
-use crate::identity::Identity;
 
 use crate::config::Config;
 use crate::drain::DrainWatcher;
@@ -50,7 +43,7 @@ use crate::state::workload::application_tunnel::Protocol;
 use crate::state::workload::{self, NetworkAddress, Workload};
 use crate::state::{DemandProxyState, ProxyRbacContext};
 use crate::strng::Strng;
-use crate::tls::TlsError;
+use futures_util::TryFutureExt;
 
 pub struct Inbound {
     listener: socket::Listener,
@@ -88,10 +81,6 @@ impl Inbound {
 
     pub async fn run(self) {
         let pi = self.pi.clone();
-        let acceptor = InboundCertProvider {
-            local_workload: self.pi.local_workload_information.clone(),
-            crl_manager: self.pi.crl_manager.clone(),
-        };
 
         // Safety: we set nodelay directly in tls_server, so it is safe to convert to a normal listener.
         // Although, that is *after* the TLS handshake; in theory we may get some benefits to setting it earlier.
@@ -114,7 +103,6 @@ impl Inbound {
                 let force_shutdown = force_shutdown.clone();
                 let pi = self.pi.clone();
                 let dst = to_canonical(raw_socket.local_addr().expect("local_addr available"));
-                let acceptor = crate::tls::InboundAcceptor::new(acceptor.clone());
 
                 let socket_labels = metrics::SocketLabels {
                     reporter: Reporter::destination,
@@ -124,7 +112,8 @@ impl Inbound {
                 let serve_client = async move {
                     let _socket_guard =
                         metrics::SocketCloseGuard::new(pi.metrics.clone(), Reporter::destination);
-                    let tls = match acceptor.accept(raw_socket).await {
+                    let accepted = Box::pin(Self::accept_profile_tls(&pi, raw_socket)).await;
+                    let (tls, revocation) = match accepted {
                         Ok(tls) => tls,
                         Err(e) => {
                             if crate::tls::tls_error_is_cert_revoked(&e) {
@@ -136,7 +125,7 @@ impl Inbound {
                         }
                     };
                     debug!(latency=?start.elapsed(), "accepted TLS connection");
-                    let (_, ssl) = tls.get_ref();
+                    let (_, ssl) = tls.get_ref().get_ref();
                     let src_identity = {
                         let x509_cert = tls::certificate_from_connection(ssl);
                         tls::identity(&x509_cert)
@@ -150,7 +139,8 @@ impl Inbound {
                     debug!(%conn, "accepted connection");
                     let cfg = pi.cfg.clone();
                     // Enforce CRL revocation on this existing connection when a CRL is configured
-                    let revocation = Box::pin(Self::build_revocation(&pi, ssl, src_identity)).await;
+                    // The handshake helper already registered the exact verified
+                    // peer SPIRE signer, including cross-domain peers.
                     let request_handler = move |req| {
                         let id = Self::extract_traceparent(&req);
                         let peer = conn.src;
@@ -176,12 +166,12 @@ impl Inbound {
                     );
                     // This is per HBONE connection, so while would be nice to be small, at least it
                     // is pooled so typically fewer of these.
-                    let serve = Box::pin(assertions::size_between(6000, 7000, serve_conn));
+                    let serve = Box::pin(assertions::size_between(3000, 7000, serve_conn));
                     serve.await
                 };
                 // This is small since it only handles the TLS layer -- the HTTP2 layer is boxed
                 // and measured above.
-                assertions::size_between_ref(1000, 1650, &serve_client);
+                assertions::size_between_ref(256, 1650, &serve_client);
                 tokio::task::spawn(serve_client.in_current_span());
             }
         };
@@ -195,32 +185,31 @@ impl Inbound {
         .await
     }
 
-    /// Builds this connection's CRL revocation state, or `None` when CRL enforcement is disabled.
-    /// Kept as its own `async fn` (and boxed at the call site) so the `fetch_certificate` await
-    /// doesn't grow the size of the caller's future.
-    async fn build_revocation(
+    async fn accept_profile_tls(
         pi: &ProxyInputs,
-        ssl: &CommonState,
-        peer_identity: Option<Identity>,
-    ) -> Option<crate::tls::revocation::RevocationHandle> {
-        let crl_manager = pi.crl_manager.as_ref()?;
-        match pi.local_workload_information.fetch_certificate().await {
-            Ok(cert) => Some(crl_manager.register(
-                crate::tls::revocation::ConnRegistration::from_conn(
-                    ssl,
-                    peer_identity,
-                    cert.root_store(),
-                    webpki::KeyUsage::client_auth(),
-                    crate::proxy::metrics::Reporter::destination,
-                ),
-            )),
-            Err(e) => {
-                warn!("failed to fetch certificate for CRL revocation enforcement: {e}");
-                pi.metrics
-                    .record_crl_untracked_connection(crate::proxy::metrics::Reporter::destination);
-                None
-            }
-        }
+        raw_socket: tokio::net::TcpStream,
+    ) -> Result<
+        (
+            Box<tls::profile_provider::ServerTls<tokio::net::TcpStream>>,
+            Option<tls::revocation::RevocationHandle>,
+        ),
+        tls::TlsError,
+    > {
+        let cert = pi.local_workload_information.fetch_certificate().await?;
+        let lease = pi
+            .local_workload_information
+            .profile_lease(&cert, tls::domain_anchors::PeerRole::Server)
+            .await
+            .map_err(|e| {
+                tls::TlsError::Handshake(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    e.to_string(),
+                ))
+            })?;
+        let (stream, revocation) =
+            tls::profile_provider::accept(cert, lease, raw_socket, pi.crl_manager.clone()).await?;
+        // Keep the guarded TLS owner and the handshake result off the per-connection future.
+        Ok((Box::new(stream), revocation))
     }
 
     fn extract_traceparent(req: &H2Request) -> TraceParent {
@@ -751,24 +740,6 @@ struct InboundFlagError(Error, ResponseFlags, StatusCode);
 impl InboundFlagError {
     pub fn build(code: StatusCode, flag: ResponseFlags) -> impl Fn(Error) -> Self {
         move |err| InboundFlagError(err, flag, code)
-    }
-}
-
-#[derive(Clone)]
-struct InboundCertProvider {
-    local_workload: Arc<LocalWorkloadInformation>,
-    crl_manager: Option<Arc<tls::crl::CrlManager>>,
-}
-
-#[async_trait::async_trait]
-impl crate::tls::ServerCertProvider for InboundCertProvider {
-    async fn fetch_cert(&mut self) -> Result<Arc<rustls::ServerConfig>, TlsError> {
-        debug!(
-            identity=%self.local_workload.workload_info(),
-            "fetching cert"
-        );
-        let cert = self.local_workload.fetch_certificate().await?;
-        Ok(Arc::new(cert.server_config(self.crl_manager.clone())?))
     }
 }
 

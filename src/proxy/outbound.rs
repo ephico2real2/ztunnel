@@ -301,16 +301,27 @@ impl OutboundConnection {
                 .local_workload_information
                 .fetch_certificate()
                 .await?;
-            let connector =
-                cert.outbound_connector(wl_key.dst_id.clone(), self.pi.crl_manager.clone())?;
-            let tls_stream = connector.connect(upgraded).await.inspect_err(|e| {
+            let lease = self
+                .pi
+                .local_workload_information
+                .profile_lease(&cert, tls::domain_anchors::PeerRole::Client)
+                .await?;
+            let (tls_stream, revocation) = tls::profile_provider::connect(
+                cert,
+                lease.clone(),
+                upgraded,
+                wl_key.dst_id.clone(),
+                self.pi.crl_manager.clone(),
+            )
+            .await
+            .inspect_err(|e| {
                 if crate::tls::io_error_is_cert_revoked(e) {
                     self.pi
                         .metrics
                         .record_crl_rejection(crate::proxy::metrics::Reporter::source);
                 }
             })?;
-            let (_, ssl) = tls_stream.get_ref();
+            let (_, ssl) = tls_stream.get_ref().get_ref();
             let peer_identity = {
                 let x509_cert = tls::certificate_from_connection(ssl);
                 tls::identity(&x509_cert)
@@ -318,16 +329,6 @@ impl OutboundConnection {
 
             // Spawn inner CONNECT tunnel
             let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
-            // Enforce CRL revocation on this inner tunnel for its lifetime
-            let revocation = self.pi.crl_manager.as_ref().map(|crl_manager| {
-                crl_manager.register(crate::tls::revocation::ConnRegistration::from_conn(
-                    ssl,
-                    peer_identity.clone(),
-                    cert.root_store(),
-                    webpki::KeyUsage::server_auth(),
-                    crate::proxy::metrics::Reporter::source,
-                ))
-            });
             let mut sender = super::h2::client::spawn_connection(
                 self.pi.cfg.clone(),
                 tls_stream,
@@ -337,6 +338,7 @@ impl OutboundConnection {
                 teardown,
             )
             .await?;
+            sender.bind_profile(lease);
             let origin_network = &self.pi.cfg.network;
             let http_request = self.create_hbone_request(remote_addr, req, Some(origin_network));
             let (inner_upgraded, baggage) = sender.send_request(http_request).await?;

@@ -46,6 +46,9 @@ impl XdsSessionGate {
         self.state.lock().expect("xDS session state").snapshot
     }
 
+    pub(crate) fn is_revoked(&self) -> bool {
+        self.state.lock().expect("xDS session state").revoked
+    }
     pub fn is_open(&self) -> bool {
         self.open_generation().is_some()
     }

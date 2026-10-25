@@ -122,7 +122,16 @@ pub trait Handler<T: prost::Message>: Send + Sync + 'static {
 // ResponseHandler is responsible for handling a discovery response.
 // Handlers can mutate state and return a list of rejected configurations (if there are any).
 // This is an internal only trait; public usage uses the Handler type which is typed.
+#[async_trait::async_trait]
 trait RawHandler: Send + Sync + 'static {
+    async fn handle_async(
+        &self,
+        state: &mut State,
+        res: DeltaDiscoveryResponse,
+    ) -> Result<(), Vec<RejectedConfig>> {
+        self.handle(state, res)
+    }
+
     fn handle(
         &self,
         state: &mut State,
@@ -238,6 +247,7 @@ pub struct Config {
     on_demand: bool,
     session_gate: Option<XdsSessionGate>,
     issuer_profile_initial_timeout: Duration,
+    profile_provider: Option<std::sync::Arc<crate::tls::profile_provider::ProfileProvider>>,
 
     /// alt_hostname provides an alternative accepted SAN for the control plane TLS verification
     alt_hostname: Option<String>,
@@ -286,6 +296,11 @@ impl State {
 }
 
 impl Config {
+    pub(crate) fn issuer_profile_expected(
+        config: &crate::config::Config,
+    ) -> anyhow::Result<Option<crate::tls::issuer_profile_wire::Expected>> {
+        issuer_profile::configured_expected(config)
+    }
     pub fn new(
         config: Arc<crate::config::Config>,
         tls_builder: Box<dyn tls::ControlPlaneClientCertProvider>,
@@ -302,6 +317,7 @@ impl Config {
             on_demand: config.xds_on_demand,
             session_gate: None,
             issuer_profile_initial_timeout: Duration::from_secs(10),
+            profile_provider: None,
             proxy_metadata: config.proxy_metadata.clone(),
             alt_hostname: config.alt_xds_hostname.clone(),
             xds_headers: config.xds_headers.vec.clone(),
@@ -316,6 +332,20 @@ impl Config {
             self = self.with_issuer_profile_probe(expected, std::time::SystemTime::now);
         }
         Ok(self)
+    }
+    pub(crate) fn with_issuer_profile_provider(
+        mut self,
+        expected: crate::tls::issuer_profile_wire::Expected,
+        provider: std::sync::Arc<crate::tls::profile_provider::ProfileProvider>,
+    ) -> Self {
+        self.profile_provider = Some(provider.clone());
+        self.handlers.insert(
+            ISSUER_PROFILE_TYPE,
+            Box::new(issuer_profile::ProviderHandler::new(expected, provider)),
+        );
+        self.initial_requests
+            .push(self.construct_initial_request(ISSUER_PROFILE_TYPE, true));
+        self
     }
     fn with_issuer_profile_probe(
         mut self,
@@ -605,6 +635,9 @@ impl AdsClient {
             Ok(()) => self.run_internal().await,
             Err(err) => Err(err),
         };
+        if let Some(provider) = &self.config.profile_provider {
+            provider.fail_closed_for_session(self.session_generation);
+        }
         if let Some(gate) = &self.session_gate {
             gate.mark_stale(self.session_generation);
         }
@@ -710,6 +743,13 @@ impl AdsClient {
     }
 
     pub async fn run(mut self) -> Result<(), Error> {
+        // This lives inside the running future, so cancellation revokes the
+        // provider without making AdsClient a Drop type (builders move config).
+        let _profile_lifetime = self
+            .config
+            .profile_provider
+            .as_ref()
+            .map(|p| p.runtime_guard());
         let mut backoff = INITIAL_BACKOFF;
         loop {
             self.connection_id += 1;
@@ -802,8 +842,25 @@ impl AdsClient {
             .handlers
             .contains_key(&ISSUER_PROFILE_TYPE)
             .then(|| tokio::time::Instant::now() + self.config.issuer_profile_initial_timeout);
+        let mut profile_changes = self.config.profile_provider.as_ref().map(|p| p.subscribe());
+        let mut profile_nack_deadline = None;
         loop {
             tokio::select! {
+                _ = async {
+                    if let Some(deadline) = profile_nack_deadline { tokio::time::sleep_until(deadline).await; }
+                    else { std::future::pending::<()>().await; }
+                } => { return Err(Error::RejectedResponse("native issuer profile NACK delivery deadline".into())); }
+                changed = async {
+                    match profile_changes.as_mut() {
+                        Some(changes) => changes.changed().await.ok(),
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if changed.is_some() && profile_nack_deadline.is_none() && !self.types_to_expect.contains(&ISSUER_PROFILE_TYPE.to_string())
+                        && self.config.profile_provider.as_ref().is_some_and(|p| !p.available_for_session(self.session_generation)) {
+                        return Err(Error::RejectedResponse("native issuer profile/session became unavailable".into()));
+                    }
+                }
                 _ = async {
                     if let Some(deadline)=profile_initial_deadline { tokio::time::sleep_until(deadline).await; }
                     else { std::future::pending::<()>().await; }
@@ -820,6 +877,9 @@ impl AdsClient {
                         // This could be an explicit OK response, or if the stream is reset without a gRPC status.
                         return Ok(());
                     };
+                    if profile_nack_deadline.is_some() {
+                        return Err(Error::RejectedResponse("native issuer profile NACK requires a new complete session".into()));
+                    }
                     // Strict mode accepts one complete initial response for
                     // each required type. Any later security delta forces a
                     // reconnect and a fresh full snapshot; applying one type
@@ -829,7 +889,8 @@ impl AdsClient {
                         let is_security_type = msg.type_url == ADDRESS_TYPE.to_string()
                             || msg.type_url == AUTHORIZATION_TYPE.to_string()
                             || msg.type_url == ISSUER_PROFILE_TYPE.to_string();
-                        if is_security_type && !self.types_to_expect.contains(&msg.type_url) {
+                        let native_profile = msg.type_url == ISSUER_PROFILE_TYPE.to_string() && self.config.profile_provider.is_some();
+                        if is_security_type && !native_profile && !self.types_to_expect.contains(&msg.type_url) {
                             gate.mark_stale(self.session_generation);
                             warn!(
                                 generation = self.session_generation,
@@ -863,7 +924,10 @@ impl AdsClient {
                         // peer to read the NACK. The server closes on NACK;
                         // the initial deadline bounds an unresponsive peer.
                         // Never count this response toward readiness.
-                        if is_profile_response { continue; }
+                        if is_profile_response {
+                            if self.config.profile_provider.is_some() { profile_nack_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1)); }
+                            continue;
+                        }
                         if self.session_gate.is_some() {
                             return Err(Error::RejectedResponse(
                                 received_type.unwrap_or_else(|| "unknown type".to_string()),
@@ -904,7 +968,7 @@ impl AdsClient {
         );
         let handler_response: Result<(), Vec<RejectedConfig>> =
             match self.config.handlers.get(&strng::new(&type_url)) {
-                Some(h) => h.handle(&mut self.state, response),
+                Some(h) => h.handle_async(&mut self.state, response).await,
                 None if self.session_gate.is_some() => Err(vec![RejectedConfig::new(
                     strng::new(type_url.clone()),
                     anyhow::anyhow!("unsupported xDS response type in fail-closed session"),
@@ -2519,5 +2583,146 @@ mod tests {
         assert!(ready.has_changed().is_ok());
         task.abort();
         let _ = task.await;
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_provider_tls_ads_commits_renews_nacks_rollback_and_recovers_full_epoch() {
+        use crate::tls::profile_checkpoint::OpenMode;
+        use crate::tls::profile_provider::ProfileProvider;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let gate = XdsSessionGate::new();
+        let (mut connections, mut client, _state, _ready) =
+            AdsServer::spawn_with_session_gate(false, Some(gate.clone())).await;
+        let (body, expected) = issuer_profile_probe_fixture();
+        let provider = ProfileProvider::open_with_clock(
+            dir.path(),
+            &expected,
+            OpenMode::BootstrapEmptyDirectory,
+            gate.clone(),
+            issuer_profile_probe_clock,
+        )
+        .unwrap();
+        client.config = client
+            .config
+            .with_issuer_profile_provider(expected, provider.clone());
+        client.config.issuer_profile_initial_timeout = Duration::from_secs(2);
+        let supervisor = tokio::spawn(provider.clone().supervise());
+        let task = tokio::spawn(client.run());
+        let mut connection = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        issuer_profile_initial_requests(&mut connection).await;
+        issuer_profile_send_address_authorization(&mut connection).await;
+        connection
+            .tx
+            .send(Ok(issuer_profile_probe_response(body.clone())))
+            .await
+            .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let req = connection.rx.recv().await.unwrap();
+                if req.type_url == ISSUER_PROFILE_TYPE.to_string() {
+                    break req;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ack.response_nonce, "profile-probe-nonce");
+        assert!(ack.error_detail.is_none());
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("profile-state.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            saved["state"]["floors"]["sequence"], 10,
+            "state must be durable before ACK is observable"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !gate.is_open() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let old_lease = provider.acquire().unwrap();
+        let old_epoch = old_lease.epoch();
+        let mut wire: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        wire["sequence"] = "11".into();
+        wire["publicationDigest"] = "c".repeat(64).into();
+        let renewal = serde_json::to_vec(&wire).unwrap();
+        connection
+            .tx
+            .send(Ok(issuer_profile_probe_response(renewal.clone())))
+            .await
+            .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(2), connection.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ack.type_url, ISSUER_PROFILE_TYPE.to_string());
+        assert!(ack.error_detail.is_none());
+        assert_eq!(
+            provider.acquire().unwrap().epoch(),
+            old_epoch,
+            "durable same-authority lease renewal must not churn live TLS"
+        );
+        connection
+            .tx
+            .send(Ok(issuer_profile_probe_response(body)))
+            .await
+            .unwrap();
+        let nack = tokio::time::timeout(Duration::from_secs(2), connection.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(nack.type_url, ISSUER_PROFILE_TYPE.to_string());
+        assert!(nack.error_detail.is_some());
+        assert!(!gate.is_open());
+        assert!(old_lease.check_current().is_err());
+        connection
+            .tx
+            .send(Err(tonic::Status::unavailable(
+                "recover authenticated session",
+            )))
+            .await
+            .unwrap();
+        let mut recovery = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        issuer_profile_initial_requests(&mut recovery).await;
+        recovery
+            .tx
+            .send(Ok(issuer_profile_probe_response(renewal)))
+            .await
+            .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(2), recovery.rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(ack.error_detail.is_none());
+        assert!(
+            provider.acquire().is_err(),
+            "fresh profile alone is not a complete new epoch"
+        );
+        issuer_profile_send_address_authorization(&mut recovery).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !gate.is_open() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_ne!(provider.acquire().unwrap().epoch(), old_epoch);
+        task.abort();
+        let _ = task.await;
+        assert!(
+            !gate.is_open(),
+            "task cancellation must revoke the actual provider"
+        );
+        supervisor.abort();
+        let _ = supervisor.await;
     }
 }

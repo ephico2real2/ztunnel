@@ -222,8 +222,15 @@ pub struct Config {
     pub require_inbound_mtls: bool,
     /// Require every non-exempt workload destination to use HBONE and a current xDS snapshot.
     pub require_mesh_hbone: bool,
-    /// Opt-in transport probe. The handler never activates trust or ACKs a profile.
+    /// Independent native issuer-profile pins. Without a checkpoint directory,
+    /// this remains a NACK-only transport probe.
     pub issuer_profile_probe_pins: Option<PathBuf>,
+    /// Native provider opt-in. Precreated private checkpoint directory. None
+    /// retains the NACK-only transport probe, even when pins are configured.
+    pub issuer_profile_checkpoint_dir: Option<PathBuf>,
+    /// One-shot administrator operation for a genuinely virgin checkpoint.
+    /// Remove this setting before the first restart; never use automatic fallback.
+    pub issuer_profile_checkpoint_bootstrap: bool,
     /// Static mesh CIDRs and narrow, explicit non-mesh exceptions used by strict egress mode.
     /// This is a lab/bootstrap input; production requires an authenticated, live Cilium inventory.
     pub mesh_egress: MeshEgressConfig,
@@ -1102,6 +1109,13 @@ pub fn construct_config(pc: ProxyConfig) -> Result<Config, Error> {
         issuer_profile_probe_pins: parse::<String>("ISSUER_PROFILE_PROBE_PINS")?
             .filter(|s| !s.is_empty())
             .map(PathBuf::from),
+        issuer_profile_checkpoint_dir: parse::<String>("ISSUER_PROFILE_CHECKPOINT_DIR")?
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from),
+        issuer_profile_checkpoint_bootstrap: parse_default(
+            "ISSUER_PROFILE_CHECKPOINT_BOOTSTRAP",
+            false,
+        )?,
         mesh_egress,
         // Enable by default; running the server is not an issue, clients still need to opt-in to sending their
         // DNS requests to Ztunnel.

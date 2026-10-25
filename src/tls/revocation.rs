@@ -103,6 +103,17 @@ pub struct RevocationHandle {
 }
 
 impl RevocationHandle {
+    /// Strict native trust mode refuses an untracked or already revoked peer.
+    /// The I/O owner also polls this receiver during H2 setup and idle periods.
+    pub(crate) fn tracked_receiver(&self) -> std::io::Result<watch::Receiver<bool>> {
+        if self._guard.tracked.is_none() || *self.revoked_rx.borrow() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "configured CRL enforcement could not track the verified peer",
+            ));
+        }
+        Ok(self.revoked_rx.clone())
+    }
     /// peer identity string for access log attribution
     pub fn peer(&self) -> String {
         self.peer_identity

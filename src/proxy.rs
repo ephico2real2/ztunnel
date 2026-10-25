@@ -50,7 +50,7 @@ use crate::{config, identity, socket, tls};
 pub mod connection_manager;
 pub mod inbound;
 
-mod h2;
+pub(crate) mod h2;
 pub(crate) use h2::TeardownCause;
 mod inbound_passthrough;
 #[allow(non_camel_case_types)]
@@ -223,6 +223,26 @@ impl LocalWorkloadInformation {
         }
     }
 
+    pub(crate) async fn profile_lease(
+        &self,
+        cert: &tls::WorkloadCertificate,
+        role: tls::domain_anchors::PeerRole,
+    ) -> Result<Option<tls::profile_provider::Lease>, Error> {
+        let Some(provider) = self.state.profile_provider() else {
+            return Ok(None);
+        };
+        let lease = provider.acquire().map_err(Error::Anyhow)?;
+        let workload = self.get_workload().await?;
+        let expected = Identity::Spiffe {
+            trust_domain: workload.trust_domain.clone(),
+            namespace: (&self.wi.namespace).into(),
+            service_account: (&self.wi.service_account).into(),
+        };
+        lease
+            .validate_local(cert, &expected, role)
+            .map_err(Error::Anyhow)?;
+        Ok(Some(lease))
+    }
     pub fn workload_info(&self) -> Arc<WorkloadInfo> {
         self.wi.clone()
     }
