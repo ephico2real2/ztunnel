@@ -1092,6 +1092,37 @@ mod tests {
         };
         (Installation::from_expected(&e), state, now)
     }
+    /// Opens a checkpoint store, waiting out a writer lock that only a forked
+    /// copy of a dropped handle still holds. cargo test runs tests as threads of
+    /// one process, and a child that any test spawns holds a copy of every open
+    /// descriptor until it execs, O_CLOEXEC or not; while it does, the flock of
+    /// a handle this test already dropped is still taken. ztunnel itself never
+    /// spawns a process, so CheckpointStore::open stays non-blocking, and a
+    /// handle that is still open keeps the lock past the bound and still fails.
+    fn open_store(
+        path: &Path,
+        installation: Installation,
+        mode: OpenMode,
+    ) -> Result<CheckpointStore> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match CheckpointStore::open(path, installation.clone(), mode) {
+                Err(e) if writer_lock_held(&e) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                result => return result,
+            }
+        }
+    }
+    fn writer_lock_held(e: &anyhow::Error) -> bool {
+        e.to_string() == "checkpoint writer lock held"
+            && e.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error)
+                    == Some(libc::EWOULDBLOCK)
+            })
+    }
     fn dir() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1118,8 +1149,7 @@ mod tests {
     }
     fn committed(d: &Path) -> (Installation, ProfileCheckpoint, SystemTime) {
         let (i, s, now) = fixture();
-        let mut store =
-            CheckpointStore::open(d, i.clone(), OpenMode::BootstrapEmptyDirectory).unwrap();
+        let mut store = open_store(d, i.clone(), OpenMode::BootstrapEmptyDirectory).unwrap();
         let receipt = store.commit(s.clone(), now).unwrap();
         assert_eq!(receipt.sequence, s.floors.sequence);
         (i, s, now)
@@ -1128,18 +1158,18 @@ mod tests {
     fn existing_store_never_auto_initializes_and_bootstrap_is_one_shot() {
         let d = dir();
         let (i, s, now) = fixture();
-        assert!(CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).is_err());
+        assert!(open_store(d.path(), i.clone(), OpenMode::Existing).is_err());
         let interrupted = dir();
-        let empty = CheckpointStore::open(
+        let empty = open_store(
             interrupted.path(),
             i.clone(),
             OpenMode::BootstrapEmptyDirectory,
         )
         .unwrap();
         drop(empty);
-        assert!(CheckpointStore::open(interrupted.path(), i.clone(), OpenMode::Existing).is_err());
+        assert!(open_store(interrupted.path(), i.clone(), OpenMode::Existing).is_err());
         assert!(
-            CheckpointStore::open(
+            open_store(
                 interrupted.path(),
                 i.clone(),
                 OpenMode::BootstrapEmptyDirectory
@@ -1147,21 +1177,19 @@ mod tests {
             .is_err()
         );
         // Existing open creates only a private cooperative lock, not a state.
-        let mut first =
-            CheckpointStore::open(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).unwrap();
+        let mut first = open_store(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).unwrap();
         first.commit(s, now).unwrap();
         drop(first);
-        assert!(
-            CheckpointStore::open(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).is_err()
-        );
+        assert!(open_store(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).is_err());
         std::fs::remove_file(d.path().join(STATE)).unwrap();
-        assert!(CheckpointStore::open(d.path(), i, OpenMode::Existing).is_err());
+        assert!(open_store(d.path(), i, OpenMode::Existing).is_err());
     }
     #[test]
     fn held_writer_lock_refuses_concurrent_owner_and_detects_replacement() {
         let d = dir();
         let (i, s, now) = committed(d.path());
-        let mut first = CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        let mut first = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        // A live owner is refused at once: the store's open never waits.
         assert!(CheckpointStore::open(d.path(), i, OpenMode::Existing).is_err());
         std::fs::remove_file(d.path().join(LOCK)).unwrap();
         std::fs::write(d.path().join(LOCK), b"").unwrap();
@@ -1177,17 +1205,13 @@ mod tests {
         let link = parent.path().join("symlink");
         symlink(target.path(), &link).unwrap();
         let (i, _, _) = fixture();
-        assert!(CheckpointStore::open(&link, i.clone(), OpenMode::Existing).is_err());
+        assert!(open_store(&link, i.clone(), OpenMode::Existing).is_err());
         let d = dir();
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            CheckpointStore::open(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).is_err()
-        );
+        assert!(open_store(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).is_err());
         let d = dir();
         std::fs::write(d.path().join("foreign"), b"preserve").unwrap();
-        assert!(
-            CheckpointStore::open(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).is_err()
-        );
+        assert!(open_store(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).is_err());
         assert_eq!(
             std::fs::read(d.path().join("foreign")).unwrap(),
             b"preserve"
@@ -1196,12 +1220,12 @@ mod tests {
         let (i, _, _) = committed(d.path());
         let state = d.path().join(STATE);
         std::fs::hard_link(&state, d.path().join("foreign-link")).unwrap();
-        assert!(CheckpointStore::open(d.path(), i, OpenMode::Existing).is_err());
+        assert!(open_store(d.path(), i, OpenMode::Existing).is_err());
         let d = dir();
         let (i, _, _) = committed(d.path());
         std::fs::remove_file(d.path().join(STATE)).unwrap();
         symlink(parent.path().join("foreign"), d.path().join(STATE)).unwrap();
-        assert!(CheckpointStore::open(d.path(), i, OpenMode::Existing).is_err());
+        assert!(open_store(d.path(), i, OpenMode::Existing).is_err());
     }
     #[test]
     fn detects_held_directory_path_substitution_without_writing_new_directory() {
@@ -1210,7 +1234,7 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (i, s, now) = committed(&path);
-        let mut store = CheckpointStore::open(&path, i, OpenMode::Existing).unwrap();
+        let mut store = open_store(&path, i, OpenMode::Existing).unwrap();
         std::fs::rename(&path, parent.path().join("old")).unwrap();
         std::fs::create_dir(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1249,7 +1273,7 @@ mod tests {
     fn commit_sequence_generation_and_digest_floors_never_roll_back() {
         let d = dir();
         let (i, s, now) = committed(d.path());
-        let mut store = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i, OpenMode::Existing).unwrap();
         let inode = store.state_inode;
         store.commit(s.clone(), now).unwrap();
         assert_eq!(store.state_inode, inode);
@@ -1269,7 +1293,7 @@ mod tests {
     fn unavailable_observation_preserves_authority_and_recovered_lease_is_not_a_grant() {
         let d = dir();
         let (i, s, now) = committed(d.path());
-        let mut store = CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
         let mut unavailable = s.clone();
         unavailable.floors.sequence += 1;
         unavailable.floors.publication_digest = "a".repeat(64);
@@ -1278,7 +1302,7 @@ mod tests {
         store.commit(unavailable.clone(), now).unwrap();
         assert_eq!(store.recovered().unwrap().anchors, s.anchors);
         drop(store);
-        let loaded = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+        let loaded = open_store(d.path(), i, OpenMode::Existing).unwrap();
         assert_eq!(loaded.recovered().unwrap(), &unavailable);
         // No ready/session/ACK data is returned, and opening is independent of
         // wall clock; certificate history may be needed long after lease expiry.
@@ -1287,7 +1311,7 @@ mod tests {
         expired.floors.sequence += 2;
         expired.anchors.as_mut().unwrap().sequence = expired.floors.sequence;
         drop(loaded);
-        let mut store = CheckpointStore::open(d.path(), fixture().0, OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), fixture().0, OpenMode::Existing).unwrap();
         assert!(
             store
                 .commit(expired, now + Duration::from_secs(60))
@@ -1312,12 +1336,11 @@ mod tests {
         next.authority_generation = 8;
         next.authority_approval_digest = "b".repeat(64);
         let d = dir();
-        let mut store =
-            CheckpointStore::open(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).unwrap();
+        let mut store = open_store(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).unwrap();
         store.commit(s.clone(), now).unwrap();
         store.commit(next.clone(), now).unwrap();
         drop(store);
-        let mut reopened = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+        let mut reopened = open_store(d.path(), i, OpenMode::Existing).unwrap();
         let history = reopened.recovered().unwrap().history().unwrap().unwrap();
         assert_eq!(history, revoked);
         assert!(history.bundle_fenced(&key));
@@ -1357,7 +1380,7 @@ mod tests {
         ] {
             let d = dir();
             let (i, s, now) = committed(d.path());
-            let mut store = CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+            let mut store = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
             let next = advanced(&s);
             store.fault = Some(TestFault {
                 boundary,
@@ -1367,7 +1390,7 @@ mod tests {
             assert!(store.is_poisoned());
             assert!(store.commit(next.clone(), now).is_err());
             drop(store);
-            let mut reopened = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+            let mut reopened = open_store(d.path(), i, OpenMode::Existing).unwrap();
             let expected = if matches!(
                 boundary,
                 TestBoundary::AfterRename | TestBoundary::AfterDirectorySync
@@ -1402,7 +1425,7 @@ mod tests {
             _ => panic!("unknown boundary"),
         };
         let (i, s, now) = fixture();
-        let mut store = CheckpointStore::open(Path::new(&path), i, OpenMode::Existing).unwrap();
+        let mut store = open_store(Path::new(&path), i, OpenMode::Existing).unwrap();
         store.fault = Some(TestFault {
             boundary,
             action: TestAction::Kill,
@@ -1426,7 +1449,7 @@ mod tests {
                 .status()
                 .unwrap();
             assert_eq!(status.signal(), Some(libc::SIGKILL));
-            let recovered = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+            let recovered = open_store(d.path(), i, OpenMode::Existing).unwrap();
             assert_eq!(
                 recovered.recovered().unwrap().floors.sequence,
                 if stage == "synced" {
@@ -1442,11 +1465,11 @@ mod tests {
         let d = dir();
         let (i, _, _) = committed(d.path());
         std::fs::write(d.path().join(STATE), b"{corrupt").unwrap();
-        assert!(CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).is_err());
-        assert!(CheckpointStore::open(d.path(), i, OpenMode::BootstrapEmptyDirectory).is_err());
+        assert!(open_store(d.path(), i.clone(), OpenMode::Existing).is_err());
+        assert!(open_store(d.path(), i, OpenMode::BootstrapEmptyDirectory).is_err());
         let d = dir();
         let (i, s, now) = committed(d.path());
-        let mut store = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i, OpenMode::Existing).unwrap();
         std::fs::remove_file(d.path().join(MARKER)).unwrap();
         assert!(store.commit(advanced(&s), now).is_err());
         assert!(store.is_poisoned());
@@ -1455,7 +1478,7 @@ mod tests {
     fn explicit_all_issuer_revocation_is_durable_and_requires_new_material_authority_to_restore() {
         let d = dir();
         let (i, s, now) = committed(d.path());
-        let mut store = CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
         let original = s.history().unwrap().unwrap();
         let withdrawn = original.withdraw_all(11).unwrap();
         let mut revoked = s.clone();
@@ -1466,7 +1489,7 @@ mod tests {
         revoked.anchors = Some(withdrawn.checkpoint().unwrap());
         store.commit(revoked.clone(), now).unwrap();
         drop(store);
-        let mut store = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i, OpenMode::Existing).unwrap();
         assert_eq!(
             store.recovered().unwrap().history().unwrap().unwrap(),
             withdrawn
@@ -1489,7 +1512,7 @@ mod tests {
     fn unavailable_new_producer_floor_does_not_erase_last_material_generation() {
         let d = dir();
         let (i, s, now) = committed(d.path());
-        let mut store = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i, OpenMode::Existing).unwrap();
         let mut unavailable = s.clone();
         unavailable.floors.sequence = 11;
         unavailable.floors.logical_generation = 8;
@@ -1529,7 +1552,7 @@ mod tests {
      {
         let d = dir();
         let (i, s, now) = committed(d.path());
-        let mut store = CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
         std::fs::write(d.path().join(STATE), b"{}").unwrap();
         assert!(store.commit(advanced(&s), now).is_err());
         assert!(store.is_poisoned());
@@ -1537,19 +1560,19 @@ mod tests {
         let d = dir();
         let (i, s, now) = committed(d.path());
         let old = std::fs::read(d.path().join(STATE)).unwrap();
-        let mut store = CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
         store.commit(advanced(&s), now).unwrap();
         drop(store);
         std::fs::write(d.path().join(STATE), old).unwrap();
         let mut floor = i;
         floor.minimum_sequence = 11;
         floor.publication_digest_at_minimum = Some("a".repeat(64));
-        assert!(CheckpointStore::open(d.path(), floor, OpenMode::Existing).is_err());
+        assert!(open_store(d.path(), floor, OpenMode::Existing).is_err());
         let d = dir();
         let (i, _, _) = committed(d.path());
         std::fs::set_permissions(d.path().join(STATE), std::fs::Permissions::from_mode(0o644))
             .unwrap();
-        assert!(CheckpointStore::open(d.path(), i, OpenMode::Existing).is_err());
+        assert!(open_store(d.path(), i, OpenMode::Existing).is_err());
     }
 
     #[test]
@@ -1562,16 +1585,14 @@ mod tests {
             let d = dir();
             let (i, s, now) = committed(d.path());
             let next = advanced(&s);
-            let mut interrupted =
-                CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+            let mut interrupted = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
             interrupted.fault = Some(TestFault {
                 boundary: TestBoundary::AfterRename,
                 action: TestAction::Error,
             });
             assert!(interrupted.commit(next.clone(), now).is_err());
             drop(interrupted);
-            let mut reopened =
-                CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+            let mut reopened = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
             assert_eq!(reopened.recovered().unwrap(), &next);
             reopened.fault = Some(TestFault {
                 boundary,
@@ -1580,7 +1601,7 @@ mod tests {
             assert!(reopened.commit(next.clone(), now).is_err());
             assert!(reopened.is_poisoned());
             drop(reopened);
-            let mut final_owner = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+            let mut final_owner = open_store(d.path(), i, OpenMode::Existing).unwrap();
             let inode = final_owner.state_inode;
             assert_eq!(
                 final_owner.commit(next.clone(), now).unwrap().sequence(),
@@ -1597,10 +1618,10 @@ mod tests {
         let entry = std::env::var("CMTC_CHECKPOINT_FIFO_ENTRY").unwrap();
         let (i, _, _) = fixture();
         if entry == PENDING {
-            let mut store = CheckpointStore::open(Path::new(&path), i, OpenMode::Existing).unwrap();
+            let mut store = open_store(Path::new(&path), i, OpenMode::Existing).unwrap();
             assert!(store.remove_pending_for_recovery().is_err());
         } else {
-            assert!(CheckpointStore::open(Path::new(&path), i, OpenMode::Existing).is_err());
+            assert!(open_store(Path::new(&path), i, OpenMode::Existing).is_err());
         }
     }
     #[test]
