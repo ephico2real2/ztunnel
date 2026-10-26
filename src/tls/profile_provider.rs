@@ -23,7 +23,8 @@ use super::domain_anchors::{AnchorPublication, PeerRole, VerifiedPeer, verify_pe
 use super::handshake::HandshakeObserver;
 use super::issuer_profile_wire::{Decoded, Expected};
 use super::profile_checkpoint::{
-    Binding, CheckpointStore, Floors, Installation, Observation, OpenMode, ProfileCheckpoint,
+    Binding, CheckpointStore, Floors, Installation, Observation, OpenMode, Predecessor,
+    ProfileCheckpoint,
 };
 use super::revocation::{ConnRegistration, RevocationHandle, verify_cert_chain};
 use crate::identity::Identity;
@@ -239,6 +240,7 @@ impl ProfileProvider {
         let started = Instant::now();
         let sequence = decoded.sequence;
         let logical_generation = decoded.generation;
+        let source = decoded.source.clone();
         let result = self.commit_inner(decoded, session);
         match &result {
             Ok(()) => tracing::info!(
@@ -246,6 +248,7 @@ impl ProfileProvider {
                 stage = "durable-provider-commit",
                 sequence,
                 logical_generation,
+                source = %source,
                 session_generation = session,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "native profile durably committed before ACK; complete-session admission remains separately gated"
@@ -267,7 +270,7 @@ impl ProfileProvider {
                 // independently committed live state.
                 self.fail_closed_for_session(session);
                 tracing::warn!(component="issuer-profile-provider", stage="durable-provider-commit", sequence, logical_generation,
-                    session_generation=session, elapsed_ms=started.elapsed().as_millis() as u64, error=%error,
+                    source=%source, session_generation=session, elapsed_ms=started.elapsed().as_millis() as u64, error=%error,
                     "native profile rejected; admission closed and existing TLS I/O cancelled");
             }
         }
@@ -293,8 +296,9 @@ impl ProfileProvider {
         let until = decoded.valid_until;
         let at = decoded.published_at;
         let observation: Observation = decoded.reason.into();
+        let source = decoded.source.clone();
         let mut next = ProfileCheckpoint {
-            version: 1,
+            version: super::profile_checkpoint::VERSION,
             origin: self.installation.origin.clone(),
             floors: Floors {
                 sequence,
@@ -305,6 +309,8 @@ impl ProfileProvider {
             observation,
             authority_generation: 0,
             authority_approval_digest: String::new(),
+            authority_source: None,
+            predecessor: None,
             published_unix: at.duration_since(UNIX_EPOCH)?.as_secs(),
             valid_until_unix: until.duration_since(UNIX_EPOCH)?.as_secs(),
             bindings: Vec::new(),
@@ -324,6 +330,7 @@ impl ProfileProvider {
             next.bindings.sort_by(|a, b| a.cluster.cmp(&b.cluster));
             next.authority_generation = generation;
             next.authority_approval_digest = approved;
+            next.authority_source = Some(source.clone());
             let history = previous
                 .as_ref()
                 .map(ProfileCheckpoint::history)
@@ -349,11 +356,13 @@ impl ProfileProvider {
                             && proposed.pins == saved.pins
                             && next.bindings == old.bindings
                             && next.authority_approval_digest == old.authority_approval_digest
+                            && next.authority_source == old.authority_source
                             && next.published_unix == old.published_unix
                             && next.valid_until_unix == old.valid_until_unix
                             && old.observation == Observation::Validated,
                         "same-publication material/lease substitution"
                     );
+                    next.predecessor = old.predecessor.clone();
                     history
                 }
                 (Some(old), Some(history)) => {
@@ -362,12 +371,27 @@ impl ProfileProvider {
                         "material generation rollback"
                     );
                     if generation > old.authority_generation {
+                        // A successor approval object may supply a strictly
+                        // newer generation. Record the object it replaces.
+                        next.predecessor = match &old.authority_source {
+                            Some(previous) if *previous != source => Some(Predecessor {
+                                source: previous.clone(),
+                                generation: old.authority_generation,
+                                approval_digest: old.authority_approval_digest.clone(),
+                            }),
+                            _ => old.predecessor.clone(),
+                        };
                         history.restore_authoritative_snapshot(candidate)?
                     } else {
                         ensure!(
                             next.authority_approval_digest == old.authority_approval_digest,
                             "same material-generation substitution"
                         );
+                        ensure!(
+                            next.authority_source == old.authority_source,
+                            "same material-generation approval source substitution"
+                        );
+                        next.predecessor = old.predecessor.clone();
                         history.replace(candidate)?
                     }
                 }
@@ -378,6 +402,7 @@ impl ProfileProvider {
             if let Some(old) = &previous {
                 material_changed = old.authority_generation != next.authority_generation
                     || old.authority_approval_digest != next.authority_approval_digest
+                    || old.authority_source != next.authority_source
                     || old.bindings != next.bindings
                     || old.anchors.as_ref().map(|a| {
                         (
@@ -404,6 +429,8 @@ impl ProfileProvider {
             if let Some(old) = &previous {
                 next.authority_generation = old.authority_generation;
                 next.authority_approval_digest = old.authority_approval_digest.clone();
+                next.authority_source = old.authority_source.clone();
+                next.predecessor = old.predecessor.clone();
                 next.bindings = old.bindings.clone();
                 next.anchors = old.anchors.clone();
             }
@@ -442,6 +469,20 @@ impl ProfileProvider {
             receipt.sequence() == sequence && receipt.publication_digest() == digest,
             "checkpoint receipt does not match exact ADS publication"
         );
+        if let Some(predecessor) = &next.predecessor
+            && previous.as_ref().and_then(|old| old.predecessor.as_ref()) != Some(predecessor)
+        {
+            tracing::info!(
+                component = "issuer-profile-provider",
+                stage = "approval-source-succession",
+                sequence,
+                logical_generation = generation,
+                predecessor = %predecessor.source,
+                predecessor_generation = predecessor.generation,
+                successor = %source,
+                "successor approval object durably accepted; floors carried, no checkpoint reset"
+            );
+        }
         inner.record = Some(next);
         if material_changed && was_open {
             drop(inner);
@@ -1249,6 +1290,134 @@ mod tests {
         next["sequence"] = json!(seq.to_string());
         next["publicationDigest"] = json!(format!("{seq:064x}"));
         next
+    }
+    /// The same publication from a successor approval object: a new name and
+    /// UID in the pinned namespace with a strictly greater generation.
+    fn successor(w: &Value, seq: u64, generation: u64, name: &str) -> Value {
+        let mut next = advance(w, seq);
+        next["sourceName"] = json!(name);
+        next["sourceUID"] = json!(format!("{name}-uid"));
+        next["generation"] = json!(generation.to_string());
+        next["approvalDigest"] = json!(format!("{generation:064x}"));
+        next
+    }
+    fn resync(p: &ProfileProvider, g: &XdsSessionGate) -> u64 {
+        let s = g.begin_session();
+        p.reset_session();
+        s
+    }
+    #[test]
+    fn successor_source_is_accepted_into_the_same_checkpoint_with_floors_carried() {
+        let d = dir();
+        let (w, e) = fixture();
+        let (p, g, s) = opened(d.path(), &e, fixture_clock);
+        p.commit(decode(&w, &e, fixture_clock)).unwrap();
+        ready(&p, &g, s);
+        let lease = p.acquire().unwrap();
+        let next = successor(&w, 11, 8, "issuer-approval-g8");
+        assert!(
+            p.commit(decode(&next, &e, fixture_clock)).is_err(),
+            "a new approval generation is staged durably, never mixed into the open session"
+        );
+        assert!(lease.check_current().is_err());
+        let saved = p.inner.lock().unwrap().record.clone().unwrap();
+        assert_eq!(
+            (
+                saved.floors.sequence,
+                saved.floors.logical_generation,
+                saved.authority_generation
+            ),
+            (11, 8, 8)
+        );
+        let s = resync(&p, &g);
+        p.commit(decode(&next, &e, fixture_clock)).unwrap();
+        ready(&p, &g, s);
+        let epoch = p.acquire().unwrap().epoch();
+        p.commit(decode(
+            &successor(&w, 12, 8, "issuer-approval-g8"),
+            &e,
+            fixture_clock,
+        ))
+        .unwrap();
+        assert_eq!(
+            p.acquire().unwrap().epoch(),
+            epoch,
+            "a successor renewal keeps the session"
+        );
+    }
+    #[test]
+    fn successor_source_cannot_roll_back_or_be_substituted_at_its_generation() {
+        let d = dir();
+        let (w, e) = fixture();
+        let (p, g, s) = opened(d.path(), &e, fixture_clock);
+        p.commit(decode(&w, &e, fixture_clock)).unwrap();
+        ready(&p, &g, s);
+        let s = resync(&p, &g);
+        p.commit(decode(
+            &successor(&w, 11, 8, "issuer-approval-g8"),
+            &e,
+            fixture_clock,
+        ))
+        .unwrap();
+        ready(&p, &g, s);
+        assert!(
+            p.commit(decode(&advance(&w, 12), &e, fixture_clock))
+                .is_err(),
+            "the predecessor at its old generation is a rollback at any sequence"
+        );
+        resync(&p, &g);
+        assert!(
+            p.commit(decode(
+                &successor(&w, 13, 8, "issuer-approval-other"),
+                &e,
+                fixture_clock
+            ))
+            .is_err(),
+            "another object at the accepted generation is a substitution"
+        );
+        let s = resync(&p, &g);
+        p.commit(decode(
+            &successor(&w, 14, 8, "issuer-approval-g8"),
+            &e,
+            fixture_clock,
+        ))
+        .unwrap();
+        ready(&p, &g, s);
+        assert!(p.acquire().is_ok());
+    }
+    #[test]
+    fn restart_mid_succession_recovers_from_the_durable_successor() {
+        let d = dir();
+        let (w, e) = fixture();
+        let (p, g, s) = opened(d.path(), &e, fixture_clock);
+        p.commit(decode(&w, &e, fixture_clock)).unwrap();
+        ready(&p, &g, s);
+        let next = successor(&w, 11, 8, "issuer-approval-g8");
+        // The successor is durable, its open session fenced: the process stops here.
+        assert!(p.commit(decode(&next, &e, fixture_clock)).is_err());
+        drop(p);
+        // The restart keeps the unchanged installation pins (predecessor, floor 7).
+        let gate = XdsSessionGate::new();
+        let p = ProfileProvider::open_with_clock(
+            d.path(),
+            &e,
+            OpenMode::Existing,
+            gate.clone(),
+            fixture_clock,
+        )
+        .unwrap();
+        let s = gate.begin_session();
+        ready(&p, &gate, s);
+        assert!(p.acquire().is_err(), "recovered history is not a grant");
+        assert!(
+            p.commit(decode(&advance(&w, 12), &e, fixture_clock))
+                .is_err(),
+            "the durable successor floor survives the restart"
+        );
+        let s = resync(&p, &gate);
+        p.commit(decode(&next, &e, fixture_clock)).unwrap();
+        ready(&p, &gate, s);
+        assert!(p.acquire().is_ok());
     }
     #[test]
     fn durable_commit_precedes_activation_and_restart_requires_fresh_session() {
