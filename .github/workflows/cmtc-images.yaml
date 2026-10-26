@@ -1,0 +1,122 @@
+name: CMTC ztunnel image
+# Publishes ghcr.io/ephico2real2/cmtc-ztunnel for linux/amd64 and linux/arm64 from one source commit, built as the CMTC
+# labs build it: Rust 1.90.0, cargo build --locked --release --bin ztunnel (default features: tls-aws-lc, jemalloc), on
+# this repository's Dockerfile (distroless cc-debian13:nonroot).
+# workflow_dispatch only runs from the default branch, so this file lives on ci/images: set SOURCE_SHA and push.
+on:
+  push:
+    branches: [ci/images]
+permissions:
+  contents: read
+env:
+  SOURCE_SHA: 47956afb333b734df2af6a1b06dc5a8afaefbfe2
+  IMAGE: ghcr.io/ephico2real2/cmtc-ztunnel
+concurrency:
+  group: cmtc-ztunnel-image
+  cancel-in-progress: false
+jobs:
+  binary:
+    name: Release binary (${{ matrix.arch }})
+    if: github.repository == 'ephico2real2/ztunnel'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - {arch: amd64, runner: ubuntu-24.04}
+          - {arch: arm64, runner: ubuntu-24.04-arm}
+    steps:
+      - name: Validate immutable source
+        run: '[[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]'
+      - name: Checkout the exact image source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - name: Install Rust 1.90.0
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: 1.90.0
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libprotobuf-dev cmake
+      - name: Build the release binary
+        run: cargo build --locked --release --bin ztunnel
+      - name: Check the binary reports its source
+        run: |
+          out/rust/release/ztunnel version | tee version.txt
+          grep -F "Version:\"$SOURCE_SHA\"" version.txt
+          grep -F 'BuildStatus:"Clean"' version.txt
+          grep -F 'CryptoProvider:"tls-aws-lc"' version.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ztunnel-${{ matrix.arch }}
+          path: out/rust/release/ztunnel
+          retention-days: 7
+  image:
+    name: Multi-architecture image
+    needs: binary
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout the exact image source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with: {name: ztunnel-amd64, path: out/docker/amd64}
+      - uses: actions/download-artifact@v4
+        with: {name: ztunnel-arm64, path: out/docker/arm64}
+      - name: Prepare the build context
+        run: |
+          chmod 0755 out/docker/amd64/ztunnel out/docker/arm64/ztunnel
+          cp Dockerfile out/docker/Dockerfile
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: out/docker
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:sha-${{ env.SOURCE_SHA }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/ephico2real2/ztunnel
+            org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            org.opencontainers.image.title=cmtc-ztunnel
+      - name: Verify the published image and write the lock
+        run: |
+          set -euo pipefail
+          mkdir -p bundle
+          docker buildx imagetools inspect "$IMAGE:sha-$SOURCE_SHA" --format '{{json .Manifest}}' > bundle/index.json
+          digest=$(python3 - <<'PY'
+          import json
+          index = json.load(open('bundle/index.json'))
+          platforms = sorted(f"{m['platform']['os']}/{m['platform']['architecture']}"
+                             for m in index['manifests'] if m['platform']['os'] != 'unknown')
+          assert platforms == ['linux/amd64', 'linux/arm64'], platforms
+          print(index['digest'])
+          PY
+          )
+          docker pull -q "$IMAGE@$digest"
+          [ "$(docker inspect "$IMAGE@$digest" --format '{{.Config.User}} {{json .Config.Entrypoint}}')" = '65532 ["/usr/local/bin/ztunnel"]' ]
+          [ "$(docker inspect "$IMAGE@$digest" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$SOURCE_SHA" ]
+          docker run --rm --network none "$IMAGE@$digest" version | grep -F "Version:\"$SOURCE_SHA\""
+          printf '{"source_sha":"%s","platforms":["linux/amd64","linux/arm64"],"images":{"ztunnel":{"image":"%s@%s","tag":"%s:sha-%s"}}}\n' \
+            "$SOURCE_SHA" "$IMAGE" "$digest" "$IMAGE" "$SOURCE_SHA" | python3 -m json.tool > bundle/images.lock.json
+          cat bundle/images.lock.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cmtc-ztunnel-images-${{ env.SOURCE_SHA }}
+          path: bundle/
+          retention-days: 90
