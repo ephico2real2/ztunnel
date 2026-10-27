@@ -9,7 +9,7 @@ on:
 permissions:
   contents: read
 env:
-  SOURCE_SHA: 0e921980bf6f7649aada0b0e30ed1c8461a67b3e
+  SOURCE_SHA: cefb2bf02cc440106ed22b81edcbf320a8ae9e1f
   IMAGE: ghcr.io/ephico2real2/cmtc-ztunnel
 concurrency:
   group: cmtc-ztunnel-image
