@@ -4,7 +4,7 @@
 //! Authority comes from independently configured authenticated ADS origin and durable
 //! floors; SHA fields provide integrity/correlation, never an admin signature.
 use super::domain_anchors::{
-    AnchorPublication, DomainAnchorSet, pin_from_certificate_with_lineage, spki_der,
+    AnchorPublication, DomainAnchorSet, pin_from_certificate_with_role, spki_der,
 };
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -24,6 +24,9 @@ struct Issuer {
     spki_sha256: String,
     #[serde(default, rename = "lineageDER")]
     lineage_der: Vec<String>,
+    // The pin is the cluster's SPIRE intermediate (see DomainPin).
+    #[serde(default, rename = "signsSPIRECA")]
+    signs_spire_ca: bool,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -401,10 +404,11 @@ pub fn decode(data: &[u8], expected: &Expected, now: SystemTime) -> Result<Decod
                 .iter()
                 .map(|encoded| der(encoded))
                 .collect::<Result<Vec<_>>>()?;
-            pins.push(pin_from_certificate_with_lineage(
+            pins.push(pin_from_certificate_with_role(
                 c.trust_domain.clone().into(),
                 certificate,
                 lineage,
+                issuer.signs_spire_ca,
             )?);
         }
         bindings.push(ClusterBinding {

@@ -461,8 +461,12 @@ impl ProfileCheckpoint {
                 .anchors
                 .as_ref()
                 .context("cannot erase persisted anchor history")?;
+            // A strictly newer approval generation may succeed the root; validate()
+            // has required the new root to be an installation root pin.
             ensure!(
-                previous.local_domain == next.local_domain && previous.root_der == next.root_der,
+                previous.local_domain == next.local_domain
+                    && (previous.root_der == next.root_der
+                        || self.authority_generation > old.authority_generation),
                 "checkpoint changed installed authority"
             );
             ensure!(

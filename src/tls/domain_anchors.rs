@@ -69,6 +69,9 @@ pub struct DomainPin {
     spki_der: Vec<u8>,
     der: CertificateDer<'static>,
     lineage: Vec<CertificateDer<'static>>,
+    // The pin is the cluster's SPIRE intermediate, directly under the root: SPIRE
+    // rotates its signing CA below it, so a peer path has exactly one CA between.
+    signs_spire_ca: bool,
     not_before: SystemTime,
     not_after: SystemTime,
 }
@@ -243,12 +246,25 @@ pub fn pin_from_certificate_with_lineage(
     der: CertificateDer<'static>,
     lineage: Vec<CertificateDer<'static>>,
 ) -> Result<DomainPin, AnchorError> {
+    pin_from_certificate_with_role(trust_domain, der, lineage, false)
+}
+// `signs_spire_ca` pins the cluster's SPIRE intermediate instead of SPIRE's own
+// signing CA. It has no lineage (the root signs it) and path depth for one CA.
+pub fn pin_from_certificate_with_role(
+    trust_domain: Strng,
+    der: CertificateDer<'static>,
+    lineage: Vec<CertificateDer<'static>>,
+    signs_spire_ca: bool,
+) -> Result<DomainPin, AnchorError> {
     validate_domain(&trust_domain)?;
     if lineage.len() > 1 {
         return Err(AnchorError::InvalidPin(trust_domain.to_string()));
     }
     let cert = parse_exact(der.as_ref())?;
     ca_material_for_domain(&cert, Some(&trust_domain))?;
+    if signs_spire_ca && (!lineage.is_empty() || !ca_depth_allows(&cert, 1)?) {
+        return Err(AnchorError::InvalidPin(trust_domain.to_string()));
+    }
     let (mut not_before, mut not_after) = validity(&cert)?;
     let spki_der = cert.public_key().raw.to_vec();
     if let Some(parent_der) = lineage.first() {
@@ -273,6 +289,7 @@ pub fn pin_from_certificate_with_lineage(
         spki_der,
         der,
         lineage,
+        signs_spire_ca,
         not_before,
         not_after,
     })
@@ -281,14 +298,18 @@ impl DomainPin {
     pub fn lineage_ders(&self) -> &[CertificateDer<'static>] {
         &self.lineage
     }
+    pub fn signs_spire_ca(&self) -> bool {
+        self.signs_spire_ca
+    }
     fn current(&self, now: SystemTime) -> bool {
         self.not_before <= now && now < self.not_after
     }
     fn validate_encoded(&self) -> Result<(), AnchorError> {
-        if pin_from_certificate_with_lineage(
+        if pin_from_certificate_with_role(
             self.trust_domain.clone(),
             self.der.clone(),
             self.lineage.clone(),
+            self.signs_spire_ca,
         )? != *self
         {
             return Err(AnchorError::InvalidPin(self.trust_domain.to_string()));
@@ -366,7 +387,7 @@ impl DomainAnchorSet {
                     key,
                     (pin.trust_domain.clone(), parent_der.as_ref().to_vec()),
                 );
-            } else if !ca_depth_allows(&root, 1)?
+            } else if !ca_depth_allows(&root, if pin.signs_spire_ca { 2 } else { 1 })?
                 || cert.issuer() != root.subject()
                 || cert.verify_signature(Some(root.public_key())).is_err()
             {
@@ -501,39 +522,59 @@ fn single_identity(end: &CertificateDer<'_>) -> Result<Identity, AnchorError> {
     }
     Ok(identity)
 }
+// The peer's path to this pin, or None. Returns the path's own expiry: the pin's,
+// or for a SPIRE intermediate pin the earlier of the pin and the SPIRE CA between.
 fn path_accepts(
     end: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
     pin: &DomainPin,
     now: UnixTime,
     role: PeerRole,
-) -> bool {
-    let Ok(leaf) = parse_exact(end.as_ref()) else {
-        return false;
-    };
+) -> Option<SystemTime> {
+    let leaf = parse_exact(end.as_ref()).ok()?;
     if intermediates
         .iter()
         .any(|cert| parse_exact(cert.as_ref()).is_err())
     {
-        return false;
+        return None;
     }
-    let Ok(issuer) = parse_exact(pin.der.as_ref()) else {
-        return false;
-    };
-    if leaf.issuer() != issuer.subject() {
-        return false;
-    }
+    let issuer = parse_exact(pin.der.as_ref()).ok()?;
     let mut roots = RootCertStore::empty();
-    if roots.add(pin.der.clone()).is_err() {
-        return false;
-    }
+    roots.add(pin.der.clone()).ok()?;
     let usage = match role {
         PeerRole::Client => KeyUsage::client_auth(),
         PeerRole::Server => KeyUsage::server_auth(),
     };
     let crls: &[CertRevocationList<'static>] = &[];
-    verify_cert_chain(end, intermediates, &roots, now, usage, crls)
-        .is_ok_and(|chain| chain.intermediates.is_empty())
+    if !pin.signs_spire_ca {
+        if leaf.issuer() != issuer.subject() {
+            return None;
+        }
+        let chain = verify_cert_chain(end, intermediates, &roots, now, usage, crls).ok()?;
+        return chain.intermediates.is_empty().then_some(pin.not_after);
+    }
+    // pin -> exactly one SPIRE CA -> SVID. SPIRE rotates that CA, so it is not
+    // pinned; it must be a CA whose only SAN is this trust domain's SPIFFE URI.
+    let chain = verify_cert_chain(end, intermediates, &roots, now, usage, crls).ok()?;
+    let [spire_ca] = chain.intermediates.as_slice() else {
+        return None;
+    };
+    let ca = parse_exact(spire_ca.as_ref()).ok()?;
+    ca_material_for_domain(&ca, Some(&pin.trust_domain)).ok()?;
+    let has_domain_san = ca
+        .subject_alternative_name()
+        .ok()
+        .flatten()
+        .is_some_and(|san| san.value.general_names.len() == 1);
+    if !has_domain_san
+        || ca.public_key().raw == issuer.public_key().raw
+        || ca.issuer() != issuer.subject()
+        || leaf.issuer() != ca.subject()
+    {
+        return None;
+    }
+    let (_, ca_not_after) = validity(&ca).ok()?;
+    Some(ca_not_after.min(pin.not_after))
 }
 pub fn verify_peer_evidence(
     end: &CertificateDer<'_>,
@@ -550,18 +591,19 @@ pub fn verify_peer_evidence(
     let pins = anchors.current_pins(&domain, observed)?;
     let matched: Vec<_> = pins
         .iter()
-        .filter(|pin| pin.current(observed) && path_accepts(end, intermediates, pin, now, role))
+        .filter(|pin| pin.current(observed))
+        .filter_map(|pin| path_accepts(end, intermediates, pin, now, role).map(|until| (pin, until)))
         .collect();
     for (other, foreign) in &anchors.by_domain {
         if other != &domain
             && foreign.iter().any(|pin| {
-                pin.current(observed) && path_accepts(end, intermediates, pin, now, role)
+                pin.current(observed) && path_accepts(end, intermediates, pin, now, role).is_some()
             })
         {
             return Err(AnchorError::AmbiguousIssuer(domain.to_string()));
         }
     }
-    let [pin] = matched.as_slice() else {
+    let [(pin, path_until)] = matched.as_slice() else {
         return Err(AnchorError::UnauthorizedIssuer(domain.to_string()));
     };
     let (_, leaf_not_after) = validity(&parse_exact(end.as_ref())?)?;
@@ -570,7 +612,7 @@ pub fn verify_peer_evidence(
         anchor_generation: anchors.generation,
         signer_spki: pin.spki_der.clone(),
         valid_until: leaf_not_after
-            .min(pin.not_after)
+            .min(*path_until)
             .min(anchors.root_not_after),
     })
 }
@@ -680,6 +722,10 @@ pub struct CheckpointPin {
     pub domain: String,
     pub certificate_der: String,
     pub lineage_der: Vec<String>,
+    // Absent in checkpoints written before SPIRE intermediate pins, and omitted
+    // when false, so those checkpoints load and re-serialize unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub signs_spire_ca: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -721,6 +767,7 @@ impl AnchorPublication {
                     .iter()
                     .map(|parent| checkpoint_b64(parent.as_ref()))
                     .collect(),
+                signs_spire_ca: p.signs_spire_ca,
             })
             .collect();
         pins.sort_by(|a, b| (&a.domain, &a.certificate_der).cmp(&(&b.domain, &b.certificate_der)));
@@ -774,10 +821,11 @@ impl AnchorPublication {
                 .iter()
                 .map(|parent| checkpoint_der(parent, 24576).map(CertificateDer::from))
                 .collect::<Result<Vec<_>, _>>()?;
-            pins.push(pin_from_certificate_with_lineage(
+            pins.push(pin_from_certificate_with_role(
                 p.domain.clone().into(),
                 checkpoint_der(&p.certificate_der, 32768)?.into(),
                 lineage,
+                p.signs_spire_ca,
             )?);
         }
         // Revalidate DER, root self-signature, direct signatures and uniqueness,
@@ -955,15 +1003,16 @@ impl AnchorPublication {
     /// from candidate.generation (the producer publication sequence). A lease
     /// renewal or same-generation replay is not restore authority. Ordinary
     /// snapshots must continue to use replace(), which rejects withdrawn keys.
-    /// This does not approve a new organizational root or local-domain identity.
+    /// It never changes the local-domain identity. It may succeed the
+    /// organizational root: only a strictly newer approval reaches here, and the
+    /// decoder accepted its root only as an installation root pin. Every pin under
+    /// the old root is then absent from the candidate, so it is fenced and drained.
     pub fn restore_authoritative_snapshot(
         &self,
         candidate: DomainAnchorSet,
     ) -> Result<Self, AnchorError> {
         self.require_newer(candidate.generation)?;
-        if candidate.local_domain != self.set.local_domain
-            || candidate.organizational_root != self.set.organizational_root
-        {
+        if candidate.local_domain != self.set.local_domain {
             return Err(AnchorError::ChangedProfileAuthority);
         }
         let mut next = self.clone();
@@ -2079,11 +2128,6 @@ mod tests {
             all.restore_authoritative_snapshot(changed_local),
             Err(AnchorError::ChangedProfileAuthority)
         );
-        let (_, _, _, other_root_set) = fixture();
-        assert_eq!(
-            all.restore_authoritative_snapshot(other_root_set.with_generation(3).unwrap()),
-            Err(AnchorError::ChangedProfileAuthority)
-        );
         assert_eq!(all, before);
         assert!(
             DomainAnchorSet::try_new(A.into(), set.organizational_root.clone(), 3, vec![]).is_err()
@@ -2490,5 +2534,206 @@ mod tests {
             AnchorPublication::from_checkpoint(&all.checkpoint().unwrap()).unwrap(),
             all
         );
+    }
+
+    fn spire_ca(
+        name: &str,
+        uri: Option<&str>,
+        issuer: &CertifiedIssuer<'_, KeyPair>,
+    ) -> CertifiedIssuer<'static, KeyPair> {
+        let mut params = ca_params(name);
+        params.subject_alt_names = uri
+            .map(|u| SanType::URI(Ia5String::try_from(u.to_string()).unwrap()))
+            .into_iter()
+            .collect();
+        CertifiedIssuer::signed_by(params, KeyPair::generate().unwrap(), issuer).unwrap()
+    }
+    fn intermediate_set(
+        root: &CertifiedIssuer<'_, KeyPair>,
+        intermediate: &CertifiedIssuer<'_, KeyPair>,
+        generation: u64,
+    ) -> Result<DomainAnchorSet, AnchorError> {
+        DomainAnchorSet::try_new(
+            A.into(),
+            root.der().clone(),
+            generation,
+            vec![pin_from_certificate_with_role(
+                A.into(),
+                intermediate.der().clone(),
+                vec![],
+                true,
+            )?],
+        )
+    }
+    #[test]
+    fn spire_intermediate_pin_accepts_exactly_one_rotating_spire_ca() {
+        let root = ca("mesh root");
+        let intermediate = CertifiedIssuer::signed_by(
+            ca_params("cmtc-a SPIRE intermediate"),
+            KeyPair::generate().unwrap(),
+            &root,
+        )
+        .unwrap();
+        let set = intermediate_set(&root, &intermediate, 1).unwrap();
+        let now = UnixTime::since_unix_epoch(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
+        let domain_uri = Some("spiffe://cmtc-a.mesh.example");
+        for role in [PeerRole::Client, PeerRole::Server] {
+            // SPIRE rotates its CA: each CA under the pinned intermediate is accepted.
+            for name in ["SPIRE CA slot A", "SPIRE CA slot B"] {
+                let ca = spire_ca(name, domain_uri, &intermediate);
+                let svid = leaf(&[URI_A], &ca);
+                assert!(verify_peer_certificate(&svid, &[ca.der().clone()], &set, now, role).is_ok());
+                assert!(
+                    verify_peer_certificate(
+                        &svid,
+                        &[ca.der().clone(), intermediate.der().clone()],
+                        &set,
+                        now,
+                        role
+                    )
+                    .is_ok()
+                );
+                // The peer must present the SPIRE CA.
+                assert!(verify_peer_certificate(&svid, &[], &set, now, role).is_err());
+            }
+            // No CA between the pin and the SVID.
+            assert!(verify_peer_certificate(&leaf(&[URI_A], &intermediate), &[], &set, now, role).is_err());
+            // A SPIRE CA without its domain URI, or with another domain's.
+            for uri in [None, Some("spiffe://cmtc-b.mesh.example")] {
+                let ca = spire_ca("not this domain's SPIRE CA", uri, &intermediate);
+                assert!(
+                    verify_peer_certificate(&leaf(&[URI_A], &ca), &[ca.der().clone()], &set, now, role)
+                        .is_err()
+                );
+            }
+            // Two CAs between the pin and the SVID.
+            let ca = spire_ca("SPIRE CA", domain_uri, &intermediate);
+            let below = spire_ca("CA below the SPIRE CA", domain_uri, &ca);
+            assert!(
+                verify_peer_certificate(
+                    &leaf(&[URI_A], &below),
+                    &[below.der().clone(), ca.der().clone()],
+                    &set,
+                    now,
+                    role
+                )
+                .is_err()
+            );
+            // A SPIRE CA from another intermediate under the same root.
+            let other = CertifiedIssuer::signed_by(
+                ca_params("unpinned intermediate"),
+                KeyPair::generate().unwrap(),
+                &root,
+            )
+            .unwrap();
+            let foreign = spire_ca("foreign SPIRE CA", domain_uri, &other);
+            assert!(
+                verify_peer_certificate(
+                    &leaf(&[URI_A], &foreign),
+                    &[foreign.der().clone(), other.der().clone()],
+                    &set,
+                    now,
+                    role
+                )
+                .is_err()
+            );
+        }
+    }
+    #[test]
+    fn spire_intermediate_pin_deadline_includes_the_spire_ca() {
+        let root = ca("mesh root");
+        let intermediate = CertifiedIssuer::signed_by(
+            ca_params("cmtc-a SPIRE intermediate"),
+            KeyPair::generate().unwrap(),
+            &root,
+        )
+        .unwrap();
+        let set = intermediate_set(&root, &intermediate, 1).unwrap();
+        let mut params = ca_params("short SPIRE CA");
+        params.subject_alt_names = vec![SanType::URI(
+            Ia5String::try_from("spiffe://cmtc-a.mesh.example".to_string()).unwrap(),
+        )];
+        params.not_after = rcgen::date_time_ymd(2099, 1, 1);
+        let ca = CertifiedIssuer::signed_by(params, KeyPair::generate().unwrap(), &intermediate)
+            .unwrap();
+        let now = UnixTime::since_unix_epoch(SystemTime::now().duration_since(UNIX_EPOCH).unwrap());
+        let peer = verify_peer_evidence(
+            &leaf(&[URI_A], &ca),
+            &[ca.der().clone()],
+            &set,
+            now,
+            PeerRole::Server,
+        )
+        .unwrap();
+        let (_, ca_not_after) = validity(&parse_exact(ca.der().as_ref()).unwrap()).unwrap();
+        assert_eq!(peer.deadline(), ca_not_after);
+    }
+    #[test]
+    fn spire_intermediate_pin_needs_depth_for_one_ca_and_no_lineage() {
+        let root = ca("mesh root");
+        let intermediate = CertifiedIssuer::signed_by(
+            ca_params("cmtc-a SPIRE intermediate"),
+            KeyPair::generate().unwrap(),
+            &root,
+        )
+        .unwrap();
+        assert!(
+            pin_from_certificate_with_role(
+                A.into(),
+                intermediate.der().clone(),
+                vec![root.der().clone()],
+                true
+            )
+            .is_err()
+        );
+        let no_room = bounded_child("depth-zero intermediate", &root, 0);
+        assert!(pin_from_certificate_with_role(A.into(), no_room.der().clone(), vec![], true).is_err());
+        // The old role still pins a depth-zero CA directly under the root.
+        assert!(pin_from_certificate_with_role(A.into(), no_room.der().clone(), vec![], false).is_ok());
+        let shallow_root = bounded_root(1);
+        let under_shallow = bounded_child("intermediate under a depth-one root", &shallow_root, 1);
+        assert!(intermediate_set(&shallow_root, &under_shallow, 1).is_err());
+    }
+    #[test]
+    fn spire_intermediate_pin_checkpoint_round_trips_and_old_checkpoints_are_unchanged() {
+        let root = ca("mesh root");
+        let intermediate = CertifiedIssuer::signed_by(
+            ca_params("cmtc-a SPIRE intermediate"),
+            KeyPair::generate().unwrap(),
+            &root,
+        )
+        .unwrap();
+        let publication = AnchorPublication::initial(intermediate_set(&root, &intermediate, 1).unwrap());
+        let dto = publication.checkpoint().unwrap();
+        assert!(dto.pins[0].signs_spire_ca);
+        assert_eq!(AnchorPublication::from_checkpoint(&dto).unwrap(), publication);
+        let (_, _, _, old_set) = fixture();
+        let old = AnchorPublication::initial(old_set).checkpoint().unwrap();
+        let encoded = serde_json::to_string(&old).unwrap();
+        assert!(!encoded.contains("signs_spire_ca"));
+        let decoded: AnchorCheckpoint = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, old);
+    }
+    #[test]
+    fn newer_approval_may_succeed_the_root_and_fences_every_old_pin() {
+        let (_, a, b, set) = fixture();
+        let history = AnchorPublication::initial(set);
+        let root = ca("mesh root");
+        let intermediate = CertifiedIssuer::signed_by(
+            ca_params("cmtc-a SPIRE intermediate"),
+            KeyPair::generate().unwrap(),
+            &root,
+        )
+        .unwrap();
+        let successor = intermediate_set(&root, &intermediate, 2).unwrap();
+        let next = history.restore_authoritative_snapshot(successor.clone()).unwrap();
+        assert_eq!(next.set, successor);
+        for old in [a.der(), b.der()] {
+            let spki = spki_der(old.as_ref()).unwrap();
+            assert!(next.bundle_fenced.contains(&spki));
+            assert_eq!(next.drain_admitted_before.get(&spki), Some(&2));
+        }
+        // A replay of the same generation under the new root is still stale.
+        assert!(next.restore_authoritative_snapshot(successor).is_err());
     }
 }
