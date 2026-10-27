@@ -18,6 +18,7 @@ use x509_parser::prelude::FromDer;
 
 use super::crl::CrlManager;
 use super::domain_anchors::PeerRole;
+use super::profile_provider::WallFloor;
 
 const MAX_CRLS: usize = 32;
 const MAX_CRL_BYTES: usize = 1024 * 1024;
@@ -26,7 +27,7 @@ struct Cached {
     sequence: u64,
     deadline: SystemTime,
     monotonic_deadline: Instant,
-    last_wall: SystemTime,
+    floor: WallFloor,
 }
 /// Bound to one exact verified peer leaf and exact approved direct SPIRE issuer.
 /// Clones share expiry state across lower ciphertext and upper plaintext guards.
@@ -83,28 +84,31 @@ impl Coverage {
                 sequence: observation.sequence,
                 deadline,
                 monotonic_deadline,
-                last_wall: now,
+                floor: WallFloor::new(now),
             }),
         }))
     }
     pub fn current(&self, clock: fn() -> SystemTime) -> Result<(SystemTime, Instant)> {
         let received_mono = Instant::now();
-        let now = clock();
         let (result, first_failure) = {
             let mut state = self.cached.lock().expect("native CRL lease");
             ensure!(
                 !self.failed.load(Ordering::Acquire),
                 "native CRL owner permanently fenced"
             );
-            let result = self
-                .check_current(now, received_mono, &mut state)
+            // Read under the lease lock through the floor (see WallFloor): a
+            // bounded backward step is judged at the floor, a larger one fences.
+            let result = state
+                .floor
+                .observe(clock())
+                .context("native CRL clock moved backwards")
+                .and_then(|now| self.check_current(now, received_mono, &mut state))
                 .and_then(|limits| {
-                    let after = clock();
+                    let after = state.floor.observe(clock())?;
                     ensure!(
-                        after >= now && after < limits.0 && Instant::now() < limits.1,
+                        after < limits.0 && Instant::now() < limits.1,
                         "native CRL expired or clock regressed during validation"
                     );
-                    state.last_wall = after;
                     Ok(limits)
                 });
             let failure = result.is_err();
@@ -126,7 +130,6 @@ impl Coverage {
         received_mono: Instant,
         state: &mut Cached,
     ) -> Result<(SystemTime, Instant)> {
-        ensure!(now >= state.last_wall, "native CRL clock moved backwards");
         // Existing owners never resurrect after their coverage has expired,
         // even if a late valid file appears. Recovery requires a new TLS stream.
         ensure!(
@@ -142,7 +145,6 @@ impl Coverage {
             state.deadline = deadline;
             state.sequence = observation.sequence;
         }
-        state.last_wall = now;
         Ok((state.deadline, state.monotonic_deadline))
     }
     pub async fn invalidated(self: Arc<Self>, clock: fn() -> SystemTime) {

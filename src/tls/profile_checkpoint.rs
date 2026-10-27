@@ -14,12 +14,18 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::domain_anchors::{AnchorCheckpoint, AnchorPublication};
-use super::issuer_profile_wire::{Expected, PublicationReason};
+use super::issuer_profile_wire::{ApprovalSource, Expected, PublicationReason};
 use anyhow::{Context, Result, bail, ensure};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-const VERSION: u32 = 1;
+/// Version 2 binds the installation (cluster, node, namespaces, output object,
+/// roots), not the approval object: a successor approval with a strictly
+/// greater generation continues the same checkpoint. Version 1 bound the
+/// approval object's name and UID as immutable scope; it is read once as a
+/// migration and never written again.
+pub(crate) const VERSION: u32 = 2;
+const V1: u32 = 1;
 pub const MAX_CHECKPOINT_BYTES: usize = 2 * 1024 * 1024;
 const STATE: &str = "profile-state.json";
 const PENDING: &str = ".profile-state.pending";
@@ -27,14 +33,16 @@ const MARKER: &str = ".profile-state.initialized";
 const LOCK: &str = ".profile-state.lock";
 const MARKER_BYTES: &[u8] = b"CMTC issuer profile checkpoint v1\n";
 
+/// Immutable installation scope of a checkpoint. The approval object is not
+/// part of it: approvals are immutable ConfigMaps, so each new approval
+/// generation is a new object, and binding its name/UID here forced a
+/// checkpoint reset at every issuer rotation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Origin {
     pub cluster: String,
     pub node: String,
     pub source_namespace: String,
-    pub source_name: String,
-    pub source_uid: String,
     pub output_namespace: String,
     pub output_name: String,
     pub output_uid: String,
@@ -48,8 +56,6 @@ impl Origin {
             cluster: e.cluster.clone(),
             node: e.node.clone(),
             source_namespace: e.source_namespace.clone(),
-            source_name: e.source_name.clone(),
-            source_uid: e.source_uid.clone(),
             output_namespace: e.output_namespace.clone(),
             output_name: e.output_name.clone(),
             output_uid: e.output_uid.clone(),
@@ -68,14 +74,8 @@ impl Origin {
             "invalid independent namespace"
         );
         ensure!(
-            dns(&self.source_name, 253)
-                && dns(&self.output_name, 253)
-                && self.source_name != self.output_name,
-            "invalid independent object names"
-        );
-        ensure!(
-            uid(&self.source_uid) && uid(&self.output_uid) && self.source_uid != self.output_uid,
-            "invalid independent object UIDs"
+            dns(&self.output_name, 253) && uid(&self.output_uid),
+            "invalid independent output object"
         );
         ensure!(
             !self.root_pins.is_empty()
@@ -86,6 +86,50 @@ impl Origin {
         );
         Ok(())
     }
+    /// The root pins an installation adds to this origin; none when it differs in
+    /// any other way. Root pins come only from the administrator's pins file, the
+    /// authority that installed the origin, so a new root can be pinned without a
+    /// checkpoint reset (a lab installed with one organizational root moves to
+    /// the mesh root). Every other field stays immutable, and dropping a root pin
+    /// still fails closed. A new root gains authority only through a strictly
+    /// newer approval generation (`supersedes`).
+    fn added_root_pins(&self, installation: &Origin) -> Vec<String> {
+        let same_scope = Origin {
+            root_pins: installation.root_pins.clone(),
+            ..self.clone()
+        } == *installation;
+        if !same_scope
+            || !self
+                .root_pins
+                .iter()
+                .all(|p| installation.root_pins.contains(p))
+        {
+            return Vec::new();
+        }
+        installation
+            .root_pins
+            .iter()
+            .filter(|p| !self.root_pins.contains(p))
+            .cloned()
+            .collect()
+    }
+    /// An approval object must be distinct from the pinned output object.
+    fn valid_source(&self, source: &ApprovalSource) -> bool {
+        dns(&source.name, 253)
+            && source.name != self.output_name
+            && uid(&source.uid)
+            && source.uid != self.output_uid
+    }
+}
+/// Audit record of the last source succession: the approval object whose
+/// material the current authority source replaced. It is history only and
+/// never authorizes anything.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Predecessor {
+    pub source: ApprovalSource,
+    pub generation: u64,
+    pub approval_digest: String,
 }
 fn dns(s: &str, max: usize) -> bool {
     !s.is_empty()
@@ -116,6 +160,9 @@ pub struct Installation {
     pub minimum_generation: u64,
     pub approval_digest_at_minimum: Option<String>,
     pub publication_digest_at_minimum: Option<String>,
+    // The approval object accepted at `minimum_generation`, like the digest
+    // floor above: it binds that generation only, never a successor.
+    pub source_at_minimum: ApprovalSource,
 }
 impl Installation {
     pub fn from_expected(e: &Expected) -> Self {
@@ -125,10 +172,18 @@ impl Installation {
             minimum_generation: e.minimum_generation,
             approval_digest_at_minimum: e.approval_digest_at_minimum.clone(),
             publication_digest_at_minimum: e.publication_digest_at_minimum.clone(),
+            source_at_minimum: ApprovalSource {
+                name: e.source_name.clone(),
+                uid: e.source_uid.clone(),
+            },
         }
     }
     fn validate(&self) -> Result<()> {
         self.origin.validate()?;
+        ensure!(
+            self.origin.valid_source(&self.source_at_minimum),
+            "invalid independent approval source at the floor"
+        );
         ensure!(
             self.minimum_sequence > 0 && self.minimum_generation > 0,
             "positive independent floors required"
@@ -195,6 +250,10 @@ pub struct ProfileCheckpoint {
     pub observation: Observation,
     pub authority_generation: u64,
     pub authority_approval_digest: String,
+    // The approval object that supplied the `authority_generation` material.
+    // Present exactly when anchor history is present.
+    pub authority_source: Option<ApprovalSource>,
+    pub predecessor: Option<Predecessor>,
     pub published_unix: u64,
     pub valid_until_unix: u64,
     // Last approved bindings/history survive availability withdrawals. This
@@ -215,6 +274,27 @@ impl ProfileCheckpoint {
             self.version == VERSION && self.origin == installation.origin,
             "checkpoint independent origin/root scope differs"
         );
+        if let Some(source) = &self.authority_source {
+            ensure!(
+                self.origin.valid_source(source),
+                "invalid checkpoint authority source"
+            );
+            ensure!(
+                self.authority_generation != installation.minimum_generation
+                    || *source == installation.source_at_minimum,
+                "checkpoint authority source at the independent floor differs"
+            );
+        }
+        if let Some(previous) = &self.predecessor {
+            ensure!(
+                self.origin.valid_source(&previous.source)
+                    && self.authority_source.as_ref() != Some(&previous.source)
+                    && previous.generation > 0
+                    && previous.generation < self.authority_generation
+                    && pin(&previous.approval_digest),
+                "invalid source succession record"
+            );
+        }
         let f = &self.floors;
         ensure!(
             f.sequence >= installation.minimum_sequence
@@ -280,7 +360,8 @@ impl ProfileCheckpoint {
                 ensure!(
                     self.authority_generation > 0
                         && self.authority_generation <= f.logical_generation
-                        && pin(&self.authority_approval_digest),
+                        && pin(&self.authority_approval_digest)
+                        && self.authority_source.is_some(),
                     "last material authority floor missing"
                 );
                 if self.authority_generation == f.logical_generation {
@@ -334,7 +415,9 @@ impl ProfileCheckpoint {
                     && self.observation != Observation::Validated
                     && self.observation != Observation::AuthorityRevoked
                     && self.authority_generation == 0
-                    && self.authority_approval_digest.is_empty(),
+                    && self.authority_approval_digest.is_empty()
+                    && self.authority_source.is_none()
+                    && self.predecessor.is_none(),
                 "no-anchor checkpoint cannot grant bindings/authority"
             ),
         }
@@ -362,8 +445,29 @@ impl ProfileCheckpoint {
         if self.authority_generation == old.authority_generation {
             ensure!(
                 self.authority_approval_digest == old.authority_approval_digest
-                    && self.bindings == old.bindings,
+                    && self.bindings == old.bindings
+                    && self.authority_source == old.authority_source
+                    && self.predecessor == old.predecessor,
                 "same material-generation authority substitution"
+            );
+        } else if self.authority_source != old.authority_source
+            && let Some(previous) = &old.authority_source
+        {
+            // A source succession is a new material generation from another
+            // approval object. Its record names exactly the replaced object.
+            ensure!(
+                self.predecessor
+                    == Some(Predecessor {
+                        source: previous.clone(),
+                        generation: old.authority_generation,
+                        approval_digest: old.authority_approval_digest.clone(),
+                    }),
+                "source succession must record its exact predecessor"
+            );
+        } else {
+            ensure!(
+                self.predecessor == old.predecessor,
+                "succession history changed without a source succession"
             );
         }
         if self.observation != Observation::Validated
@@ -373,7 +477,9 @@ impl ProfileCheckpoint {
                 self.anchors == old.anchors
                     && self.bindings == old.bindings
                     && self.authority_generation == old.authority_generation
-                    && self.authority_approval_digest == old.authority_approval_digest,
+                    && self.authority_approval_digest == old.authority_approval_digest
+                    && self.authority_source == old.authority_source
+                    && self.predecessor == old.predecessor,
                 "availability failure mutated authority history"
             );
         }
@@ -382,8 +488,12 @@ impl ProfileCheckpoint {
                 .anchors
                 .as_ref()
                 .context("cannot erase persisted anchor history")?;
+            // A strictly newer approval generation may succeed the root; validate()
+            // has required the new root to be an installation root pin.
             ensure!(
-                previous.local_domain == next.local_domain && previous.root_der == next.root_der,
+                previous.local_domain == next.local_domain
+                    && (previous.root_der == next.root_der
+                        || self.authority_generation > old.authority_generation),
                 "checkpoint changed installed authority"
             );
             ensure!(
@@ -472,6 +582,85 @@ struct Envelope {
     state: ProfileCheckpoint,
     checksum: String,
 }
+/// Reads only `state.version` to select the strict layout below.
+#[derive(Deserialize)]
+struct VersionProbe {
+    state: VersionField,
+}
+#[derive(Deserialize)]
+struct VersionField {
+    version: u32,
+}
+// The exact v1 layout written by ztunnel f221f29 and earlier. Field order is
+// the checksum input and must not change. Read for migration only.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OriginV1 {
+    cluster: String,
+    node: String,
+    source_namespace: String,
+    source_name: String,
+    source_uid: String,
+    output_namespace: String,
+    output_name: String,
+    output_uid: String,
+    root_pins: Vec<String>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProfileCheckpointV1 {
+    version: u32,
+    origin: OriginV1,
+    floors: Floors,
+    observation: Observation,
+    authority_generation: u64,
+    authority_approval_digest: String,
+    published_unix: u64,
+    valid_until_unix: u64,
+    bindings: Vec<Binding>,
+    anchors: Option<AnchorCheckpoint>,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvelopeV1 {
+    state: ProfileCheckpointV1,
+    checksum: String,
+}
+impl ProfileCheckpointV1 {
+    /// A v1 checkpoint could only hold material from its origin's approval
+    /// object, so that object is the authority source. Floors, observation,
+    /// bindings and anchor history (fences, cutoffs) carry over unchanged.
+    fn migrate(self) -> Result<ProfileCheckpoint> {
+        ensure!(self.version == V1, "v1 checkpoint layout/version differs");
+        let o = self.origin;
+        let source = ApprovalSource {
+            name: o.source_name,
+            uid: o.source_uid,
+        };
+        Ok(ProfileCheckpoint {
+            version: VERSION,
+            origin: Origin {
+                cluster: o.cluster,
+                node: o.node,
+                source_namespace: o.source_namespace,
+                output_namespace: o.output_namespace,
+                output_name: o.output_name,
+                output_uid: o.output_uid,
+                root_pins: o.root_pins,
+            },
+            floors: self.floors,
+            observation: self.observation,
+            authority_generation: self.authority_generation,
+            authority_approval_digest: self.authority_approval_digest,
+            authority_source: self.anchors.is_some().then_some(source),
+            predecessor: None,
+            published_unix: self.published_unix,
+            valid_until_unix: self.valid_until_unix,
+            bindings: self.bindings,
+            anchors: self.anchors,
+        })
+    }
+}
 fn hash(data: &[u8]) -> Result<String> {
     #[cfg(any(feature = "tls-ring", feature = "tls-aws-lc"))]
     let bytes = {
@@ -503,18 +692,53 @@ fn encode(state: &ProfileCheckpoint) -> Result<Vec<u8>> {
     );
     Ok(bytes)
 }
+#[cfg(test)]
 fn decode(bytes: &[u8], installation: &Installation) -> Result<ProfileCheckpoint> {
+    decode_recovered(bytes, installation).map(|(state, _)| state)
+}
+/// Also returns the root pins the installation added to the stored origin.
+fn decode_recovered(
+    bytes: &[u8],
+    installation: &Installation,
+) -> Result<(ProfileCheckpoint, Vec<String>)> {
     ensure!(
         !bytes.is_empty() && bytes.len() <= MAX_CHECKPOINT_BYTES,
         "bounded checkpoint required"
     );
-    let env: Envelope = serde_json::from_slice(bytes).context("strict checkpoint JSON")?;
-    ensure!(
-        pin(&env.checksum) && hash(&serde_json::to_vec(&env.state)?)? == env.checksum,
-        "checkpoint integrity mismatch"
-    );
-    env.state.validate(installation)?;
-    Ok(env.state)
+    let probe: VersionProbe = serde_json::from_slice(bytes).context("strict checkpoint JSON")?;
+    let mut state = match probe.state.version {
+        VERSION => {
+            let env: Envelope = serde_json::from_slice(bytes).context("strict checkpoint JSON")?;
+            ensure!(
+                pin(&env.checksum) && hash(&serde_json::to_vec(&env.state)?)? == env.checksum,
+                "checkpoint integrity mismatch"
+            );
+            env.state
+        }
+        V1 => {
+            // Integrity is checked on the exact v1 bytes before migration. The
+            // file stays v1 on disk until the next distinct durable commit.
+            let env: EnvelopeV1 =
+                serde_json::from_slice(bytes).context("strict v1 checkpoint JSON")?;
+            ensure!(
+                pin(&env.checksum) && hash(&serde_json::to_vec(&env.state)?)? == env.checksum,
+                "checkpoint integrity mismatch"
+            );
+            env.state.migrate()?
+        }
+        version => bail!("unsupported checkpoint version {version}"),
+    };
+    // Integrity is checked on the stored bytes first. Like a v1 migration, the
+    // file keeps the narrower origin until the next distinct durable commit.
+    let added = state.origin.added_root_pins(&installation.origin);
+    if !added.is_empty() {
+        state
+            .origin
+            .root_pins
+            .clone_from(&installation.origin.root_pins);
+    }
+    state.validate(installation)?;
+    Ok((state, added))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -708,6 +932,7 @@ pub struct CheckpointStore {
     installation: Installation,
     marker_inode: Option<Inode>,
     recovered: Option<ProfileCheckpoint>,
+    added_root_pins: Vec<String>,
     state_inode: Option<Inode>,
     state_bytes: Option<Vec<u8>>,
     poisoned: bool,
@@ -735,6 +960,7 @@ impl CheckpointStore {
             installation,
             marker_inode: None,
             recovered: None,
+            added_root_pins: Vec::new(),
             state_inode: None,
             state_bytes: None,
             poisoned: false,
@@ -781,7 +1007,9 @@ impl CheckpointStore {
                 let file = open_at(&store.directory, STATE, libc::O_RDONLY, 0)
                     .context("initialized checkpoint missing; explicit recovery required")?;
                 let bytes = bounded_read(&file, MAX_CHECKPOINT_BYTES)?;
-                store.recovered = Some(decode(&bytes, &store.installation)?);
+                let (recovered, added) = decode_recovered(&bytes, &store.installation)?;
+                store.recovered = Some(recovered);
+                store.added_root_pins = added;
                 store.state_inode = Some(inode(&file)?);
                 store.state_bytes = Some(bytes);
             }
@@ -791,6 +1019,10 @@ impl CheckpointStore {
     }
     pub fn recovered(&self) -> Option<&ProfileCheckpoint> {
         self.recovered.as_ref()
+    }
+    /// Root pins the installation added to the recovered checkpoint's origin.
+    pub fn added_root_pins(&self) -> &[String] {
+        &self.added_root_pins
     }
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
@@ -1078,6 +1310,8 @@ mod tests {
             observation: Observation::Validated,
             authority_generation: d.generation,
             authority_approval_digest: d.approval_digest,
+            authority_source: Some(d.source),
+            predecessor: None,
             published_unix: w["publishedUnix"].as_str().unwrap().parse().unwrap(),
             valid_until_unix: w["validUntilUnix"].as_str().unwrap().parse().unwrap(),
             bindings: d
@@ -1091,6 +1325,37 @@ mod tests {
             anchors: Some(anchors),
         };
         (Installation::from_expected(&e), state, now)
+    }
+    /// Opens a checkpoint store, waiting out a writer lock that only a forked
+    /// copy of a dropped handle still holds. cargo test runs tests as threads of
+    /// one process, and a child that any test spawns holds a copy of every open
+    /// descriptor until it execs, O_CLOEXEC or not; while it does, the flock of
+    /// a handle this test already dropped is still taken. ztunnel itself never
+    /// spawns a process, so CheckpointStore::open stays non-blocking, and a
+    /// handle that is still open keeps the lock past the bound and still fails.
+    fn open_store(
+        path: &Path,
+        installation: Installation,
+        mode: OpenMode,
+    ) -> Result<CheckpointStore> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match CheckpointStore::open(path, installation.clone(), mode) {
+                Err(e) if writer_lock_held(&e) && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                result => return result,
+            }
+        }
+    }
+    fn writer_lock_held(e: &anyhow::Error) -> bool {
+        e.to_string() == "checkpoint writer lock held"
+            && e.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .and_then(std::io::Error::raw_os_error)
+                    == Some(libc::EWOULDBLOCK)
+            })
     }
     fn dir() -> tempfile::TempDir {
         let d = tempfile::tempdir().unwrap();
@@ -1118,8 +1383,7 @@ mod tests {
     }
     fn committed(d: &Path) -> (Installation, ProfileCheckpoint, SystemTime) {
         let (i, s, now) = fixture();
-        let mut store =
-            CheckpointStore::open(d, i.clone(), OpenMode::BootstrapEmptyDirectory).unwrap();
+        let mut store = open_store(d, i.clone(), OpenMode::BootstrapEmptyDirectory).unwrap();
         let receipt = store.commit(s.clone(), now).unwrap();
         assert_eq!(receipt.sequence, s.floors.sequence);
         (i, s, now)
@@ -1128,18 +1392,18 @@ mod tests {
     fn existing_store_never_auto_initializes_and_bootstrap_is_one_shot() {
         let d = dir();
         let (i, s, now) = fixture();
-        assert!(CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).is_err());
+        assert!(open_store(d.path(), i.clone(), OpenMode::Existing).is_err());
         let interrupted = dir();
-        let empty = CheckpointStore::open(
+        let empty = open_store(
             interrupted.path(),
             i.clone(),
             OpenMode::BootstrapEmptyDirectory,
         )
         .unwrap();
         drop(empty);
-        assert!(CheckpointStore::open(interrupted.path(), i.clone(), OpenMode::Existing).is_err());
+        assert!(open_store(interrupted.path(), i.clone(), OpenMode::Existing).is_err());
         assert!(
-            CheckpointStore::open(
+            open_store(
                 interrupted.path(),
                 i.clone(),
                 OpenMode::BootstrapEmptyDirectory
@@ -1147,21 +1411,19 @@ mod tests {
             .is_err()
         );
         // Existing open creates only a private cooperative lock, not a state.
-        let mut first =
-            CheckpointStore::open(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).unwrap();
+        let mut first = open_store(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).unwrap();
         first.commit(s, now).unwrap();
         drop(first);
-        assert!(
-            CheckpointStore::open(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).is_err()
-        );
+        assert!(open_store(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).is_err());
         std::fs::remove_file(d.path().join(STATE)).unwrap();
-        assert!(CheckpointStore::open(d.path(), i, OpenMode::Existing).is_err());
+        assert!(open_store(d.path(), i, OpenMode::Existing).is_err());
     }
     #[test]
     fn held_writer_lock_refuses_concurrent_owner_and_detects_replacement() {
         let d = dir();
         let (i, s, now) = committed(d.path());
-        let mut first = CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        let mut first = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        // A live owner is refused at once: the store's open never waits.
         assert!(CheckpointStore::open(d.path(), i, OpenMode::Existing).is_err());
         std::fs::remove_file(d.path().join(LOCK)).unwrap();
         std::fs::write(d.path().join(LOCK), b"").unwrap();
@@ -1177,17 +1439,13 @@ mod tests {
         let link = parent.path().join("symlink");
         symlink(target.path(), &link).unwrap();
         let (i, _, _) = fixture();
-        assert!(CheckpointStore::open(&link, i.clone(), OpenMode::Existing).is_err());
+        assert!(open_store(&link, i.clone(), OpenMode::Existing).is_err());
         let d = dir();
         std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            CheckpointStore::open(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).is_err()
-        );
+        assert!(open_store(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).is_err());
         let d = dir();
         std::fs::write(d.path().join("foreign"), b"preserve").unwrap();
-        assert!(
-            CheckpointStore::open(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).is_err()
-        );
+        assert!(open_store(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).is_err());
         assert_eq!(
             std::fs::read(d.path().join("foreign")).unwrap(),
             b"preserve"
@@ -1196,12 +1454,12 @@ mod tests {
         let (i, _, _) = committed(d.path());
         let state = d.path().join(STATE);
         std::fs::hard_link(&state, d.path().join("foreign-link")).unwrap();
-        assert!(CheckpointStore::open(d.path(), i, OpenMode::Existing).is_err());
+        assert!(open_store(d.path(), i, OpenMode::Existing).is_err());
         let d = dir();
         let (i, _, _) = committed(d.path());
         std::fs::remove_file(d.path().join(STATE)).unwrap();
         symlink(parent.path().join("foreign"), d.path().join(STATE)).unwrap();
-        assert!(CheckpointStore::open(d.path(), i, OpenMode::Existing).is_err());
+        assert!(open_store(d.path(), i, OpenMode::Existing).is_err());
     }
     #[test]
     fn detects_held_directory_path_substitution_without_writing_new_directory() {
@@ -1210,7 +1468,7 @@ mod tests {
         std::fs::create_dir(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (i, s, now) = committed(&path);
-        let mut store = CheckpointStore::open(&path, i, OpenMode::Existing).unwrap();
+        let mut store = open_store(&path, i, OpenMode::Existing).unwrap();
         std::fs::rename(&path, parent.path().join("old")).unwrap();
         std::fs::create_dir(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1233,7 +1491,8 @@ mod tests {
             let mut changed = i.clone();
             match variant {
                 0 => changed.origin.node = "other-node".into(),
-                1 => changed.origin.source_uid = "other-source".into(),
+                // The pinned floor source still binds the floor generation.
+                1 => changed.source_at_minimum.uid = "other-source".into(),
                 2 => changed.origin.output_uid = "other-output".into(),
                 3 => changed.origin.root_pins = vec!["f".repeat(64)],
                 4 => changed.minimum_sequence += 1,
@@ -1244,12 +1503,77 @@ mod tests {
         let mut changed = i.clone();
         changed.publication_digest_at_minimum = Some("f".repeat(64));
         assert!(decode(&bytes, &changed).is_err());
+        // An added root pin does not excuse any other origin change.
+        for variant in 0..3 {
+            let mut changed = i.clone();
+            changed.origin.root_pins.push("f".repeat(64));
+            changed.origin.root_pins.sort();
+            match variant {
+                0 => changed.origin.node = "other-node".into(),
+                1 => changed.origin.output_uid = "other-output".into(),
+                _ => changed.origin.cluster = "other-cluster".into(),
+            };
+            assert!(decode(&bytes, &changed).is_err(), "variant {variant}");
+        }
+    }
+    /// The administrator adds a root pin (the move to the mesh root): the
+    /// checkpoint continues with its floors and history, a load never writes it,
+    /// and the first distinct commit records the wider origin. Dropping the pin
+    /// afterwards fails closed.
+    #[test]
+    fn installation_root_pin_extension_continues_the_checkpoint() {
+        let d = dir();
+        let (i, s, now) = committed(d.path());
+        let added = "f".repeat(64);
+        let mut wider = i.clone();
+        wider.origin.root_pins.push(added.clone());
+        wider.origin.root_pins.sort();
+        let state = d.path().join(STATE);
+        let on_disk = std::fs::read(&state).unwrap();
+        for _restart in 0..2 {
+            let store = open_store(d.path(), wider.clone(), OpenMode::Existing).unwrap();
+            assert_eq!(store.added_root_pins(), std::slice::from_ref(&added));
+            let recovered = store.recovered().unwrap();
+            assert_eq!(recovered.origin, wider.origin);
+            assert_eq!(
+                (&recovered.floors, &recovered.anchors, &recovered.bindings),
+                (&s.floors, &s.anchors, &s.bindings)
+            );
+            drop(store);
+            assert_eq!(
+                std::fs::read(&state).unwrap(),
+                on_disk,
+                "a load wrote the checkpoint"
+            );
+        }
+        let mut store = open_store(d.path(), wider.clone(), OpenMode::Existing).unwrap();
+        let mut same = s.clone();
+        same.origin = wider.origin.clone();
+        store.commit(same, now).unwrap();
+        assert_eq!(
+            std::fs::read(&state).unwrap(),
+            on_disk,
+            "an equal commit rewrote the checkpoint"
+        );
+        let mut next = advanced(&s);
+        next.origin = wider.origin.clone();
+        store.commit(next, now).unwrap();
+        drop(store);
+        assert_ne!(std::fs::read(&state).unwrap(), on_disk);
+        let store = open_store(d.path(), wider.clone(), OpenMode::Existing).unwrap();
+        assert!(store.added_root_pins().is_empty());
+        drop(store);
+        let refused = open_store(d.path(), i, OpenMode::Existing).err().unwrap();
+        assert!(
+            format!("{refused:#}").contains("checkpoint independent origin/root scope differs"),
+            "{refused:#}"
+        );
     }
     #[test]
     fn commit_sequence_generation_and_digest_floors_never_roll_back() {
         let d = dir();
         let (i, s, now) = committed(d.path());
-        let mut store = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i, OpenMode::Existing).unwrap();
         let inode = store.state_inode;
         store.commit(s.clone(), now).unwrap();
         assert_eq!(store.state_inode, inode);
@@ -1269,7 +1593,7 @@ mod tests {
     fn unavailable_observation_preserves_authority_and_recovered_lease_is_not_a_grant() {
         let d = dir();
         let (i, s, now) = committed(d.path());
-        let mut store = CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
         let mut unavailable = s.clone();
         unavailable.floors.sequence += 1;
         unavailable.floors.publication_digest = "a".repeat(64);
@@ -1278,7 +1602,7 @@ mod tests {
         store.commit(unavailable.clone(), now).unwrap();
         assert_eq!(store.recovered().unwrap().anchors, s.anchors);
         drop(store);
-        let loaded = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+        let loaded = open_store(d.path(), i, OpenMode::Existing).unwrap();
         assert_eq!(loaded.recovered().unwrap(), &unavailable);
         // No ready/session/ACK data is returned, and opening is independent of
         // wall clock; certificate history may be needed long after lease expiry.
@@ -1287,7 +1611,7 @@ mod tests {
         expired.floors.sequence += 2;
         expired.anchors.as_mut().unwrap().sequence = expired.floors.sequence;
         drop(loaded);
-        let mut store = CheckpointStore::open(d.path(), fixture().0, OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), fixture().0, OpenMode::Existing).unwrap();
         assert!(
             store
                 .commit(expired, now + Duration::from_secs(60))
@@ -1312,12 +1636,11 @@ mod tests {
         next.authority_generation = 8;
         next.authority_approval_digest = "b".repeat(64);
         let d = dir();
-        let mut store =
-            CheckpointStore::open(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).unwrap();
+        let mut store = open_store(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).unwrap();
         store.commit(s.clone(), now).unwrap();
         store.commit(next.clone(), now).unwrap();
         drop(store);
-        let mut reopened = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+        let mut reopened = open_store(d.path(), i, OpenMode::Existing).unwrap();
         let history = reopened.recovered().unwrap().history().unwrap().unwrap();
         assert_eq!(history, revoked);
         assert!(history.bundle_fenced(&key));
@@ -1347,6 +1670,190 @@ mod tests {
         approved.anchors = Some(restored.checkpoint().unwrap());
         reopened.commit(approved, now).unwrap();
     }
+    /// The exact bytes the v1 writer (ztunnel f221f29) committed for the
+    /// fixture: origin bound to the approval object `issuer-approval`.
+    const V1_STATE: &[u8] = include_bytes!("profile-state-v1-f221f29.json");
+    fn v1_store() -> tempfile::TempDir {
+        let d = dir();
+        let (i, _, _) = fixture();
+        drop(open_store(d.path(), i, OpenMode::BootstrapEmptyDirectory).unwrap());
+        let path = d.path().join(STATE);
+        std::fs::write(&path, V1_STATE).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        d
+    }
+    /// A successor approval object supplies generation 8 at sequence 11.
+    fn successor(old: &ProfileCheckpoint, name: &str) -> ProfileCheckpoint {
+        let mut next = advanced(old);
+        next.floors.logical_generation = 8;
+        next.floors.approval_digest = "8".repeat(64);
+        next.authority_generation = 8;
+        next.authority_approval_digest = "8".repeat(64);
+        let previous = old.authority_source.clone().unwrap();
+        next.authority_source = Some(ApprovalSource {
+            name: name.into(),
+            uid: format!("{name}-uid"),
+        });
+        next.predecessor = Some(Predecessor {
+            source: previous,
+            generation: old.authority_generation,
+            approval_digest: old.authority_approval_digest.clone(),
+        });
+        next
+    }
+    #[test]
+    fn v1_checkpoint_on_disk_is_migrated_in_place_without_reset_or_rewrite() {
+        let d = v1_store();
+        let (i, s, now) = fixture();
+        let mut store = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        // The v1 origin's approval object becomes the recorded authority source.
+        assert_eq!(store.recovered().unwrap(), &s);
+        assert_eq!(
+            store
+                .recovered()
+                .unwrap()
+                .authority_source
+                .as_ref()
+                .unwrap(),
+            &i.source_at_minimum
+        );
+        // Revalidating the same publication fsyncs the v1 file; it never rewrites it.
+        store.commit(s.clone(), now).unwrap();
+        assert_eq!(std::fs::read(d.path().join(STATE)).unwrap(), V1_STATE);
+        // Bootstrap still refuses the initialized directory.
+        drop(store);
+        assert!(open_store(d.path(), i.clone(), OpenMode::BootstrapEmptyDirectory).is_err());
+        // The first new commit writes v2 with every floor and history entry carried.
+        let mut store = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        let next = successor(&s, "issuer-approval-g8");
+        store.commit(next.clone(), now).unwrap();
+        drop(store);
+        let reopened = open_store(d.path(), i, OpenMode::Existing).unwrap();
+        assert_eq!(reopened.recovered().unwrap(), &next);
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(d.path().join(STATE)).unwrap()).unwrap();
+        assert_eq!(raw["state"]["version"], 2);
+        assert!(raw["state"]["origin"].get("source_uid").is_none());
+    }
+    #[test]
+    fn v1_checkpoint_keeps_integrity_and_installation_scope() {
+        let (i, _, _) = fixture();
+        assert!(decode(V1_STATE, &i).is_ok());
+        let mut tampered = V1_STATE.to_vec();
+        let at = tampered
+            .windows(b"\"sequence\":10".len())
+            .position(|w| w == b"\"sequence\":10")
+            .unwrap();
+        tampered[at + b"\"sequence\":1".len()] = b'1';
+        assert!(decode(&tampered, &i).is_err(), "v1 checksum not enforced");
+        for variant in 0..5 {
+            let mut changed = i.clone();
+            match variant {
+                0 => changed.origin.node = "other-node".into(),
+                1 => changed.origin.output_uid = "other-output".into(),
+                2 => changed.origin.root_pins = vec!["f".repeat(64)],
+                3 => changed.minimum_generation += 1,
+                // At the floor generation the v1 approval object is still bound.
+                _ => changed.source_at_minimum.uid = "other-source".into(),
+            }
+            assert!(decode(V1_STATE, &changed).is_err(), "variant {variant}");
+        }
+        let mut future = V1_STATE.to_vec();
+        let at = future
+            .windows(b"\"version\":1".len())
+            .position(|w| w == b"\"version\":1")
+            .unwrap();
+        future[at + b"\"version\":".len()] = b'3';
+        assert!(decode(&future, &i).is_err());
+    }
+    #[test]
+    fn source_succession_carries_floors_and_records_its_exact_predecessor() {
+        let d = dir();
+        let (i, s, now) = committed(d.path());
+        let mut store = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        let next = successor(&s, "issuer-approval-g8");
+        let mut unrecorded = next.clone();
+        unrecorded.predecessor = None;
+        assert!(store.commit(unrecorded, now).is_err());
+        let mut misrecorded = next.clone();
+        misrecorded.predecessor.as_mut().unwrap().generation = 6;
+        assert!(store.commit(misrecorded, now).is_err());
+        let mut same_generation = next.clone();
+        same_generation.floors.logical_generation = 7;
+        same_generation.floors.approval_digest = s.floors.approval_digest.clone();
+        same_generation.authority_generation = 7;
+        same_generation.authority_approval_digest = s.authority_approval_digest.clone();
+        same_generation.predecessor = None;
+        assert!(
+            store.commit(same_generation, now).is_err(),
+            "another object cannot supply the accepted generation"
+        );
+        assert!(!store.is_poisoned());
+        store.commit(next.clone(), now).unwrap();
+        // The successor is now the floor: its renewal keeps the record.
+        let renewal = advanced(&next);
+        assert_eq!(renewal.floors.sequence, 12);
+        store.commit(renewal.clone(), now).unwrap();
+        // A third object at the accepted generation is a substitution.
+        let mut third = advanced(&renewal);
+        third.authority_source = Some(ApprovalSource {
+            name: "issuer-approval-other".into(),
+            uid: "issuer-approval-other-uid".into(),
+        });
+        assert!(store.commit(third, now).is_err());
+        // Rolling back to the predecessor's generation is refused at any sequence.
+        let mut rollback = advanced(&renewal);
+        rollback.floors.logical_generation = 7;
+        rollback.floors.approval_digest = s.floors.approval_digest.clone();
+        rollback.authority_generation = 7;
+        rollback.authority_approval_digest = s.authority_approval_digest.clone();
+        rollback.authority_source = s.authority_source.clone();
+        rollback.predecessor = None;
+        assert!(store.commit(rollback, now).is_err());
+        // Erasing or rewriting the audit record is refused.
+        let mut erased = advanced(&renewal);
+        erased.predecessor = None;
+        assert!(store.commit(erased, now).is_err());
+        assert!(!store.is_poisoned());
+        drop(store);
+        // A restart with the unchanged installation pins (predecessor at floor 7) recovers.
+        let reopened = open_store(d.path(), i, OpenMode::Existing).unwrap();
+        assert_eq!(reopened.recovered().unwrap(), &renewal);
+    }
+    #[test]
+    fn crash_child_succession() {
+        let Ok(path) = std::env::var("CMTC_CHECKPOINT_SUCCESSION_CRASH_PATH") else {
+            return;
+        };
+        let (i, s, now) = fixture();
+        let mut store = open_store(Path::new(&path), i, OpenMode::Existing).unwrap();
+        store.fault = Some(TestFault {
+            boundary: TestBoundary::AfterRename,
+            action: TestAction::Kill,
+        });
+        let _ = store.commit(successor(&s, "issuer-approval-g8"), now);
+        panic!("child must be SIGKILLed after the succession rename");
+    }
+    #[test]
+    fn sigkill_after_succession_rename_recovers_the_successor_from_a_v1_store() {
+        let d = v1_store();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tls::profile_checkpoint::tests::crash_child_succession",
+                "--nocapture",
+            ])
+            .env("CMTC_CHECKPOINT_SUCCESSION_CRASH_PATH", d.path())
+            .status()
+            .unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        let (i, s, now) = fixture();
+        let mut recovered = open_store(d.path(), i, OpenMode::Existing).unwrap();
+        let next = successor(&s, "issuer-approval-g8");
+        assert_eq!(recovered.recovered().unwrap(), &next);
+        // The visible rename is re-synced before it is acknowledged again.
+        assert_eq!(recovered.commit(next, now).unwrap().sequence(), 11);
+    }
     #[test]
     fn injected_io_failure_poisons_handle_and_reopen_preserves_old_or_committed_state() {
         for boundary in [
@@ -1357,7 +1864,7 @@ mod tests {
         ] {
             let d = dir();
             let (i, s, now) = committed(d.path());
-            let mut store = CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+            let mut store = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
             let next = advanced(&s);
             store.fault = Some(TestFault {
                 boundary,
@@ -1367,7 +1874,7 @@ mod tests {
             assert!(store.is_poisoned());
             assert!(store.commit(next.clone(), now).is_err());
             drop(store);
-            let mut reopened = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+            let mut reopened = open_store(d.path(), i, OpenMode::Existing).unwrap();
             let expected = if matches!(
                 boundary,
                 TestBoundary::AfterRename | TestBoundary::AfterDirectorySync
@@ -1402,7 +1909,7 @@ mod tests {
             _ => panic!("unknown boundary"),
         };
         let (i, s, now) = fixture();
-        let mut store = CheckpointStore::open(Path::new(&path), i, OpenMode::Existing).unwrap();
+        let mut store = open_store(Path::new(&path), i, OpenMode::Existing).unwrap();
         store.fault = Some(TestFault {
             boundary,
             action: TestAction::Kill,
@@ -1426,7 +1933,7 @@ mod tests {
                 .status()
                 .unwrap();
             assert_eq!(status.signal(), Some(libc::SIGKILL));
-            let recovered = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+            let recovered = open_store(d.path(), i, OpenMode::Existing).unwrap();
             assert_eq!(
                 recovered.recovered().unwrap().floors.sequence,
                 if stage == "synced" {
@@ -1442,11 +1949,11 @@ mod tests {
         let d = dir();
         let (i, _, _) = committed(d.path());
         std::fs::write(d.path().join(STATE), b"{corrupt").unwrap();
-        assert!(CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).is_err());
-        assert!(CheckpointStore::open(d.path(), i, OpenMode::BootstrapEmptyDirectory).is_err());
+        assert!(open_store(d.path(), i.clone(), OpenMode::Existing).is_err());
+        assert!(open_store(d.path(), i, OpenMode::BootstrapEmptyDirectory).is_err());
         let d = dir();
         let (i, s, now) = committed(d.path());
-        let mut store = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i, OpenMode::Existing).unwrap();
         std::fs::remove_file(d.path().join(MARKER)).unwrap();
         assert!(store.commit(advanced(&s), now).is_err());
         assert!(store.is_poisoned());
@@ -1455,7 +1962,7 @@ mod tests {
     fn explicit_all_issuer_revocation_is_durable_and_requires_new_material_authority_to_restore() {
         let d = dir();
         let (i, s, now) = committed(d.path());
-        let mut store = CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
         let original = s.history().unwrap().unwrap();
         let withdrawn = original.withdraw_all(11).unwrap();
         let mut revoked = s.clone();
@@ -1466,7 +1973,7 @@ mod tests {
         revoked.anchors = Some(withdrawn.checkpoint().unwrap());
         store.commit(revoked.clone(), now).unwrap();
         drop(store);
-        let mut store = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i, OpenMode::Existing).unwrap();
         assert_eq!(
             store.recovered().unwrap().history().unwrap().unwrap(),
             withdrawn
@@ -1489,7 +1996,7 @@ mod tests {
     fn unavailable_new_producer_floor_does_not_erase_last_material_generation() {
         let d = dir();
         let (i, s, now) = committed(d.path());
-        let mut store = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i, OpenMode::Existing).unwrap();
         let mut unavailable = s.clone();
         unavailable.floors.sequence = 11;
         unavailable.floors.logical_generation = 8;
@@ -1529,7 +2036,7 @@ mod tests {
      {
         let d = dir();
         let (i, s, now) = committed(d.path());
-        let mut store = CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
         std::fs::write(d.path().join(STATE), b"{}").unwrap();
         assert!(store.commit(advanced(&s), now).is_err());
         assert!(store.is_poisoned());
@@ -1537,19 +2044,19 @@ mod tests {
         let d = dir();
         let (i, s, now) = committed(d.path());
         let old = std::fs::read(d.path().join(STATE)).unwrap();
-        let mut store = CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+        let mut store = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
         store.commit(advanced(&s), now).unwrap();
         drop(store);
         std::fs::write(d.path().join(STATE), old).unwrap();
         let mut floor = i;
         floor.minimum_sequence = 11;
         floor.publication_digest_at_minimum = Some("a".repeat(64));
-        assert!(CheckpointStore::open(d.path(), floor, OpenMode::Existing).is_err());
+        assert!(open_store(d.path(), floor, OpenMode::Existing).is_err());
         let d = dir();
         let (i, _, _) = committed(d.path());
         std::fs::set_permissions(d.path().join(STATE), std::fs::Permissions::from_mode(0o644))
             .unwrap();
-        assert!(CheckpointStore::open(d.path(), i, OpenMode::Existing).is_err());
+        assert!(open_store(d.path(), i, OpenMode::Existing).is_err());
     }
 
     #[test]
@@ -1562,16 +2069,14 @@ mod tests {
             let d = dir();
             let (i, s, now) = committed(d.path());
             let next = advanced(&s);
-            let mut interrupted =
-                CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+            let mut interrupted = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
             interrupted.fault = Some(TestFault {
                 boundary: TestBoundary::AfterRename,
                 action: TestAction::Error,
             });
             assert!(interrupted.commit(next.clone(), now).is_err());
             drop(interrupted);
-            let mut reopened =
-                CheckpointStore::open(d.path(), i.clone(), OpenMode::Existing).unwrap();
+            let mut reopened = open_store(d.path(), i.clone(), OpenMode::Existing).unwrap();
             assert_eq!(reopened.recovered().unwrap(), &next);
             reopened.fault = Some(TestFault {
                 boundary,
@@ -1580,7 +2085,7 @@ mod tests {
             assert!(reopened.commit(next.clone(), now).is_err());
             assert!(reopened.is_poisoned());
             drop(reopened);
-            let mut final_owner = CheckpointStore::open(d.path(), i, OpenMode::Existing).unwrap();
+            let mut final_owner = open_store(d.path(), i, OpenMode::Existing).unwrap();
             let inode = final_owner.state_inode;
             assert_eq!(
                 final_owner.commit(next.clone(), now).unwrap().sequence(),
@@ -1597,10 +2102,10 @@ mod tests {
         let entry = std::env::var("CMTC_CHECKPOINT_FIFO_ENTRY").unwrap();
         let (i, _, _) = fixture();
         if entry == PENDING {
-            let mut store = CheckpointStore::open(Path::new(&path), i, OpenMode::Existing).unwrap();
+            let mut store = open_store(Path::new(&path), i, OpenMode::Existing).unwrap();
             assert!(store.remove_pending_for_recovery().is_err());
         } else {
-            assert!(CheckpointStore::open(Path::new(&path), i, OpenMode::Existing).is_err());
+            assert!(open_store(Path::new(&path), i, OpenMode::Existing).is_err());
         }
     }
     #[test]

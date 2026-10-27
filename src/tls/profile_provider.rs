@@ -23,7 +23,8 @@ use super::domain_anchors::{AnchorPublication, PeerRole, VerifiedPeer, verify_pe
 use super::handshake::HandshakeObserver;
 use super::issuer_profile_wire::{Decoded, Expected};
 use super::profile_checkpoint::{
-    Binding, CheckpointStore, Floors, Installation, Observation, OpenMode, ProfileCheckpoint,
+    Binding, CheckpointStore, Floors, Installation, Observation, OpenMode, Predecessor,
+    ProfileCheckpoint,
 };
 use super::revocation::{ConnRegistration, RevocationHandle, verify_cert_chain};
 use crate::identity::Identity;
@@ -43,9 +44,58 @@ struct Inner {
     record: Option<ProfileCheckpoint>,
     active: Option<Active>,
     epoch: u64,
-    last_wall: SystemTime,
+    floor: WallFloor,
     next_flow: u64,
     flows: BTreeMap<u64, (u64, u64)>,
+}
+/// Largest backward wall-clock step a verifier absorbs instead of revoking
+/// trust. On the CMTC lab the Lima VZ host agent steps the guest clock back by
+/// 100-142 ms every 10-20 s (its log, 2026-10-25); a larger step, or a floor
+/// the clock does not catch up with within this bound, still fails closed.
+pub(crate) const MAX_ABSORBED_WALL_ROLLBACK: Duration = Duration::from_secs(1);
+/// High-water mark of the wall clock. Every validity decision uses `observe`,
+/// which never returns a time earlier than one already observed: after a
+/// backward step expiry is judged at the floor, which is stricter, so a step
+/// cannot make an expired lease, certificate, fence or CRL current again.
+/// The floor is never lowered or reset.
+pub(crate) struct WallFloor {
+    wall: SystemTime,
+    /// When the clock was first observed behind the floor; cleared once it
+    /// catches up. Idle time before a step does not count against the bound.
+    behind_since: Option<Instant>,
+}
+impl WallFloor {
+    pub(crate) fn new(now: SystemTime) -> Self {
+        Self {
+            wall: now,
+            behind_since: None,
+        }
+    }
+    pub(crate) fn observe(&mut self, raw: SystemTime) -> Result<SystemTime> {
+        match self.wall.duration_since(raw) {
+            Err(_) => {
+                *self = Self::new(raw);
+                Ok(raw)
+            }
+            Ok(back) if back.is_zero() => {
+                self.behind_since = None;
+                Ok(raw)
+            }
+            Ok(back) => {
+                // Bound both the step and how long the clock stays behind the
+                // floor, so repeated small steps cannot freeze verifier time.
+                let held = self.behind_since.get_or_insert_with(Instant::now).elapsed();
+                ensure!(
+                    back <= MAX_ABSORBED_WALL_ROLLBACK && held <= MAX_ABSORBED_WALL_ROLLBACK,
+                    "wall clock moved backwards by {:?} (behind the floor for {:?}, bound {:?})",
+                    back,
+                    held,
+                    MAX_ABSORBED_WALL_ROLLBACK
+                );
+                Ok(self.wall)
+            }
+        }
+    }
 }
 /// All origin/root pins are supplied by the administrator, not by ADS or the
 /// checkpoint. Recovered history never becomes an active provider on its own.
@@ -89,6 +139,14 @@ impl ProfileProvider {
     ) -> Result<Arc<Self>> {
         let installation = Installation::from_expected(expected);
         let store = CheckpointStore::open(path, installation.clone(), mode)?;
+        if !store.added_root_pins().is_empty() {
+            tracing::info!(
+                component = "issuer-profile-provider",
+                stage = "installation-root-pin-extension",
+                added = ?store.added_root_pins(),
+                "checkpoint origin gains administrator root pins; floors, history and fences carried, no checkpoint reset; written at the next durable commit"
+            );
+        }
         let record = store.recovered().cloned();
         // Revalidate cumulative DER history now. This does not restore a lease.
         if let Some(record) = &record {
@@ -103,7 +161,7 @@ impl ProfileProvider {
                 record,
                 active: None,
                 epoch: 1,
-                last_wall: clock(),
+                floor: WallFloor::new(clock()),
                 next_flow: 0,
                 flows: BTreeMap::new(),
             }),
@@ -123,16 +181,23 @@ impl ProfileProvider {
         self.changes.subscribe()
     }
     pub fn available_for_session(&self, generation: u64) -> bool {
-        let inner = self.inner.lock().expect("profile state");
+        let mut inner = self.inner.lock().expect("profile state");
+        let Ok(now) = inner.floor.observe((self.clock)()) else {
+            return false;
+        };
         inner.active.as_ref().is_some_and(|a| {
             !self.poisoned.load(Ordering::Acquire)
                 && a.session == generation
                 && self.gate.snapshot().generation == generation
                 && !self.gate.is_revoked()
-                && (self.clock)() >= inner.last_wall
-                && (self.clock)() < a.until
+                && now < a.until
                 && Instant::now() < a.monotonic_until
         })
+    }
+    /// The time validity decisions use; see `WallFloor`.
+    pub fn verifier_now(&self) -> Result<SystemTime> {
+        let mut inner = self.inner.lock().expect("profile state");
+        inner.floor.observe((self.clock)())
     }
     fn notify(&self) {
         self.changes.send_modify(|n| *n = n.wrapping_add(1));
@@ -183,6 +248,7 @@ impl ProfileProvider {
         let started = Instant::now();
         let sequence = decoded.sequence;
         let logical_generation = decoded.generation;
+        let source = decoded.source.clone();
         let result = self.commit_inner(decoded, session);
         match &result {
             Ok(()) => tracing::info!(
@@ -190,6 +256,7 @@ impl ProfileProvider {
                 stage = "durable-provider-commit",
                 sequence,
                 logical_generation,
+                source = %source,
                 session_generation = session,
                 elapsed_ms = started.elapsed().as_millis() as u64,
                 "native profile durably committed before ACK; complete-session admission remains separately gated"
@@ -211,7 +278,7 @@ impl ProfileProvider {
                 // independently committed live state.
                 self.fail_closed_for_session(session);
                 tracing::warn!(component="issuer-profile-provider", stage="durable-provider-commit", sequence, logical_generation,
-                    session_generation=session, elapsed_ms=started.elapsed().as_millis() as u64, error=%error,
+                    source=%source, session_generation=session, elapsed_ms=started.elapsed().as_millis() as u64, error=%error,
                     "native profile rejected; admission closed and existing TLS I/O cancelled");
             }
         }
@@ -223,14 +290,11 @@ impl ProfileProvider {
             self.gate.snapshot().generation == session && !self.gate.is_revoked(),
             "commit belongs to a stale ADS session"
         );
-        let received_wall = (self.clock)();
-        let received_mono = Instant::now();
         let mut inner = self.inner.lock().expect("profile state");
-        ensure!(
-            received_wall >= inner.last_wall,
-            "wall clock moved backwards"
-        );
-        inner.last_wall = received_wall;
+        let received_mono = Instant::now();
+        // Under the state lock, so a concurrent lease check cannot raise the
+        // floor between this read and its comparison.
+        let received_wall = inner.floor.observe((self.clock)())?;
         let was_open = self.gate.is_open();
         let previous = inner.record.clone();
         let sequence = decoded.sequence;
@@ -240,8 +304,9 @@ impl ProfileProvider {
         let until = decoded.valid_until;
         let at = decoded.published_at;
         let observation: Observation = decoded.reason.into();
+        let source = decoded.source.clone();
         let mut next = ProfileCheckpoint {
-            version: 1,
+            version: super::profile_checkpoint::VERSION,
             origin: self.installation.origin.clone(),
             floors: Floors {
                 sequence,
@@ -252,6 +317,8 @@ impl ProfileProvider {
             observation,
             authority_generation: 0,
             authority_approval_digest: String::new(),
+            authority_source: None,
+            predecessor: None,
             published_unix: at.duration_since(UNIX_EPOCH)?.as_secs(),
             valid_until_unix: until.duration_since(UNIX_EPOCH)?.as_secs(),
             bindings: Vec::new(),
@@ -271,6 +338,7 @@ impl ProfileProvider {
             next.bindings.sort_by(|a, b| a.cluster.cmp(&b.cluster));
             next.authority_generation = generation;
             next.authority_approval_digest = approved;
+            next.authority_source = Some(source.clone());
             let history = previous
                 .as_ref()
                 .map(ProfileCheckpoint::history)
@@ -296,11 +364,13 @@ impl ProfileProvider {
                             && proposed.pins == saved.pins
                             && next.bindings == old.bindings
                             && next.authority_approval_digest == old.authority_approval_digest
+                            && next.authority_source == old.authority_source
                             && next.published_unix == old.published_unix
                             && next.valid_until_unix == old.valid_until_unix
                             && old.observation == Observation::Validated,
                         "same-publication material/lease substitution"
                     );
+                    next.predecessor = old.predecessor.clone();
                     history
                 }
                 (Some(old), Some(history)) => {
@@ -309,12 +379,27 @@ impl ProfileProvider {
                         "material generation rollback"
                     );
                     if generation > old.authority_generation {
+                        // A successor approval object may supply a strictly
+                        // newer generation. Record the object it replaces.
+                        next.predecessor = match &old.authority_source {
+                            Some(previous) if *previous != source => Some(Predecessor {
+                                source: previous.clone(),
+                                generation: old.authority_generation,
+                                approval_digest: old.authority_approval_digest.clone(),
+                            }),
+                            _ => old.predecessor.clone(),
+                        };
                         history.restore_authoritative_snapshot(candidate)?
                     } else {
                         ensure!(
                             next.authority_approval_digest == old.authority_approval_digest,
                             "same material-generation substitution"
                         );
+                        ensure!(
+                            next.authority_source == old.authority_source,
+                            "same material-generation approval source substitution"
+                        );
+                        next.predecessor = old.predecessor.clone();
                         history.replace(candidate)?
                     }
                 }
@@ -325,6 +410,7 @@ impl ProfileProvider {
             if let Some(old) = &previous {
                 material_changed = old.authority_generation != next.authority_generation
                     || old.authority_approval_digest != next.authority_approval_digest
+                    || old.authority_source != next.authority_source
                     || old.bindings != next.bindings
                     || old.anchors.as_ref().map(|a| {
                         (
@@ -351,6 +437,8 @@ impl ProfileProvider {
             if let Some(old) = &previous {
                 next.authority_generation = old.authority_generation;
                 next.authority_approval_digest = old.authority_approval_digest.clone();
+                next.authority_source = old.authority_source.clone();
+                next.predecessor = old.predecessor.clone();
                 next.bindings = old.bindings.clone();
                 next.anchors = old.anchors.clone();
             }
@@ -389,6 +477,20 @@ impl ProfileProvider {
             receipt.sequence() == sequence && receipt.publication_digest() == digest,
             "checkpoint receipt does not match exact ADS publication"
         );
+        if let Some(predecessor) = &next.predecessor
+            && previous.as_ref().and_then(|old| old.predecessor.as_ref()) != Some(predecessor)
+        {
+            tracing::info!(
+                component = "issuer-profile-provider",
+                stage = "approval-source-succession",
+                sequence,
+                logical_generation = generation,
+                predecessor = %predecessor.source,
+                predecessor_generation = predecessor.generation,
+                successor = %source,
+                "successor approval object durably accepted; floors carried, no checkpoint reset"
+            );
+        }
         inner.record = Some(next);
         if material_changed && was_open {
             drop(inner);
@@ -404,9 +506,9 @@ impl ProfileProvider {
                 && !self.gate.is_revoked(),
             "ADS session changed while committing profile; history retained without activation"
         );
-        let after = (self.clock)();
+        let after = inner.floor.observe((self.clock)())?;
         ensure!(
-            after >= received_wall && after < until,
+            after < until,
             "profile expired/clock regressed during durable commit"
         );
         let duration = until.duration_since(received_wall)?;
@@ -419,7 +521,6 @@ impl ProfileProvider {
             Instant::now() < monotonic_until,
             "profile expired during checkpoint commit"
         );
-        inner.last_wall = after;
         inner.active = Some(Active {
             epoch: inner.epoch,
             session,
@@ -432,13 +533,15 @@ impl ProfileProvider {
         Ok(())
     }
     pub fn acquire(self: &Arc<Self>) -> Result<Lease> {
-        let now = (self.clock)();
         let mut inner = self.inner.lock().expect("profile state");
         ensure!(
-            !self.poisoned.load(Ordering::Acquire) && now >= inner.last_wall,
+            !self.poisoned.load(Ordering::Acquire),
             "trust store/clock unavailable"
         );
-        inner.last_wall = now;
+        let now = inner
+            .floor
+            .observe((self.clock)())
+            .context("trust store/clock unavailable")?;
         let active = inner
             .active
             .as_ref()
@@ -455,13 +558,19 @@ impl ProfileProvider {
         })
     }
     fn current(&self, lease: &Lease) -> Result<Active> {
-        let now = (self.clock)();
+        self.current_at(lease).map(|(active, _)| active)
+    }
+    /// The live state for `lease` and the verifier time it was checked at.
+    fn current_at(&self, lease: &Lease) -> Result<(Active, SystemTime)> {
         let mut inner = self.inner.lock().expect("profile state");
         ensure!(
-            !self.poisoned.load(Ordering::Acquire) && now >= inner.last_wall,
+            !self.poisoned.load(Ordering::Acquire),
             "trust store/clock unavailable"
         );
-        inner.last_wall = now;
+        let now = inner
+            .floor
+            .observe((self.clock)())
+            .context("trust store/clock unavailable")?;
         let active = inner
             .active
             .as_ref()
@@ -474,7 +583,7 @@ impl ProfileProvider {
                 && Instant::now() < active.monotonic_until,
             "issuer profile/session changed or expired"
         );
-        Ok(active.clone())
+        Ok((active.clone(), now))
     }
     /// Owns one participant for all TLS drivers. A new session cannot open until
     /// every old registered TLS I/O owner has dropped its underlying stream.
@@ -484,21 +593,36 @@ impl ProfileProvider {
         let mut changes = self.subscribe();
         loop {
             let snapshot = self.gate.snapshot();
-            {
+            let fenced = {
                 let mut inner = self.inner.lock().expect("profile state");
-                if let Some(active) = &inner.active {
-                    let now = (self.clock)();
-                    if now < inner.last_wall
-                        || now >= active.until
-                        || Instant::now() >= active.monotonic_until
-                    {
-                        // Fence while holding the state writer lock. A late
-                        // renewal cannot reopen this expired session.
-                        self.gate.mark_stale(active.session);
-                        Self::reset_locked(&mut inner);
-                        self.notify();
+                let now = inner.floor.observe((self.clock)());
+                let fenced = inner.active.as_ref().and_then(|active| match &now {
+                    Err(error) => Some((active.session, error.to_string())),
+                    Ok(now) if *now >= active.until => {
+                        Some((active.session, "wall-clock lease expiry".to_string()))
                     }
+                    Ok(_) if Instant::now() >= active.monotonic_until => {
+                        Some((active.session, "monotonic lease expiry".to_string()))
+                    }
+                    Ok(_) => None,
+                });
+                if let Some((generation, _)) = &fenced {
+                    // Fence while holding the state writer lock. A late
+                    // renewal cannot reopen this expired session.
+                    self.gate.mark_stale(*generation);
+                    Self::reset_locked(&mut inner);
+                    self.notify();
                 }
+                fenced
+            };
+            if let Some((generation, reason)) = fenced {
+                tracing::warn!(
+                    component = "issuer-profile-provider",
+                    stage = "lease-supervision",
+                    session_generation = generation,
+                    reason = %reason,
+                    "native profile lease fenced; admission closed and existing TLS I/O cancelled"
+                );
             }
             if self.gate.needs_drain(snapshot.generation, participant) {
                 let empty = self.inner.lock().expect("profile state").flows.is_empty();
@@ -545,7 +669,7 @@ impl Lease {
         expected: &Identity,
         role: PeerRole,
     ) -> Result<()> {
-        let active = self.provider.current(self)?;
+        let (active, now) = self.provider.current_at(self)?;
         ensure!(
             cert.identity().as_ref() == Some(expected)
                 && expected.trust_domain() == *active.publication.anchors().local_domain(),
@@ -556,17 +680,13 @@ impl Lease {
             &cert.cert.der,
             &chain,
             active.publication.anchors(),
-            UnixTime::since_unix_epoch((self.provider.clock)().duration_since(UNIX_EPOCH)?),
+            UnixTime::since_unix_epoch(now.duration_since(UNIX_EPOCH)?),
             role,
         )?;
         ensure!(
             active
                 .publication
-                .current_unfenced_signer(
-                    &expected.trust_domain(),
-                    peer.signer_spki(),
-                    (self.provider.clock)()
-                )
+                .current_unfenced_signer(&expected.trust_domain(), peer.signer_spki(), now)
                 .is_some(),
             "local SPIRE signer fenced"
         );
@@ -589,10 +709,9 @@ impl Lease {
         Option<RevocationHandle>,
         Option<Arc<super::native_crl::Coverage>>,
     )> {
-        let active = self.provider.current(self)?;
+        let (active, now) = self.provider.current_at(self)?;
         let chain = ssl.peer_certificates().context("TLS peer chain missing")?;
         let (leaf, intermediates) = chain.split_first().context("TLS peer leaf missing")?;
-        let now = (self.provider.clock)();
         let time = UnixTime::since_unix_epoch(now.duration_since(UNIX_EPOCH)?);
         let peer = verify_peer_evidence(
             leaf,
@@ -650,10 +769,9 @@ impl Lease {
         let mut changes = self.provider.subscribe();
         let mut session = self.provider.gate.subscribe();
         loop {
-            let Ok(active) = self.provider.current(&self) else {
+            let Ok((active, now)) = self.provider.current_at(&self) else {
                 return;
             };
-            let now = (self.provider.clock)();
             let mut until = active.until.min(local_deadline);
             if let Some(peer) = &peer {
                 if super::domain_anchors::retained_tunnel(
@@ -803,10 +921,9 @@ impl<IO: Unpin> ProfileIo<IO> {
         // can resume while the monotonic timer has not fired. Recheck on every
         // actual read/write poll before releasing any bytes to rustls/H2.
         let invalid_now = self.lease.as_ref().is_some_and(|lease| {
-            let Ok(active) = lease.provider.current(lease) else {
+            let Ok((active, now)) = lease.provider.current_at(lease) else {
                 return true;
             };
-            let now = (lease.provider.clock)();
             now >= self.local_deadline
                 || self.peer.as_ref().is_some_and(|peer| {
                     super::domain_anchors::retained_tunnel(
@@ -1109,6 +1226,7 @@ mod tests {
     };
     use serde_json::{Value, json};
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicI64, AtomicU64};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
 
@@ -1180,6 +1298,134 @@ mod tests {
         next["sequence"] = json!(seq.to_string());
         next["publicationDigest"] = json!(format!("{seq:064x}"));
         next
+    }
+    /// The same publication from a successor approval object: a new name and
+    /// UID in the pinned namespace with a strictly greater generation.
+    fn successor(w: &Value, seq: u64, generation: u64, name: &str) -> Value {
+        let mut next = advance(w, seq);
+        next["sourceName"] = json!(name);
+        next["sourceUID"] = json!(format!("{name}-uid"));
+        next["generation"] = json!(generation.to_string());
+        next["approvalDigest"] = json!(format!("{generation:064x}"));
+        next
+    }
+    fn resync(p: &ProfileProvider, g: &XdsSessionGate) -> u64 {
+        let s = g.begin_session();
+        p.reset_session();
+        s
+    }
+    #[test]
+    fn successor_source_is_accepted_into_the_same_checkpoint_with_floors_carried() {
+        let d = dir();
+        let (w, e) = fixture();
+        let (p, g, s) = opened(d.path(), &e, fixture_clock);
+        p.commit(decode(&w, &e, fixture_clock)).unwrap();
+        ready(&p, &g, s);
+        let lease = p.acquire().unwrap();
+        let next = successor(&w, 11, 8, "issuer-approval-g8");
+        assert!(
+            p.commit(decode(&next, &e, fixture_clock)).is_err(),
+            "a new approval generation is staged durably, never mixed into the open session"
+        );
+        assert!(lease.check_current().is_err());
+        let saved = p.inner.lock().unwrap().record.clone().unwrap();
+        assert_eq!(
+            (
+                saved.floors.sequence,
+                saved.floors.logical_generation,
+                saved.authority_generation
+            ),
+            (11, 8, 8)
+        );
+        let s = resync(&p, &g);
+        p.commit(decode(&next, &e, fixture_clock)).unwrap();
+        ready(&p, &g, s);
+        let epoch = p.acquire().unwrap().epoch();
+        p.commit(decode(
+            &successor(&w, 12, 8, "issuer-approval-g8"),
+            &e,
+            fixture_clock,
+        ))
+        .unwrap();
+        assert_eq!(
+            p.acquire().unwrap().epoch(),
+            epoch,
+            "a successor renewal keeps the session"
+        );
+    }
+    #[test]
+    fn successor_source_cannot_roll_back_or_be_substituted_at_its_generation() {
+        let d = dir();
+        let (w, e) = fixture();
+        let (p, g, s) = opened(d.path(), &e, fixture_clock);
+        p.commit(decode(&w, &e, fixture_clock)).unwrap();
+        ready(&p, &g, s);
+        let s = resync(&p, &g);
+        p.commit(decode(
+            &successor(&w, 11, 8, "issuer-approval-g8"),
+            &e,
+            fixture_clock,
+        ))
+        .unwrap();
+        ready(&p, &g, s);
+        assert!(
+            p.commit(decode(&advance(&w, 12), &e, fixture_clock))
+                .is_err(),
+            "the predecessor at its old generation is a rollback at any sequence"
+        );
+        resync(&p, &g);
+        assert!(
+            p.commit(decode(
+                &successor(&w, 13, 8, "issuer-approval-other"),
+                &e,
+                fixture_clock
+            ))
+            .is_err(),
+            "another object at the accepted generation is a substitution"
+        );
+        let s = resync(&p, &g);
+        p.commit(decode(
+            &successor(&w, 14, 8, "issuer-approval-g8"),
+            &e,
+            fixture_clock,
+        ))
+        .unwrap();
+        ready(&p, &g, s);
+        assert!(p.acquire().is_ok());
+    }
+    #[test]
+    fn restart_mid_succession_recovers_from_the_durable_successor() {
+        let d = dir();
+        let (w, e) = fixture();
+        let (p, g, s) = opened(d.path(), &e, fixture_clock);
+        p.commit(decode(&w, &e, fixture_clock)).unwrap();
+        ready(&p, &g, s);
+        let next = successor(&w, 11, 8, "issuer-approval-g8");
+        // The successor is durable, its open session fenced: the process stops here.
+        assert!(p.commit(decode(&next, &e, fixture_clock)).is_err());
+        drop(p);
+        // The restart keeps the unchanged installation pins (predecessor, floor 7).
+        let gate = XdsSessionGate::new();
+        let p = ProfileProvider::open_with_clock(
+            d.path(),
+            &e,
+            OpenMode::Existing,
+            gate.clone(),
+            fixture_clock,
+        )
+        .unwrap();
+        let s = gate.begin_session();
+        ready(&p, &gate, s);
+        assert!(p.acquire().is_err(), "recovered history is not a grant");
+        assert!(
+            p.commit(decode(&advance(&w, 12), &e, fixture_clock))
+                .is_err(),
+            "the durable successor floor survives the restart"
+        );
+        let s = resync(&p, &gate);
+        p.commit(decode(&next, &e, fixture_clock)).unwrap();
+        ready(&p, &gate, s);
+        assert!(p.acquire().is_ok());
     }
     #[test]
     fn durable_commit_precedes_activation_and_restart_requires_fresh_session() {
@@ -1390,6 +1636,296 @@ mod tests {
         drop(owner);
         assert!(!g.is_open());
         assert!(p.acquire().is_err());
+    }
+
+    // The provider and CRL coverage take a plain `fn() -> SystemTime` and the
+    // tests in this module run concurrently, so each test owns one offset.
+    fn shifted(base: SystemTime, offset_ns: i64) -> SystemTime {
+        let magnitude = Duration::from_nanos(offset_ns.unsigned_abs());
+        if offset_ns >= 0 {
+            base + magnitude
+        } else {
+            base - magnitude
+        }
+    }
+    /// Largest guest-clock step the Lima host agent logged on the lab.
+    const LAB_STEP_NS: i64 = 142_000_000;
+    static BOUNDED_STEP_NS: AtomicI64 = AtomicI64::new(0);
+    fn bounded_step_clock() -> SystemTime {
+        shifted(fixture_clock(), BOUNDED_STEP_NS.load(Ordering::SeqCst))
+    }
+    static UNBOUNDED_STEP_NS: AtomicI64 = AtomicI64::new(0);
+    fn unbounded_step_clock() -> SystemTime {
+        shifted(fixture_clock(), UNBOUNDED_STEP_NS.load(Ordering::SeqCst))
+    }
+    static HELD_STEP_NS: AtomicI64 = AtomicI64::new(0);
+    fn held_step_clock() -> SystemTime {
+        shifted(fixture_clock(), HELD_STEP_NS.load(Ordering::SeqCst))
+    }
+    static EXPIRY_STEP_NS: AtomicI64 = AtomicI64::new(0);
+    fn expiry_step_clock() -> SystemTime {
+        shifted(fixture_clock(), EXPIRY_STEP_NS.load(Ordering::SeqCst))
+    }
+    static COMMIT_STEP_NS: AtomicI64 = AtomicI64::new(0);
+    fn commit_step_clock() -> SystemTime {
+        shifted(fixture_clock(), COMMIT_STEP_NS.load(Ordering::SeqCst))
+    }
+    static CRL_STEP_BASE_NS: AtomicU64 = AtomicU64::new(0);
+    static CRL_STEP_NS: AtomicI64 = AtomicI64::new(0);
+    fn crl_step_clock() -> SystemTime {
+        let base = UNIX_EPOCH + Duration::from_nanos(CRL_STEP_BASE_NS.load(Ordering::SeqCst));
+        shifted(base, CRL_STEP_NS.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bounded_wall_step_keeps_the_session_and_its_renewal_without_lowering_the_floor() {
+        let d = dir();
+        let (w, e) = fixture();
+        let (p, g, s) = opened(d.path(), &e, bounded_step_clock);
+        p.commit(decode(&w, &e, bounded_step_clock)).unwrap();
+        ready(&p, &g, s);
+        let lease = p.acquire().unwrap();
+        let supervisor = tokio::spawn(p.clone().supervise());
+        // A TLS poll observes +60 ms; the guest clock is then stepped back.
+        BOUNDED_STEP_NS.store(60_000_000, Ordering::SeqCst);
+        lease.check_current().unwrap();
+        let floor = p.inner.lock().unwrap().floor.wall;
+        BOUNDED_STEP_NS.store(60_000_000 - LAB_STEP_NS, Ordering::SeqCst);
+        assert!(
+            p.available_for_session(s),
+            "a bounded backward step is not a loss of authority"
+        );
+        lease.check_current().unwrap();
+        // Three 50 ms supervision sweeps: the sweep that revoked live sessions.
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        assert!(g.is_open() && p.available_for_session(s));
+        // The ~15 s renewal lands inside the step window and stays in-session.
+        p.commit(decode(&advance(&w, 11), &e, bounded_step_clock))
+            .unwrap();
+        assert!(g.is_open() && p.available_for_session(s));
+        assert_eq!(p.acquire().unwrap().epoch(), lease.epoch());
+        lease.check_current().unwrap();
+        assert_eq!(
+            p.inner.lock().unwrap().floor.wall,
+            floor,
+            "the floor never moves backwards"
+        );
+        supervisor.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wall_rollback_beyond_the_bound_still_revokes_the_session_and_keeps_the_floor() {
+        let d = dir();
+        let (w, e) = fixture();
+        let (p, g, s) = opened(d.path(), &e, unbounded_step_clock);
+        p.commit(decode(&w, &e, unbounded_step_clock)).unwrap();
+        ready(&p, &g, s);
+        let lease = p.acquire().unwrap();
+        let floor = p.inner.lock().unwrap().floor.wall;
+        let beyond = MAX_ABSORBED_WALL_ROLLBACK + Duration::from_millis(1);
+        UNBOUNDED_STEP_NS.store(-i64::try_from(beyond.as_nanos()).unwrap(), Ordering::SeqCst);
+        assert!(!p.available_for_session(s));
+        assert!(p.acquire().is_err());
+        assert!(lease.check_current().is_err());
+        let supervisor = tokio::spawn(p.clone().supervise());
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            !g.is_open(),
+            "a real rollback still revokes the complete session"
+        );
+        assert!(p.inner.lock().unwrap().active.is_none());
+        assert_eq!(
+            p.inner.lock().unwrap().floor.wall,
+            floor,
+            "the floor is never reset"
+        );
+        // A fresh session cannot activate while the clock is beyond the bound.
+        let next = g.begin_session();
+        p.reset_session();
+        let error = p
+            .commit(decode(&advance(&w, 11), &e, fixture_clock))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("wall clock moved backwards"),
+            "{error:#}"
+        );
+        assert!(!g.is_open() && g.snapshot().generation == next);
+        // Recovery: the clock is back within the bound; a fresh session commits.
+        UNBOUNDED_STEP_NS.store(0, Ordering::SeqCst);
+        let recovered = g.begin_session();
+        p.reset_session();
+        p.commit(decode(&advance(&w, 12), &e, unbounded_step_clock))
+            .unwrap();
+        ready(&p, &g, recovered);
+        assert!(p.acquire().is_ok() && p.available_for_session(recovered));
+        supervisor.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wall_floor_held_longer_than_the_bound_revokes_the_session() {
+        let d = dir();
+        let (w, e) = fixture();
+        let (p, g, s) = opened(d.path(), &e, held_step_clock);
+        p.commit(decode(&w, &e, held_step_clock)).unwrap();
+        ready(&p, &g, s);
+        let lease = p.acquire().unwrap();
+        HELD_STEP_NS.store(60_000_000, Ordering::SeqCst);
+        lease.check_current().unwrap();
+        // Stepped back and never catching up (repeated small steps or a stalled
+        // clock): every read is within the step bound, the hold is not.
+        HELD_STEP_NS.store(60_000_000 - LAB_STEP_NS, Ordering::SeqCst);
+        let supervisor = tokio::spawn(p.clone().supervise());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(g.is_open(), "absorbed while the hold is within the bound");
+        tokio::time::sleep(MAX_ABSORBED_WALL_ROLLBACK).await;
+        assert!(!g.is_open(), "a floor held past the bound is a rollback");
+        assert!(!p.available_for_session(s));
+        assert!(lease.check_current().is_err());
+        supervisor.abort();
+    }
+
+    // Idle time before a step is not time behind the floor: only the period
+    // the clock actually spends behind it counts against the bound.
+    #[tokio::test(start_paused = true)]
+    async fn wall_floor_bounds_time_behind_the_floor_not_idle_time() {
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let mut floor = WallFloor::new(t0);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(
+            floor.observe(t0 - Duration::from_millis(1)).unwrap(),
+            t0,
+            "a small step after an idle gap is absorbed at the floor"
+        );
+        tokio::time::advance(MAX_ABSORBED_WALL_ROLLBACK + Duration::from_millis(1)).await;
+        assert!(
+            floor.observe(t0 - Duration::from_millis(1)).is_err(),
+            "staying behind the floor past the bound fails closed"
+        );
+        assert_eq!(
+            floor.observe(t0).unwrap(),
+            t0,
+            "catching up to the floor is accepted"
+        );
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(
+            floor.observe(t0 - Duration::from_millis(1)).unwrap(),
+            t0,
+            "catching up resets the hold"
+        );
+        let later = t0 + Duration::from_secs(2);
+        assert_eq!(
+            floor.observe(later).unwrap(),
+            later,
+            "a later reading raises the floor"
+        );
+        assert!(
+            floor
+                .observe(later - MAX_ABSORBED_WALL_ROLLBACK - Duration::from_millis(1))
+                .is_err(),
+            "a step larger than the bound fails closed at once"
+        );
+    }
+
+    #[test]
+    fn bounded_wall_step_cannot_resurrect_an_expired_lease() {
+        let d = dir();
+        let (w, e) = fixture();
+        let (p, g, s) = opened(d.path(), &e, expiry_step_clock);
+        p.commit(decode(&w, &e, expiry_step_clock)).unwrap();
+        ready(&p, &g, s);
+        let lease = p.acquire().unwrap();
+        let until = p.inner.lock().unwrap().active.as_ref().unwrap().until;
+        let expired = until.duration_since(fixture_clock()).unwrap() + Duration::from_millis(1);
+        let expired = i64::try_from(expired.as_nanos()).unwrap();
+        EXPIRY_STEP_NS.store(expired, Ordering::SeqCst);
+        assert!(p.acquire().is_err() && lease.check_current().is_err());
+        // Stepped back 500 ms, the raw clock is inside the lease window again.
+        EXPIRY_STEP_NS.store(expired - 500_000_000, Ordering::SeqCst);
+        assert!(expiry_step_clock() < until);
+        assert!(
+            p.acquire().is_err(),
+            "a bounded step must not resurrect an expired lease"
+        );
+        assert!(lease.check_current().is_err());
+        assert!(!p.available_for_session(s));
+    }
+
+    #[test]
+    fn bounded_wall_step_during_a_durable_renewal_commit_keeps_the_session() {
+        let d = dir();
+        let (w, e) = fixture();
+        let (p, g, s) = opened(d.path(), &e, commit_step_clock);
+        p.commit(decode(&w, &e, commit_step_clock)).unwrap();
+        ready(&p, &g, s);
+        let lease = p.acquire().unwrap();
+        COMMIT_STEP_NS.store(60_000_000, Ordering::SeqCst);
+        let decoded = decode(&advance(&w, 11), &e, commit_step_clock);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        *p.before_disk.lock().unwrap() = Some((entered_tx, resume_rx));
+        let worker = p.clone();
+        let thread = std::thread::spawn(move || worker.commit_for_session(decoded, s));
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // The guest clock is stepped back while the record is fsynced
+        // (cmtc-b-worker, 2026-10-25T16:49:10.62Z).
+        COMMIT_STEP_NS.store(60_000_000 - LAB_STEP_NS, Ordering::SeqCst);
+        resume_tx.send(()).unwrap();
+        thread
+            .join()
+            .unwrap()
+            .expect("a bounded step during the fsync is not a rejection");
+        assert!(g.is_open() && p.available_for_session(s));
+        // The next delivery, still behind the floor, also commits in-session.
+        p.commit(decode(&advance(&w, 12), &e, commit_step_clock))
+            .unwrap();
+        assert_eq!(p.acquire().unwrap().epoch(), lease.epoch());
+    }
+
+    #[test]
+    fn native_crl_coverage_absorbs_a_bounded_wall_step_and_fences_beyond_the_bound() {
+        use super::super::native_crl::Coverage;
+        let root = ca("root", None);
+        let signer = ca("same", Some(&root));
+        let cert = workload("cmtc-a.mesh.example", &signer);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            native_crl_window(&signer, false, 1, -60, 86400),
+        )
+        .unwrap();
+        let manager = Arc::new(
+            tls::crl::CrlManager::new(
+                file.path().to_path_buf(),
+                crate::test_helpers::helpers::test_proxy_metrics(),
+            )
+            .unwrap(),
+        );
+        let base = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        CRL_STEP_BASE_NS.store(u64::try_from(base.as_nanos()).unwrap(), Ordering::SeqCst);
+        let coverage = Coverage::new(
+            manager,
+            cert.cert.der.clone(),
+            signer.der().clone(),
+            PeerRole::Client,
+            crl_step_clock,
+        )
+        .unwrap();
+        CRL_STEP_NS.store(60_000_000, Ordering::SeqCst);
+        coverage.current(crl_step_clock).unwrap();
+        CRL_STEP_NS.store(60_000_000 - LAB_STEP_NS, Ordering::SeqCst);
+        coverage
+            .current(crl_step_clock)
+            .expect("a bounded backward step keeps exact CRL coverage");
+        CRL_STEP_NS.store(60_000_000 - 2_000_000_000, Ordering::SeqCst);
+        assert!(
+            coverage.current(crl_step_clock).is_err(),
+            "a rollback beyond the bound fences this owner"
+        );
+        CRL_STEP_NS.store(120_000_000, Ordering::SeqCst);
+        assert!(
+            coverage.current(crl_step_clock).is_err(),
+            "a fenced owner never resurrects"
+        );
     }
 
     type Ca = CertifiedIssuer<'static, KeyPair>;

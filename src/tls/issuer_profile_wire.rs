@@ -4,12 +4,12 @@
 //! Authority comes from independently configured authenticated ADS origin and durable
 //! floors; SHA fields provide integrity/correlation, never an admin signature.
 use super::domain_anchors::{
-    AnchorPublication, DomainAnchorSet, pin_from_certificate_with_lineage, spki_der,
+    AnchorPublication, DomainAnchorSet, pin_from_certificate_with_role, spki_der,
 };
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rustls::pki_types::CertificateDer;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +24,9 @@ struct Issuer {
     spki_sha256: String,
     #[serde(default, rename = "lineageDER")]
     lineage_der: Vec<String>,
+    // The pin is the cluster's SPIRE intermediate (see DomainPin).
+    #[serde(default, rename = "signsSPIRECA")]
+    signs_spire_ca: bool,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -64,6 +67,11 @@ struct Wire {
 
 // All values are independent installation/checkpoint configuration, NOT taken
 // from the incoming wire envelope. This type does not load/checkpoint them.
+//
+// `source_name` and `source_uid` name the approval object accepted at
+// `minimum_generation`. They bind the source only at that floor: a successor
+// object in `source_namespace` is followed when its generation is strictly
+// greater (see `ApprovalSource`). Pin content and floors, not the container.
 pub struct Expected {
     pub cluster: String,
     pub node: String,
@@ -78,6 +86,21 @@ pub struct Expected {
     pub minimum_sequence: u64,
     pub approval_digest_at_minimum: Option<String>,
     pub publication_digest_at_minimum: Option<String>,
+}
+/// The administrator approval object a publication names. The installation
+/// pins its namespace. Name and UID change only with a strictly greater
+/// approval generation (a source succession); the durable checkpoint records
+/// which object supplied each material generation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalSource {
+    pub name: String,
+    pub uid: String,
+}
+impl std::fmt::Display for ApprovalSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.name, self.uid)
+    }
 }
 #[derive(Debug)]
 pub struct ClusterBinding {
@@ -110,6 +133,9 @@ pub struct Decoded {
     pub generation: u64,
     pub approval_digest: String,
     pub publication_digest: String,
+    // The producer's configured approval object. For a published profile it is
+    // the object whose material is `generation`; a tombstone carries no material.
+    pub source: ApprovalSource,
     pub published_at: SystemTime,
     pub valid_until: SystemTime,
     pub bindings: Vec<ClusterBinding>,
@@ -165,6 +191,11 @@ fn cluster_id(s: &str) -> bool {
             || s.as_bytes()[s.len() - 1].is_ascii_digit())
         && s.bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Kubernetes object UID shape, the same bound the checkpoint applies.
+fn object_uid(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 fn dns_subdomain(s: &str) -> bool {
@@ -231,13 +262,25 @@ pub fn decode(data: &[u8], expected: &Expected, now: SystemTime) -> Result<Decod
             && w.cluster == expected.cluster
             && w.node == expected.node
             && w.source_namespace == expected.source_namespace
-            && w.source_name == expected.source_name
-            && w.source_uid == expected.source_uid
             && w.output_namespace == expected.output_namespace
             && w.output_name == expected.output_name
             && w.output_uid == expected.output_uid,
         "profile origin/node mismatch"
     );
+    // The approval object itself is data, never installation scope: it must be
+    // a distinct object in the pinned namespace. Which object may supply a given
+    // generation is decided below (at the floor) and by the durable checkpoint.
+    ensure!(
+        dns_subdomain(&w.source_name)
+            && w.source_name != w.output_name
+            && object_uid(&w.source_uid)
+            && w.source_uid != w.output_uid,
+        "invalid approval source object"
+    );
+    let source = ApprovalSource {
+        name: w.source_name.clone(),
+        uid: w.source_uid.clone(),
+    };
     let sequence = number(&w.sequence)?;
     let generation = number(&w.generation)?;
     ensure!(
@@ -294,6 +337,7 @@ pub fn decode(data: &[u8], expected: &Expected, now: SystemTime) -> Result<Decod
             generation,
             approval_digest: w.approval_digest,
             publication_digest: w.publication_digest,
+            source,
             published_at: at,
             valid_until: until,
             bindings: Vec::new(),
@@ -308,6 +352,13 @@ pub fn decode(data: &[u8], expected: &Expected, now: SystemTime) -> Result<Decod
             && until.duration_since(at)? <= Duration::from_secs(30)
             && now < until,
         "inactive/expired profile"
+    );
+    // At the installation floor the pinned object is the only valid source of
+    // that generation's material. A successor needs a strictly greater one.
+    ensure!(
+        generation > expected.minimum_generation
+            || (source.name == expected.source_name && source.uid == expected.source_uid),
+        "same-generation approval source substitution"
     );
     ensure!(
         !w.clusters.is_empty() && w.clusters.len() <= 16,
@@ -353,10 +404,11 @@ pub fn decode(data: &[u8], expected: &Expected, now: SystemTime) -> Result<Decod
                 .iter()
                 .map(|encoded| der(encoded))
                 .collect::<Result<Vec<_>>>()?;
-            pins.push(pin_from_certificate_with_lineage(
+            pins.push(pin_from_certificate_with_role(
                 c.trust_domain.clone().into(),
                 certificate,
                 lineage,
+                issuer.signs_spire_ca,
             )?);
         }
         bindings.push(ClusterBinding {
@@ -397,6 +449,7 @@ pub fn decode(data: &[u8], expected: &Expected, now: SystemTime) -> Result<Decod
         generation,
         approval_digest: w.approval_digest,
         publication_digest: w.publication_digest,
+        source,
         published_at: at,
         valid_until: until,
         bindings,
@@ -475,6 +528,59 @@ mod tests {
         }
         assert!(decode(&body, &e, now + Duration::from_secs(30)).is_err());
         assert!(decode(&body, &e, now - Duration::from_secs(2)).is_err());
+    }
+    fn successor_wire(body: &[u8], generation: &str) -> serde_json::Value {
+        let mut v: serde_json::Value = serde_json::from_slice(body).unwrap();
+        v["sourceName"] = "issuer-approval-g8".into();
+        v["sourceUID"] = "fixture-source-uid-g8".into();
+        v["generation"] = generation.into();
+        v["approvalDigest"] = "8".repeat(64).into();
+        v["sequence"] = "11".into();
+        v["publicationDigest"] = "b".repeat(64).into();
+        v
+    }
+    /// A successor approval object has a new name and UID in the pinned
+    /// namespace. A strictly greater generation is the authority to follow it:
+    /// the installation pins bind the source object only at their own floor.
+    #[test]
+    fn successor_source_with_greater_generation_decodes() {
+        let (body, e, now) = fixture();
+        let wire = successor_wire(&body, "8");
+        let decoded = decode(&serde_json::to_vec(&wire).unwrap(), &e, now).unwrap();
+        assert_eq!((decoded.sequence, decoded.generation), (11, 8));
+        assert!(decoded.candidate.is_some());
+    }
+    #[test]
+    fn successor_source_needs_greater_generation_and_the_pinned_namespace() {
+        let (body, e, now) = fixture();
+        for case in [
+            "same-generation",
+            "foreign-namespace",
+            "output-name",
+            "output-uid",
+            "empty-uid",
+            "unpinned-root",
+        ] {
+            let mut v = successor_wire(&body, "8");
+            match case {
+                "same-generation" => {
+                    v["generation"] = "7".into();
+                    v["approvalDigest"] = e.approval_digest_at_minimum.clone().unwrap().into();
+                }
+                "foreign-namespace" => v["sourceNamespace"] = "other-system".into(),
+                "output-name" => v["sourceName"] = e.output_name.clone().into(),
+                "output-uid" => v["sourceUID"] = e.output_uid.clone().into(),
+                "empty-uid" => v["sourceUID"] = "".into(),
+                _ => {
+                    v["rootSHA256"] =
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()
+                }
+            }
+            assert!(
+                decode(&serde_json::to_vec(&v).unwrap(), &e, now).is_err(),
+                "accepted {case}"
+            );
+        }
     }
     #[test]
     fn unknown_duplicate_and_oversized_envelopes_rejected() {
