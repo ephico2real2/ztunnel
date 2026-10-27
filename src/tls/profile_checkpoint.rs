@@ -729,7 +729,8 @@ fn decode_recovered(
         version => bail!("unsupported checkpoint version {version}"),
     };
     // Integrity is checked on the stored bytes first. Like a v1 migration, the
-    // file keeps the narrower origin until the next distinct durable commit.
+    // file keeps its stored origin (narrower after an extension, wider after a
+    // retirement) until the next distinct durable commit.
     let change = state.origin.root_pin_change(&installation.origin);
     if !change.is_empty() {
         state
@@ -737,7 +738,13 @@ fn decode_recovered(
             .root_pins
             .clone_from(&installation.origin.root_pins);
     }
-    state.validate(installation)?;
+    if let Err(error) = state.validate(installation) {
+        if change.retired.is_empty() {
+            return Err(error);
+        }
+        let retired = &change.retired;
+        return Err(error.context(format!("installation retires root pins {retired:?}")));
+    }
     Ok((state, change))
 }
 
@@ -1632,7 +1639,22 @@ mod tests {
                 "a load wrote the checkpoint"
             );
         }
+        // An equal commit (a reconnect revalidating the same publication) only
+        // requalifies the stored bytes: the file keeps the wider origin, and the
+        // next start takes the retirement path again.
         let mut store = open_store(d.path(), narrower.clone(), OpenMode::Existing).unwrap();
+        store.commit(s.clone(), now).unwrap();
+        drop(store);
+        assert_eq!(
+            std::fs::read(&state).unwrap(),
+            on_disk,
+            "an equal commit rewrote the checkpoint"
+        );
+        let mut store = open_store(d.path(), narrower.clone(), OpenMode::Existing).unwrap();
+        assert_eq!(
+            store.root_pin_change().retired,
+            std::slice::from_ref(&retired)
+        );
         store.commit(advanced(&s), now).unwrap();
         drop(store);
         assert_ne!(std::fs::read(&state).unwrap(), on_disk);
@@ -1651,9 +1673,11 @@ mod tests {
         let refused = open_store(d.path(), unanchored, OpenMode::Existing)
             .err()
             .unwrap();
+        let refused = format!("{refused:#}");
         assert!(
-            format!("{refused:#}").contains("checkpoint root not independently pinned"),
-            "{refused:#}"
+            refused.contains("installation retires root pins")
+                && refused.contains("checkpoint root not independently pinned"),
+            "{refused}"
         );
         // A retirement does not excuse any other origin change.
         for variant in 0..3 {
@@ -1671,10 +1695,17 @@ mod tests {
                 "variant {variant}: {refused:#}"
             );
         }
-        // Retiring every root pin is not an installation.
+        // Retiring every root pin is not an installation: refused before the
+        // checkpoint is read.
         let mut none = narrower;
         none.origin.root_pins.clear();
-        assert!(open_store(d.path(), none, OpenMode::Existing).is_err());
+        let refused = open_store(d.path(), none, OpenMode::Existing)
+            .err()
+            .unwrap();
+        assert!(
+            format!("{refused:#}").contains("sorted unique independent roots required"),
+            "{refused:#}"
+        );
     }
     #[test]
     fn commit_sequence_generation_and_digest_floors_never_roll_back() {
