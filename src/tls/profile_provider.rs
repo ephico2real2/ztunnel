@@ -139,6 +139,14 @@ impl ProfileProvider {
     ) -> Result<Arc<Self>> {
         let installation = Installation::from_expected(expected);
         let store = CheckpointStore::open(path, installation.clone(), mode)?;
+        if !store.added_root_pins().is_empty() {
+            tracing::info!(
+                component = "issuer-profile-provider",
+                stage = "installation-root-pin-extension",
+                added = ?store.added_root_pins(),
+                "checkpoint origin gains administrator root pins; floors, history and fences carried, no checkpoint reset; written at the next durable commit"
+            );
+        }
         let record = store.recovered().cloned();
         // Revalidate cumulative DER history now. This does not restore a lease.
         if let Some(record) = &record {

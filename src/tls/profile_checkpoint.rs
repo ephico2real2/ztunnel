@@ -86,6 +86,33 @@ impl Origin {
         );
         Ok(())
     }
+    /// The root pins an installation adds to this origin; none when it differs in
+    /// any other way. Root pins come only from the administrator's pins file, the
+    /// authority that installed the origin, so a new root can be pinned without a
+    /// checkpoint reset (a lab installed with one organizational root moves to
+    /// the mesh root). Every other field stays immutable, and dropping a root pin
+    /// still fails closed. A new root gains authority only through a strictly
+    /// newer approval generation (`supersedes`).
+    fn added_root_pins(&self, installation: &Origin) -> Vec<String> {
+        let same_scope = Origin {
+            root_pins: installation.root_pins.clone(),
+            ..self.clone()
+        } == *installation;
+        if !same_scope
+            || !self
+                .root_pins
+                .iter()
+                .all(|p| installation.root_pins.contains(p))
+        {
+            return Vec::new();
+        }
+        installation
+            .root_pins
+            .iter()
+            .filter(|p| !self.root_pins.contains(p))
+            .cloned()
+            .collect()
+    }
     /// An approval object must be distinct from the pinned output object.
     fn valid_source(&self, source: &ApprovalSource) -> bool {
         dns(&source.name, 253)
@@ -665,13 +692,21 @@ fn encode(state: &ProfileCheckpoint) -> Result<Vec<u8>> {
     );
     Ok(bytes)
 }
+#[cfg(test)]
 fn decode(bytes: &[u8], installation: &Installation) -> Result<ProfileCheckpoint> {
+    decode_recovered(bytes, installation).map(|(state, _)| state)
+}
+/// Also returns the root pins the installation added to the stored origin.
+fn decode_recovered(
+    bytes: &[u8],
+    installation: &Installation,
+) -> Result<(ProfileCheckpoint, Vec<String>)> {
     ensure!(
         !bytes.is_empty() && bytes.len() <= MAX_CHECKPOINT_BYTES,
         "bounded checkpoint required"
     );
     let probe: VersionProbe = serde_json::from_slice(bytes).context("strict checkpoint JSON")?;
-    let state = match probe.state.version {
+    let mut state = match probe.state.version {
         VERSION => {
             let env: Envelope = serde_json::from_slice(bytes).context("strict checkpoint JSON")?;
             ensure!(
@@ -693,8 +728,17 @@ fn decode(bytes: &[u8], installation: &Installation) -> Result<ProfileCheckpoint
         }
         version => bail!("unsupported checkpoint version {version}"),
     };
+    // Integrity is checked on the stored bytes first. Like a v1 migration, the
+    // file keeps the narrower origin until the next distinct durable commit.
+    let added = state.origin.added_root_pins(&installation.origin);
+    if !added.is_empty() {
+        state
+            .origin
+            .root_pins
+            .clone_from(&installation.origin.root_pins);
+    }
     state.validate(installation)?;
-    Ok(state)
+    Ok((state, added))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -888,6 +932,7 @@ pub struct CheckpointStore {
     installation: Installation,
     marker_inode: Option<Inode>,
     recovered: Option<ProfileCheckpoint>,
+    added_root_pins: Vec<String>,
     state_inode: Option<Inode>,
     state_bytes: Option<Vec<u8>>,
     poisoned: bool,
@@ -915,6 +960,7 @@ impl CheckpointStore {
             installation,
             marker_inode: None,
             recovered: None,
+            added_root_pins: Vec::new(),
             state_inode: None,
             state_bytes: None,
             poisoned: false,
@@ -961,7 +1007,9 @@ impl CheckpointStore {
                 let file = open_at(&store.directory, STATE, libc::O_RDONLY, 0)
                     .context("initialized checkpoint missing; explicit recovery required")?;
                 let bytes = bounded_read(&file, MAX_CHECKPOINT_BYTES)?;
-                store.recovered = Some(decode(&bytes, &store.installation)?);
+                let (recovered, added) = decode_recovered(&bytes, &store.installation)?;
+                store.recovered = Some(recovered);
+                store.added_root_pins = added;
                 store.state_inode = Some(inode(&file)?);
                 store.state_bytes = Some(bytes);
             }
@@ -971,6 +1019,10 @@ impl CheckpointStore {
     }
     pub fn recovered(&self) -> Option<&ProfileCheckpoint> {
         self.recovered.as_ref()
+    }
+    /// Root pins the installation added to the recovered checkpoint's origin.
+    pub fn added_root_pins(&self) -> &[String] {
+        &self.added_root_pins
     }
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
@@ -1451,6 +1503,71 @@ mod tests {
         let mut changed = i.clone();
         changed.publication_digest_at_minimum = Some("f".repeat(64));
         assert!(decode(&bytes, &changed).is_err());
+        // An added root pin does not excuse any other origin change.
+        for variant in 0..3 {
+            let mut changed = i.clone();
+            changed.origin.root_pins.push("f".repeat(64));
+            changed.origin.root_pins.sort();
+            match variant {
+                0 => changed.origin.node = "other-node".into(),
+                1 => changed.origin.output_uid = "other-output".into(),
+                _ => changed.origin.cluster = "other-cluster".into(),
+            };
+            assert!(decode(&bytes, &changed).is_err(), "variant {variant}");
+        }
+    }
+    /// The administrator adds a root pin (the move to the mesh root): the
+    /// checkpoint continues with its floors and history, a load never writes it,
+    /// and the first distinct commit records the wider origin. Dropping the pin
+    /// afterwards fails closed.
+    #[test]
+    fn installation_root_pin_extension_continues_the_checkpoint() {
+        let d = dir();
+        let (i, s, now) = committed(d.path());
+        let added = "f".repeat(64);
+        let mut wider = i.clone();
+        wider.origin.root_pins.push(added.clone());
+        wider.origin.root_pins.sort();
+        let state = d.path().join(STATE);
+        let on_disk = std::fs::read(&state).unwrap();
+        for _restart in 0..2 {
+            let store = open_store(d.path(), wider.clone(), OpenMode::Existing).unwrap();
+            assert_eq!(store.added_root_pins(), std::slice::from_ref(&added));
+            let recovered = store.recovered().unwrap();
+            assert_eq!(recovered.origin, wider.origin);
+            assert_eq!(
+                (&recovered.floors, &recovered.anchors, &recovered.bindings),
+                (&s.floors, &s.anchors, &s.bindings)
+            );
+            drop(store);
+            assert_eq!(
+                std::fs::read(&state).unwrap(),
+                on_disk,
+                "a load wrote the checkpoint"
+            );
+        }
+        let mut store = open_store(d.path(), wider.clone(), OpenMode::Existing).unwrap();
+        let mut same = s.clone();
+        same.origin = wider.origin.clone();
+        store.commit(same, now).unwrap();
+        assert_eq!(
+            std::fs::read(&state).unwrap(),
+            on_disk,
+            "an equal commit rewrote the checkpoint"
+        );
+        let mut next = advanced(&s);
+        next.origin = wider.origin.clone();
+        store.commit(next, now).unwrap();
+        drop(store);
+        assert_ne!(std::fs::read(&state).unwrap(), on_disk);
+        let store = open_store(d.path(), wider.clone(), OpenMode::Existing).unwrap();
+        assert!(store.added_root_pins().is_empty());
+        drop(store);
+        let refused = open_store(d.path(), i, OpenMode::Existing).err().unwrap();
+        assert!(
+            format!("{refused:#}").contains("checkpoint independent origin/root scope differs"),
+            "{refused:#}"
+        );
     }
     #[test]
     fn commit_sequence_generation_and_digest_floors_never_roll_back() {
