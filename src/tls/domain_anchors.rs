@@ -592,7 +592,9 @@ pub fn verify_peer_evidence(
     let matched: Vec<_> = pins
         .iter()
         .filter(|pin| pin.current(observed))
-        .filter_map(|pin| path_accepts(end, intermediates, pin, now, role).map(|until| (pin, until)))
+        .filter_map(|pin| {
+            path_accepts(end, intermediates, pin, now, role).map(|until| (pin, until))
+        })
         .collect();
     for (other, foreign) in &anchors.by_domain {
         if other != &domain
@@ -611,9 +613,7 @@ pub fn verify_peer_evidence(
         identity,
         anchor_generation: anchors.generation,
         signer_spki: pin.spki_der.clone(),
-        valid_until: leaf_not_after
-            .min(*path_until)
-            .min(anchors.root_not_after),
+        valid_until: leaf_not_after.min(*path_until).min(anchors.root_not_after),
     })
 }
 pub fn verify_peer_certificate(
@@ -2582,7 +2582,9 @@ mod tests {
             for name in ["SPIRE CA slot A", "SPIRE CA slot B"] {
                 let ca = spire_ca(name, domain_uri, &intermediate);
                 let svid = leaf(&[URI_A], &ca);
-                assert!(verify_peer_certificate(&svid, &[ca.der().clone()], &set, now, role).is_ok());
+                assert!(
+                    verify_peer_certificate(&svid, &[ca.der().clone()], &set, now, role).is_ok()
+                );
                 assert!(
                     verify_peer_certificate(
                         &svid,
@@ -2597,13 +2599,22 @@ mod tests {
                 assert!(verify_peer_certificate(&svid, &[], &set, now, role).is_err());
             }
             // No CA between the pin and the SVID.
-            assert!(verify_peer_certificate(&leaf(&[URI_A], &intermediate), &[], &set, now, role).is_err());
+            assert!(
+                verify_peer_certificate(&leaf(&[URI_A], &intermediate), &[], &set, now, role)
+                    .is_err()
+            );
             // A SPIRE CA without its domain URI, or with another domain's.
             for uri in [None, Some("spiffe://cmtc-b.mesh.example")] {
                 let ca = spire_ca("not this domain's SPIRE CA", uri, &intermediate);
                 assert!(
-                    verify_peer_certificate(&leaf(&[URI_A], &ca), &[ca.der().clone()], &set, now, role)
-                        .is_err()
+                    verify_peer_certificate(
+                        &leaf(&[URI_A], &ca),
+                        &[ca.der().clone()],
+                        &set,
+                        now,
+                        role
+                    )
+                    .is_err()
                 );
             }
             // Two CAs between the pin and the SVID.
@@ -2687,9 +2698,13 @@ mod tests {
             .is_err()
         );
         let no_room = bounded_child("depth-zero intermediate", &root, 0);
-        assert!(pin_from_certificate_with_role(A.into(), no_room.der().clone(), vec![], true).is_err());
+        assert!(
+            pin_from_certificate_with_role(A.into(), no_room.der().clone(), vec![], true).is_err()
+        );
         // The old role still pins a depth-zero CA directly under the root.
-        assert!(pin_from_certificate_with_role(A.into(), no_room.der().clone(), vec![], false).is_ok());
+        assert!(
+            pin_from_certificate_with_role(A.into(), no_room.der().clone(), vec![], false).is_ok()
+        );
         let shallow_root = bounded_root(1);
         let under_shallow = bounded_child("intermediate under a depth-one root", &shallow_root, 1);
         assert!(intermediate_set(&shallow_root, &under_shallow, 1).is_err());
@@ -2703,10 +2718,14 @@ mod tests {
             &root,
         )
         .unwrap();
-        let publication = AnchorPublication::initial(intermediate_set(&root, &intermediate, 1).unwrap());
+        let publication =
+            AnchorPublication::initial(intermediate_set(&root, &intermediate, 1).unwrap());
         let dto = publication.checkpoint().unwrap();
         assert!(dto.pins[0].signs_spire_ca);
-        assert_eq!(AnchorPublication::from_checkpoint(&dto).unwrap(), publication);
+        assert_eq!(
+            AnchorPublication::from_checkpoint(&dto).unwrap(),
+            publication
+        );
         let (_, _, _, old_set) = fixture();
         let old = AnchorPublication::initial(old_set).checkpoint().unwrap();
         let encoded = serde_json::to_string(&old).unwrap();
@@ -2726,7 +2745,9 @@ mod tests {
         )
         .unwrap();
         let successor = intermediate_set(&root, &intermediate, 2).unwrap();
-        let next = history.restore_authoritative_snapshot(successor.clone()).unwrap();
+        let next = history
+            .restore_authoritative_snapshot(successor.clone())
+            .unwrap();
         assert_eq!(next.set, successor);
         for old in [a.der(), b.der()] {
             let spki = spki_der(old.as_ref()).unwrap();
