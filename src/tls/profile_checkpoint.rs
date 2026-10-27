@@ -86,32 +86,31 @@ impl Origin {
         );
         Ok(())
     }
-    /// The root pins an installation adds to this origin; none when it differs in
-    /// any other way. Root pins come only from the administrator's pins file, the
-    /// authority that installed the origin, so a new root can be pinned without a
-    /// checkpoint reset (a lab installed with one organizational root moves to
-    /// the mesh root). Every other field stays immutable, and dropping a root pin
-    /// still fails closed. A new root gains authority only through a strictly
-    /// newer approval generation (`supersedes`).
-    fn added_root_pins(&self, installation: &Origin) -> Vec<String> {
+    /// The root pins an installation adds to or retires from this origin; no
+    /// change when it differs in any other way, or when it adds and retires at
+    /// once. Root pins come only from the administrator's pins file, the
+    /// authority that installed the origin, so a root can be pinned or retired
+    /// without a checkpoint reset (a lab installed with one organizational root
+    /// moves to the mesh root, then retires the old root). Every other field
+    /// stays immutable. A new root gains authority only through a strictly newer
+    /// approval generation (`supersedes`). A retired root takes no authority
+    /// away from the history: `validate` still requires the recovered anchors'
+    /// root to be pinned, so retiring the root the last accepted approval chains
+    /// to fails closed.
+    fn root_pin_change(&self, installation: &Origin) -> RootPinChange {
         let same_scope = Origin {
             root_pins: installation.root_pins.clone(),
             ..self.clone()
         } == *installation;
-        if !same_scope
-            || !self
-                .root_pins
-                .iter()
-                .all(|p| installation.root_pins.contains(p))
-        {
-            return Vec::new();
+        let missing = |from: &[String], to: &[String]| -> Vec<String> {
+            to.iter().filter(|p| !from.contains(p)).cloned().collect()
+        };
+        let added = missing(&self.root_pins, &installation.root_pins);
+        let retired = missing(&installation.root_pins, &self.root_pins);
+        if !same_scope || (!added.is_empty() && !retired.is_empty()) {
+            return RootPinChange::default();
         }
-        installation
-            .root_pins
-            .iter()
-            .filter(|p| !self.root_pins.contains(p))
-            .cloned()
-            .collect()
+        RootPinChange { added, retired }
     }
     /// An approval object must be distinct from the pinned output object.
     fn valid_source(&self, source: &ApprovalSource) -> bool {
@@ -696,11 +695,12 @@ fn encode(state: &ProfileCheckpoint) -> Result<Vec<u8>> {
 fn decode(bytes: &[u8], installation: &Installation) -> Result<ProfileCheckpoint> {
     decode_recovered(bytes, installation).map(|(state, _)| state)
 }
-/// Also returns the root pins the installation added to the stored origin.
+/// Also returns the root pins the installation added to or retired from the
+/// stored origin.
 fn decode_recovered(
     bytes: &[u8],
     installation: &Installation,
-) -> Result<(ProfileCheckpoint, Vec<String>)> {
+) -> Result<(ProfileCheckpoint, RootPinChange)> {
     ensure!(
         !bytes.is_empty() && bytes.len() <= MAX_CHECKPOINT_BYTES,
         "bounded checkpoint required"
@@ -730,15 +730,28 @@ fn decode_recovered(
     };
     // Integrity is checked on the stored bytes first. Like a v1 migration, the
     // file keeps the narrower origin until the next distinct durable commit.
-    let added = state.origin.added_root_pins(&installation.origin);
-    if !added.is_empty() {
+    let change = state.origin.root_pin_change(&installation.origin);
+    if !change.is_empty() {
         state
             .origin
             .root_pins
             .clone_from(&installation.origin.root_pins);
     }
     state.validate(installation)?;
-    Ok((state, added))
+    Ok((state, change))
+}
+
+/// The root pins an installation changed in a recovered checkpoint's origin;
+/// at most one of the two lists is non-empty.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RootPinChange {
+    pub added: Vec<String>,
+    pub retired: Vec<String>,
+}
+impl RootPinChange {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.retired.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -932,7 +945,7 @@ pub struct CheckpointStore {
     installation: Installation,
     marker_inode: Option<Inode>,
     recovered: Option<ProfileCheckpoint>,
-    added_root_pins: Vec<String>,
+    root_pin_change: RootPinChange,
     state_inode: Option<Inode>,
     state_bytes: Option<Vec<u8>>,
     poisoned: bool,
@@ -960,7 +973,7 @@ impl CheckpointStore {
             installation,
             marker_inode: None,
             recovered: None,
-            added_root_pins: Vec::new(),
+            root_pin_change: RootPinChange::default(),
             state_inode: None,
             state_bytes: None,
             poisoned: false,
@@ -1007,9 +1020,9 @@ impl CheckpointStore {
                 let file = open_at(&store.directory, STATE, libc::O_RDONLY, 0)
                     .context("initialized checkpoint missing; explicit recovery required")?;
                 let bytes = bounded_read(&file, MAX_CHECKPOINT_BYTES)?;
-                let (recovered, added) = decode_recovered(&bytes, &store.installation)?;
+                let (recovered, change) = decode_recovered(&bytes, &store.installation)?;
                 store.recovered = Some(recovered);
-                store.added_root_pins = added;
+                store.root_pin_change = change;
                 store.state_inode = Some(inode(&file)?);
                 store.state_bytes = Some(bytes);
             }
@@ -1020,9 +1033,10 @@ impl CheckpointStore {
     pub fn recovered(&self) -> Option<&ProfileCheckpoint> {
         self.recovered.as_ref()
     }
-    /// Root pins the installation added to the recovered checkpoint's origin.
-    pub fn added_root_pins(&self) -> &[String] {
-        &self.added_root_pins
+    /// Root pins the installation added to or retired from the recovered
+    /// checkpoint's origin.
+    pub fn root_pin_change(&self) -> &RootPinChange {
+        &self.root_pin_change
     }
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
@@ -1518,8 +1532,7 @@ mod tests {
     }
     /// The administrator adds a root pin (the move to the mesh root): the
     /// checkpoint continues with its floors and history, a load never writes it,
-    /// and the first distinct commit records the wider origin. Dropping the pin
-    /// afterwards fails closed.
+    /// and the first distinct commit records the wider origin.
     #[test]
     fn installation_root_pin_extension_continues_the_checkpoint() {
         let d = dir();
@@ -1532,7 +1545,8 @@ mod tests {
         let on_disk = std::fs::read(&state).unwrap();
         for _restart in 0..2 {
             let store = open_store(d.path(), wider.clone(), OpenMode::Existing).unwrap();
-            assert_eq!(store.added_root_pins(), std::slice::from_ref(&added));
+            assert_eq!(store.root_pin_change().added, std::slice::from_ref(&added));
+            assert!(store.root_pin_change().retired.is_empty());
             let recovered = store.recovered().unwrap();
             assert_eq!(recovered.origin, wider.origin);
             assert_eq!(
@@ -1561,13 +1575,106 @@ mod tests {
         drop(store);
         assert_ne!(std::fs::read(&state).unwrap(), on_disk);
         let store = open_store(d.path(), wider.clone(), OpenMode::Existing).unwrap();
-        assert!(store.added_root_pins().is_empty());
+        assert!(store.root_pin_change().is_empty());
         drop(store);
-        let refused = open_store(d.path(), i, OpenMode::Existing).err().unwrap();
+        // Adding one pin and retiring another at once is not a root change.
+        let mut swapped = wider.clone();
+        swapped.origin.root_pins.retain(|p| *p != added);
+        swapped.origin.root_pins.push("e".repeat(64));
+        swapped.origin.root_pins.sort();
+        let refused = open_store(d.path(), swapped, OpenMode::Existing)
+            .err()
+            .unwrap();
         assert!(
             format!("{refused:#}").contains("checkpoint independent origin/root scope differs"),
             "{refused:#}"
         );
+    }
+    /// The administrator retires a root pin no accepted approval chains to (the
+    /// Lab Org Root after the move to the mesh root): the checkpoint continues
+    /// with its floors and history, a load never writes it, and the first
+    /// distinct commit records the narrower origin. Retiring the root the
+    /// recovered anchors chain to, or a retirement together with any other
+    /// origin change, fails closed.
+    #[test]
+    fn installation_root_pin_retirement_continues_the_checkpoint() {
+        let d = dir();
+        let (narrower, s, now) = fixture();
+        let retired = "f".repeat(64);
+        let mut wider = narrower.clone();
+        wider.origin.root_pins.push(retired.clone());
+        wider.origin.root_pins.sort();
+        let mut first = s.clone();
+        first.origin = wider.origin.clone();
+        let mut store =
+            open_store(d.path(), wider.clone(), OpenMode::BootstrapEmptyDirectory).unwrap();
+        store.commit(first.clone(), now).unwrap();
+        drop(store);
+        let state = d.path().join(STATE);
+        let on_disk = std::fs::read(&state).unwrap();
+        for _restart in 0..2 {
+            let store = open_store(d.path(), narrower.clone(), OpenMode::Existing).unwrap();
+            assert_eq!(
+                store.root_pin_change().retired,
+                std::slice::from_ref(&retired)
+            );
+            assert!(store.root_pin_change().added.is_empty());
+            let recovered = store.recovered().unwrap();
+            assert_eq!(recovered.origin, narrower.origin);
+            assert_eq!(
+                (&recovered.floors, &recovered.anchors, &recovered.bindings),
+                (&s.floors, &s.anchors, &s.bindings)
+            );
+            drop(store);
+            assert_eq!(
+                std::fs::read(&state).unwrap(),
+                on_disk,
+                "a load wrote the checkpoint"
+            );
+        }
+        let mut store = open_store(d.path(), narrower.clone(), OpenMode::Existing).unwrap();
+        store.commit(advanced(&s), now).unwrap();
+        drop(store);
+        assert_ne!(std::fs::read(&state).unwrap(), on_disk);
+        let store = open_store(d.path(), narrower.clone(), OpenMode::Existing).unwrap();
+        assert!(store.root_pin_change().is_empty());
+        drop(store);
+
+        // The anchors chain to the fixture's root: retiring it fails closed.
+        let d = dir();
+        let mut store =
+            open_store(d.path(), wider.clone(), OpenMode::BootstrapEmptyDirectory).unwrap();
+        store.commit(first, now).unwrap();
+        drop(store);
+        let mut unanchored = wider.clone();
+        unanchored.origin.root_pins = vec![retired.clone()];
+        let refused = open_store(d.path(), unanchored, OpenMode::Existing)
+            .err()
+            .unwrap();
+        assert!(
+            format!("{refused:#}").contains("checkpoint root not independently pinned"),
+            "{refused:#}"
+        );
+        // A retirement does not excuse any other origin change.
+        for variant in 0..3 {
+            let mut changed = narrower.clone();
+            match variant {
+                0 => changed.origin.node = "other-node".into(),
+                1 => changed.origin.output_uid = "other-output".into(),
+                _ => changed.origin.cluster = "other-cluster".into(),
+            };
+            let refused = open_store(d.path(), changed, OpenMode::Existing)
+                .err()
+                .unwrap();
+            assert!(
+                format!("{refused:#}").contains("checkpoint independent origin/root scope differs"),
+                "variant {variant}: {refused:#}"
+            );
+        }
+        // Retiring every root pin is not an installation.
+        let mut none = narrower;
+        none.origin.root_pins.clear();
+        assert!(open_store(d.path(), none, OpenMode::Existing).is_err());
     }
     #[test]
     fn commit_sequence_generation_and_digest_floors_never_roll_back() {

@@ -139,12 +139,21 @@ impl ProfileProvider {
     ) -> Result<Arc<Self>> {
         let installation = Installation::from_expected(expected);
         let store = CheckpointStore::open(path, installation.clone(), mode)?;
-        if !store.added_root_pins().is_empty() {
+        let change = store.root_pin_change();
+        if !change.added.is_empty() {
             tracing::info!(
                 component = "issuer-profile-provider",
                 stage = "installation-root-pin-extension",
-                added = ?store.added_root_pins(),
+                added = ?change.added,
                 "checkpoint origin gains administrator root pins; floors, history and fences carried, no checkpoint reset; written at the next durable commit"
+            );
+        }
+        if !change.retired.is_empty() {
+            tracing::info!(
+                component = "issuer-profile-provider",
+                stage = "installation-root-pin-retirement",
+                retired = ?change.retired,
+                "checkpoint origin retires administrator root pins; the recovered anchors' root stays pinned, floors, history and fences carried, no checkpoint reset; written at the next durable commit"
             );
         }
         let record = store.recovered().cloned();
