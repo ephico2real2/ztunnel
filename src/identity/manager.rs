@@ -330,8 +330,9 @@ impl Worker {
         // This avoids delays where a failing fetch for one workload needlessly stalls the refetch
         // for other workloads. Kept separate from the `pending` KeyedPriorityKey for convenience.
         let mut pending_backoffs_by_key: HashMap<CacheKey, ExponentialBackoff> = HashMap::new();
-        // The wall-clock time of each Background refresh in `pending`. Its Instant is correct only
-        // while the two clocks advance together; after a jump it is computed again from here.
+        // The wall-clock due time of each refresh in `pending`, used while its priority is
+        // Background. Its Instant is correct only while the two clocks advance together; after a
+        // jump it is computed again from here.
         let mut refresh_due: HashMap<CacheKey, SystemTime> = HashMap::new();
         let mut clock_check = tokio::time::interval(CLOCK_CHECK_INTERVAL);
         clock_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -689,12 +690,23 @@ impl SecretManager {
                     if pri > existing_pri {
                         self.post(Request::Fetch(key, pri)).await;
                     }
-                } else if expired(&rx, self.worker.clock.now()) {
-                    // An expired certificate is never returned. Mark it seen, so that the caller
-                    // waits for the result of the fetch requested here.
-                    tracing::info!(id = %key, "cached certificate expired; fetching a new one");
-                    rx.borrow_and_update();
+                    return Ok(rx);
+                }
+                // Decide on the value that is marked seen, so that a refresh sent between the
+                // expiry check and the mark is still returned at once.
+                let now = self.worker.clock.now();
+                let is_expired = matches!(
+                    *rx.borrow_and_update(),
+                    CertState::Available(ref cert) if cert.cert.expiration().not_after <= now
+                );
+                if is_expired {
+                    // An expired certificate is never returned: the caller waits for the result
+                    // of the fetch requested here.
+                    tracing::debug!(id = %key, "cached certificate expired; fetching a new one");
                     self.post(Request::Fetch(key, pri)).await;
+                } else {
+                    // The cached value is the answer; mark it unseen, so that wait() returns it.
+                    rx.mark_changed();
                 }
                 Ok(rx)
             }
@@ -817,14 +829,6 @@ impl SecretManager {
             ret.push(f(key, &chan.rx.borrow()));
         }
         ret
-    }
-}
-
-// Whether the Receiver holds an Available certificate whose not_after is at or before `now`.
-fn expired(rx: &watch::Receiver<CertState>, now: SystemTime) -> bool {
-    match *rx.borrow() {
-        CertState::Available(ref cert) => cert.cert.expiration().not_after <= now,
-        _ => false,
     }
 }
 
