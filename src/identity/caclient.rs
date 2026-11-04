@@ -219,7 +219,6 @@ pub mod mock {
     use std::time::Duration;
 
     use tokio::sync::RwLock;
-    use tokio::time::Instant;
 
     use crate::identity::{CacheKey, Identity};
 
@@ -235,7 +234,9 @@ pub mod mock {
     #[derive(Clone)]
     pub struct ClientConfig {
         pub cert_lifetime: Duration,
-        pub time_conv: crate::time::Converter,
+        // The wall clock certificates are issued by. Tests share it with the SecretManager so
+        // both read the same (simulated) time.
+        pub clock: crate::time::WallClock,
         // If non-zero, causes fetch_certificate calls to sleep for the specified duration before
         // returning. This is helpful to let tests that pause tokio time get more control over code
         // execution.
@@ -247,7 +248,7 @@ pub mod mock {
             Self {
                 fetch_latency: Duration::ZERO,
                 cert_lifetime: Duration::from_secs(10),
-                time_conv: crate::time::Converter::new(),
+                clock: crate::time::WallClock::simulated(crate::time::Converter::new()),
             }
         }
     }
@@ -302,12 +303,7 @@ pub mod mock {
                 tokio::time::sleep(self.cfg.fetch_latency).await;
             }
 
-            // Get SystemTime::now() via Instant::now() to allow mocking in tests.
-            let not_before = self
-                .cfg
-                .time_conv
-                .instant_to_system_time(Instant::now().into())
-                .expect("SystemTime cannot represent current time. Was the process started in extreme future?");
+            let not_before = self.cfg.clock.now();
             let not_after = not_before + self.cfg.cert_lifetime;
 
             let mut state = self.state.write().await;
