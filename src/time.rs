@@ -70,6 +70,68 @@ impl Default for Converter {
     }
 }
 
+/// The wall clock that certificate scheduling reads.
+///
+/// Certificate validity is wall-clock time, but timers run on the monotonic clock
+/// (`CLOCK_MONOTONIC` on Linux). The monotonic clock stops while the host or VM is suspended
+/// and does not follow wall-clock steps, so a mapping between the two that is fixed once (a
+/// [`Converter`]) drifts by every suspend. Code that schedules by certificate time reads the
+/// wall clock again each time it schedules, through this type.
+#[derive(Clone)]
+pub enum WallClock {
+    /// `SystemTime::now()`.
+    System,
+    /// Tokio's clock mapped through a fixed [`Converter`], plus a step that tests set to move the
+    /// wall clock without moving the monotonic clock (a suspend, or an NTP step).
+    #[cfg(any(test, feature = "testing"))]
+    Simulated {
+        conv: Converter,
+        step: std::sync::Arc<std::sync::Mutex<std::time::Duration>>,
+    },
+}
+
+impl WallClock {
+    #[cfg(any(test, feature = "testing"))]
+    pub fn simulated(conv: Converter) -> Self {
+        Self::Simulated {
+            conv,
+            step: Default::default(),
+        }
+    }
+
+    pub fn now(&self) -> SystemTime {
+        match self {
+            Self::System => SystemTime::now(),
+            #[cfg(any(test, feature = "testing"))]
+            Self::Simulated { conv, step } => {
+                conv.instant_to_system_time(tokio::time::Instant::now().into_std())
+                    .expect("SystemTime cannot represent the simulated time")
+                    + *step.lock().unwrap()
+            }
+        }
+    }
+
+    /// The Tokio instant at which this clock reads `t`, assuming the wall and monotonic clocks
+    /// advance together from now. A time in the past maps to now. None when the instant cannot
+    /// be represented.
+    pub fn instant_at(&self, t: SystemTime) -> Option<tokio::time::Instant> {
+        let now = tokio::time::Instant::now();
+        match t.duration_since(self.now()) {
+            Ok(d) => now.checked_add(d),
+            Err(_) => Some(now),
+        }
+    }
+
+    /// Moves the simulated wall clock forward by `d`; the monotonic clock does not move.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn step_forward(&self, d: std::time::Duration) {
+        match self {
+            Self::Simulated { step, .. } => *step.lock().unwrap() += d,
+            Self::System => panic!("cannot step the system clock"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};

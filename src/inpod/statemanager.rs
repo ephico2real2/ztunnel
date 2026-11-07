@@ -338,10 +338,12 @@ impl WorkloadProxyManagerState {
     // reconcile existing state to snaphsot. drains any workloads not in the snapshot
     // this can happen if workloads were removed while we were disconnected.
     async fn reconcile(&mut self) -> Result<(), Error> {
+        let mut removed = Vec::new();
         for (uid, workload_state) in self
             .workload_states
             .extract_if(|uid, _| !self.snapshot_names.contains(uid))
         {
+            removed.push(uid.clone());
             self.draining.shutdown_workload(uid, workload_state);
         }
         self.snapshot_names.clear();
@@ -357,6 +359,12 @@ impl WorkloadProxyManagerState {
         {
             result
                 .map_err(|error| Error::ProtocolError(format!("snapshot drain failed: {error}")))?;
+        }
+        // Every removed workload is fully stopped. Without this a bound owner
+        // stayed live although its proxy was gone, and check_add refused a
+        // restarted source's ADD of the Pod until this proxy execution ended.
+        for uid in &removed {
+            self.owners.complete_removed(uid);
         }
         Ok(())
     }

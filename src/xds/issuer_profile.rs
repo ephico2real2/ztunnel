@@ -126,6 +126,15 @@ impl ProbeHandler {
         Self { expected, clock }
     }
     fn decode(&self, res: &DeltaDiscoveryResponse) -> Result<issuer_profile_wire::Decoded> {
+        self.decode_at(res, (self.clock)())
+    }
+    /// Decode at an explicit verifier time: the native provider passes its
+    /// wall floor so a bounded backward step cannot NACK a current profile.
+    fn decode_at(
+        &self,
+        res: &DeltaDiscoveryResponse,
+        now: SystemTime,
+    ) -> Result<issuer_profile_wire::Decoded> {
         ensure!(
             res.type_url == ISSUER_PROFILE_TYPE.to_string()
                 && !res.nonce.is_empty()
@@ -158,11 +167,8 @@ impl ProbeHandler {
             profile.transport_version == 1,
             "unsupported issuer-profile transport version"
         );
-        let decoded = issuer_profile_wire::decode(
-            &profile.strict_der_profile_json,
-            &self.expected,
-            (self.clock)(),
-        )?;
+        let decoded =
+            issuer_profile_wire::decode(&profile.strict_der_profile_json, &self.expected, now)?;
         let version = format!("{}/{}", decoded.sequence, decoded.publication_digest);
         ensure!(
             raw.version == version && res.system_version_info == version,
@@ -247,7 +253,11 @@ impl RawHandler for ProviderHandler {
             .map(|r| strng::new(&r.version))
             .unwrap_or_default();
         let session = self.provider.session_generation();
-        let result = match self.decoder.decode(&res) {
+        let decoded = self
+            .provider
+            .verifier_now()
+            .and_then(|now| self.decoder.decode_at(&res, now));
+        let result = match decoded {
             Err(error) => Err(error),
             Ok(decoded) => {
                 let provider = self.provider.clone();

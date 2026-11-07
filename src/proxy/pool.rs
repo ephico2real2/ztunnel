@@ -134,6 +134,7 @@ impl ConnSpawner {
         if self.closed.load(Ordering::Acquire) {
             return Err(Error::WorkloadHBONEPoolDraining);
         }
+        let certificate_deadline = tls_stream.certificate_deadline();
         trace!("connector connected, handshaking");
         let mut sender = h2::client::spawn_owned_connection(
             self.cfg.clone(),
@@ -145,7 +146,7 @@ impl ConnSpawner {
             Some(self.tasks.clone()),
         )
         .await?;
-        sender.bind_profile(lease);
+        sender.bind_profile(lease, certificate_deadline);
         sender.bind_source(source_witness);
         Ok(sender)
     }

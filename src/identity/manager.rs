@@ -19,6 +19,7 @@ use std::fmt::{Formatter, Write};
 use std::hash::{Hash, RandomState};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use crate::config::ProxyMode;
 use async_trait::async_trait;
@@ -39,6 +40,13 @@ use educe::Educe;
 use keyed_priority_queue::KeyedPriorityQueue;
 
 const CERT_REFRESH_FAILURE_RETRY_DELAY_MAX_INTERVAL: Duration = Duration::from_secs(150);
+
+// How often the worker compares the wall clock with the monotonic clock. A suspend or a
+// wall-clock step makes a refresh scheduled on the monotonic clock late in wall-clock (that is,
+// certificate) time; this bounds how long after the jump the refresh runs.
+const CLOCK_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+// The smallest difference between the two clocks' elapsed time that counts as a jump.
+const CLOCK_JUMP_THRESHOLD: Duration = Duration::from_secs(1);
 
 /// Default trust domain to use if not otherwise specified.
 pub const DEFAULT_TRUST_DOMAIN: &str = "cluster.local";
@@ -255,12 +263,9 @@ impl PartialOrd for PendingPriority {
 // Implements the actual logic behind SecretManager.
 struct Worker {
     client: Box<dyn CaClientTrait>,
-    // For now, certificates contain SystemTime so we need to convert it to Instant. Using Converter
-    // allows us to work on Instants without referring to the current SystemTime, which allows for
-    // time control in unit tests.
-    //
-    // TODO: Change tls::Certs to use Instant instead of SystemTime.
-    time_conv: crate::time::Converter,
+    // Certificates carry SystemTime and timers run on Instant. Every conversion reads the wall
+    // clock at that moment (see [`crate::time::WallClock`]); tests simulate it.
+    clock: crate::time::WallClock,
     // Maps each cache key to its certificate state (see [`CacheKey`]).
     certs: Mutex<HashMap<CacheKey, CertChannel>>,
     // How many concurrent fetch_certificate calls can be pending at a time.
@@ -278,7 +283,7 @@ impl Worker {
         }
         let worker = Arc::new(Self {
             client,
-            time_conv: cfg.time_conv,
+            clock: cfg.clock,
             concurrency: cfg.concurrency,
             certs: Default::default(),
         });
@@ -325,6 +330,13 @@ impl Worker {
         // This avoids delays where a failing fetch for one workload needlessly stalls the refetch
         // for other workloads. Kept separate from the `pending` KeyedPriorityKey for convenience.
         let mut pending_backoffs_by_key: HashMap<CacheKey, ExponentialBackoff> = HashMap::new();
+        // The wall-clock due time of each refresh in `pending`, used while its priority is
+        // Background. Its Instant is correct only while the two clocks advance together; after a
+        // jump it is computed again from here.
+        let mut refresh_due: HashMap<CacheKey, SystemTime> = HashMap::new();
+        let mut clock_check = tokio::time::interval(CLOCK_CHECK_INTERVAL);
+        clock_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut clock_sample = (Instant::now(), self.clock.now());
 
         'main: loop {
             let next = pending.peek().map(|(_, PendingPriority(_, ts))| *ts);
@@ -372,6 +384,7 @@ impl Worker {
                             // managing the key. Do nothing.
                             continue 'main;
                         }
+                        refresh_due.remove(&key);
                         match processing.get(&key) {
                             None => {
                                 pending.remove(&key);
@@ -393,7 +406,7 @@ impl Worker {
                         Some(Fetch::Forgetting) => continue 'main,
                         None => unreachable!("processing should represent all fetches"),
                     }
-                    let (state, refresh_at) = match res {
+                    let (state, due) = match res {
                         Err(err) => {
                             // Check if we should retain the existing valid certificate
                             let existing_cert_info = self.get_existing_cert_info(&key).await;
@@ -439,19 +452,19 @@ impl Worker {
                             let retry_delay = keyed_backoff.next_backoff().unwrap_or(CERT_REFRESH_FAILURE_RETRY_DELAY_MAX_INTERVAL);
                             // Store the per-key backoff, we're gonna retry.
                             pending_backoffs_by_key.insert(key.clone(), keyed_backoff);
-                            let refresh_at = Instant::now() + retry_delay;
+                            let retry_at = self.clock.now() + retry_delay;
 
                             match existing_cert_info {
                                 // we do have a valid existing certificate, schedule retry
-                                Some((valid_cert, cert_expiry_instant)) => {
-                                    let effective_refresh_at = std::cmp::min(refresh_at, cert_expiry_instant);
-                                    tracing::info!(id = %key, "certificate renewal failed ({err}); retaining existing valid certificate until {:?}; next retry at {:?}", cert_expiry_instant, effective_refresh_at);
-                                    (CertState::Available(valid_cert), effective_refresh_at)
+                                Some((valid_cert, cert_expiry)) => {
+                                    let effective_retry_at = std::cmp::min(retry_at, cert_expiry);
+                                    tracing::info!(id = %key, "certificate renewal failed ({err}); retaining existing valid certificate until {:?}; next retry at {:?}", cert_expiry, effective_retry_at);
+                                    (CertState::Available(valid_cert), effective_retry_at)
                                 },
                                 // we don't have a valid existing certificate
                                 None => {
                                     tracing::warn!(id = %key, "certificate fetch failed ({err}) and no valid existing certificate; will retry in {retry_delay:?} (backoff capped at {CERT_REFRESH_FAILURE_RETRY_DELAY_MAX_INTERVAL:?})");
-                                    (CertState::Unavailable(err), refresh_at)
+                                    (CertState::Unavailable(err), retry_at)
                                 }
                             }
                         },
@@ -460,30 +473,48 @@ impl Worker {
                             // Reset (pop and drop) the backoff on success.
                             pending_backoffs_by_key.remove(&key);
                             let certs: tls::WorkloadCertificate = certs; // Type annotation.
-                            let refresh_at = self.time_conv.system_time_to_instant(certs.refresh_at());
-                            let refresh_at = if let Some(t) = refresh_at {
-                                t.into()
-                            } else {
-                                // Malformed certificate (not_after is way too much into the
-                                // past or the future). Queue another refresh soon.
-                                //
-                                // TODO: This is a bit inconsistent since we still return the
-                                // certificate to the caller successfully. Basically the
-                                // behavior is silly, but simple and avoid panics in time math.
-                                // We'll try to get rid of the SystemTime <-> Instant
-                                // conversion here, so for now leaving the code as is.
-                                Instant::now()
-                            };
+                            let refresh_at = certs.refresh_at();
                             (CertState::Available(Arc::new(certs)), refresh_at)
                         },
                     };
+                    // A due time the Instant cannot represent (not_after is far in the future)
+                    // queues another refresh soon. The certificate is still returned to the caller.
+                    let refresh_at = self.clock.instant_at(due).unwrap_or_else(Instant::now);
                     if self.update_certs(&key, state).await {
+                        refresh_due.insert(key.clone(), due);
                         push_increase(&mut pending, key, PendingPriority(Priority::Background, refresh_at));
                     }
+                },
+                // Detect a jump of the wall clock against the monotonic clock and reschedule
+                // every Background refresh by its wall-clock due time.
+                _ = clock_check.tick() => {
+                    let sample = (Instant::now(), self.clock.now());
+                    let monotonic = sample.0.saturating_duration_since(clock_sample.0).as_nanos() as i128;
+                    let wall = match sample.1.duration_since(clock_sample.1) {
+                        Ok(d) => d.as_nanos() as i128,
+                        Err(e) => -(e.duration().as_nanos() as i128),
+                    };
+                    clock_sample = sample;
+                    let skew = wall - monotonic;
+                    let jump = Duration::from_nanos(skew.unsigned_abs().try_into().unwrap_or(u64::MAX));
+                    if jump < CLOCK_JUMP_THRESHOLD {
+                        continue 'main;
+                    }
+                    let mut rescheduled = 0usize;
+                    for (key, due) in &refresh_due {
+                        if let Some(PendingPriority(Priority::Background, _)) = pending.get_priority(key) {
+                            let refresh_at = self.clock.instant_at(*due).unwrap_or_else(Instant::now);
+                            let _ = pending.set_priority(key, PendingPriority(Priority::Background, refresh_at));
+                            rescheduled += 1;
+                        }
+                    }
+                    let direction = if skew > 0 { "ahead of" } else { "behind" };
+                    tracing::warn!(?jump, rescheduled, "wall clock moved {direction} the monotonic clock; certificate refreshes rescheduled by wall-clock time");
                 },
                 // Initiate the next fetch.
                 true = maybe_sleep_until(next), if fetches.len() < self.concurrency as usize => {
                     let (key, _) = pending.pop().expect("pending should always have an element at this point");
+                    refresh_due.remove(&key);
                     processing.insert(key.clone(), Fetch::Processing);
                     fetches.push(async move {
                         let res = self.client.fetch_certificate(&key).await;
@@ -515,27 +546,16 @@ impl Worker {
     async fn get_existing_cert_info(
         &self,
         key: &CacheKey,
-    ) -> Option<(Arc<tls::WorkloadCertificate>, Instant)> {
+    ) -> Option<(Arc<tls::WorkloadCertificate>, SystemTime)> {
         if let Some(cert_channel) = self.certs.lock().await.get(key) {
             match &*cert_channel.rx.borrow() {
                 CertState::Available(cert) => {
-                    let now = self
-                        .time_conv
-                        .instant_to_system_time(std::time::Instant::now());
-                    if let Some(now) = now {
-                        let cert_expiry = cert.cert.expiration().not_after;
-
-                        if now < cert_expiry {
-                            if let Some(expiry_instant) =
-                                self.time_conv.system_time_to_instant(cert_expiry)
-                            {
-                                tracing::debug!(id = %key, "existing certificate valid until {:?}", cert_expiry);
-                                return Some((cert.clone(), expiry_instant.into()));
-                            }
-                        } else {
-                            tracing::debug!(id = %key, "existing certificate expired at {:?}", cert_expiry);
-                        }
+                    let cert_expiry = cert.cert.expiration().not_after;
+                    if self.clock.now() < cert_expiry {
+                        tracing::debug!(id = %key, "existing certificate valid until {:?}", cert_expiry);
+                        return Some((cert.clone(), cert_expiry));
                     }
+                    tracing::debug!(id = %key, "existing certificate expired at {:?}", cert_expiry);
                 }
                 _ => {
                     tracing::debug!(id = %key, "no valid certificate available to retain");
@@ -564,7 +584,7 @@ enum Request {
 }
 
 pub struct SecretManagerConfig {
-    time_conv: crate::time::Converter,
+    clock: crate::time::WallClock,
     concurrency: u16,
 }
 
@@ -617,7 +637,7 @@ impl SecretManager {
         Self::new_internal(
             Box::new(client),
             SecretManagerConfig {
-                time_conv: crate::time::Converter::new(),
+                clock: crate::time::WallClock::System,
                 concurrency: 8,
             },
         )
@@ -663,13 +683,30 @@ impl SecretManager {
         match certs.get(&key) {
             // Key found in cache and is already being refreshed. Bump the priority if needed.
             Some(st) => {
-                let rx = st.rx.clone();
+                let mut rx = st.rx.clone();
                 drop(certs);
 
-                if let Some(existing_pri) = init_pri(&rx)
-                    && pri > existing_pri
-                {
+                if let Some(existing_pri) = init_pri(&rx) {
+                    if pri > existing_pri {
+                        self.post(Request::Fetch(key, pri)).await;
+                    }
+                    return Ok(rx);
+                }
+                // Decide on the value that is marked seen, so that a refresh sent between the
+                // expiry check and the mark is still returned at once.
+                let now = self.worker.clock.now();
+                let is_expired = matches!(
+                    *rx.borrow_and_update(),
+                    CertState::Available(ref cert) if cert.cert.expiration().not_after <= now
+                );
+                if is_expired {
+                    // An expired certificate is never returned: the caller waits for the result
+                    // of the fetch requested here.
+                    tracing::debug!(id = %key, "cached certificate expired; fetching a new one");
                     self.post(Request::Fetch(key, pri)).await;
+                } else {
+                    // The cached value is the answer; mark it unseen, so that wait() returns it.
+                    rx.mark_changed();
                 }
                 Ok(rx)
             }
@@ -832,17 +869,19 @@ pub mod mock {
     // There is no need to return Arc, but most callers want one so it simplifies the code - and we
     // don't care about the extra overhead in tests.
     pub fn new_secret_manager_cfg(cfg: Config) -> Arc<SecretManager> {
-        let time_conv = crate::time::Converter::new_at(cfg.epoch.unwrap_or_else(SystemTime::now));
+        let clock = crate::time::WallClock::simulated(crate::time::Converter::new_at(
+            cfg.epoch.unwrap_or_else(SystemTime::now),
+        ));
         let client = MockCaClient::new(mock::ClientConfig {
             cert_lifetime: cfg.cert_lifetime,
             fetch_latency: cfg.fetch_latency,
-            time_conv: time_conv.clone(),
+            clock: clock.clone(),
         });
         Arc::new(
             SecretManager::new_internal(
                 Box::new(client),
                 super::SecretManagerConfig {
-                    time_conv,
+                    clock,
                     concurrency: 2,
                 },
             )
@@ -976,6 +1015,7 @@ mod tests {
     struct Test {
         secret_manager: Arc<SecretManager>,
         caclient: MockCaClient,
+        clock: crate::time::WallClock,
         worker: tokio::task::JoinHandle<()>,
     }
 
@@ -1003,22 +1043,23 @@ mod tests {
         //  - In practice, sleep calls add some number of microseconds and then round down to the
         //    nearest millisecond. That means eg. sleep(1ms) will advance the timer by 2ms while
         //    sleep(600us) will advance the timer by only 1ms.
-        let time_conv = crate::time::Converter::new();
+        let clock = crate::time::WallClock::simulated(crate::time::Converter::new());
         let caclient = MockCaClient::new(caclient::mock::ClientConfig {
-            time_conv: time_conv.clone(),
+            clock: clock.clone(),
             fetch_latency: SEC,
             cert_lifetime: 2 * CERT_HALFLIFE,
         });
         let (secret_manager, worker) = SecretManager::new_internal(
             Box::new(caclient.clone()),
             SecretManagerConfig {
-                time_conv,
+                clock: clock.clone(),
                 concurrency,
             },
         );
         Test {
             worker,
             caclient,
+            clock,
             secret_manager: Arc::new(secret_manager),
         }
     }
@@ -1309,6 +1350,48 @@ mod tests {
 
         assert!(post_refresh_fetch_count > initial_fetch_count);
         assert_eq!(initial_serial, current_serial);
+
+        test.tear_down().await;
+    }
+
+    // A suspend stops the monotonic clock while the wall clock keeps going. The refresh follows
+    // the certificate's wall-clock time, not the schedule made on the monotonic clock.
+    #[tokio::test(start_paused = true)]
+    async fn test_refresh_follows_wall_clock_jump() {
+        let test = setup(1);
+        let id = identity("wall-clock-jump");
+        let initial = test.secret_manager.fetch_certificate(&id).await.unwrap();
+        let initial_serial = initial.cert.serial().clone();
+        test.caclient.clear_fetches().await;
+
+        // The wall clock moves past the certificate's expiry; the monotonic clock does not.
+        test.clock.step_forward(4 * CERT_HALFLIFE);
+
+        // The jump is seen within CLOCK_CHECK_INTERVAL and the overdue refresh runs at once (the
+        // mock CA answers after SEC), long before the monotonic schedule (CERT_HALFLIFE).
+        tokio::time::sleep(CLOCK_CHECK_INTERVAL + 2 * SEC).await;
+        assert_eq!(test.caclient.fetches().await.len(), 1);
+        let current = test.secret_manager.fetch_certificate(&id).await.unwrap();
+        assert_ne!(initial_serial, current.cert.serial().clone());
+        assert!(current.cert.expiration().not_after > test.clock.now());
+
+        test.tear_down().await;
+    }
+
+    // A certificate that expired before its refresh ran is not returned: the caller waits for a
+    // new one.
+    #[tokio::test(start_paused = true)]
+    async fn test_expired_certificate_is_not_returned() {
+        let test = setup(1);
+        let id = identity("expired");
+        let initial = test.secret_manager.fetch_certificate(&id).await.unwrap();
+        let initial_serial = initial.cert.serial().clone();
+
+        test.clock.step_forward(4 * CERT_HALFLIFE);
+
+        let current = test.secret_manager.fetch_certificate(&id).await.unwrap();
+        assert_ne!(initial_serial, current.cert.serial().clone());
+        assert!(current.cert.expiration().not_after > test.clock.now());
 
         test.tear_down().await;
     }

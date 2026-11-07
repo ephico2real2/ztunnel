@@ -35,7 +35,6 @@ use crate::xds::metrics::{ConnectionTerminationReason, Metrics};
 use crate::xds::service::discovery::v3::Resource as ProtoResource;
 use crate::xds::service::discovery::v3::aggregated_discovery_service_client::AggregatedDiscoveryServiceClient;
 use crate::xds::service::discovery::v3::*;
-use crate::xds::{ADDRESS_TYPE, AUTHORIZATION_TYPE};
 use crate::{identity, strng, tls};
 
 use super::Error;
@@ -519,6 +518,10 @@ pub struct AdsClient {
     types_to_expect: HashSet<String>,
     session_gate: Option<XdsSessionGate>,
     session_generation: u64,
+    // Set once this connection delivered a complete initial snapshot. A
+    // healthy session restarts the reconnect backoff, so an occasional later
+    // rejection does not inherit a backoff grown by unrelated earlier failures.
+    snapshot_completed: bool,
 }
 
 /// Demanded allows awaiting for an on-demand XDS resource
@@ -601,6 +604,7 @@ impl AdsClient {
             types_to_expect,
             session_gate,
             session_generation: 0,
+            snapshot_completed: false,
         }
     }
 
@@ -623,6 +627,7 @@ impl AdsClient {
             .filter(|e| !Self::is_initial_request_on_demand(e))
             .map(|e| e.type_url.clone())
             .collect();
+        self.snapshot_completed = false;
         if let Some(gate) = &self.session_gate {
             self.session_generation = gate.begin_session();
         }
@@ -641,6 +646,11 @@ impl AdsClient {
         if let Some(gate) = &self.session_gate {
             gate.mark_stale(self.session_generation);
         }
+        let backoff = if self.snapshot_completed {
+            INITIAL_BACKOFF
+        } else {
+            backoff
+        };
 
         match result {
             Err(e @ Error::Connection(_, _)) => {
@@ -883,17 +893,21 @@ impl AdsClient {
                         // deadline expire; later corrections cannot mutate it.
                         continue;
                     }
-                    // Strict mode accepts one complete initial response for
-                    // each required type. Any later security delta forces a
-                    // reconnect and a fresh full snapshot; applying one type
-                    // while the other remains from an older snapshot could
-                    // briefly authorize against mixed state.
+                    // Strict mode opens admission only after one complete
+                    // initial response for each required type. Later Address
+                    // and Authorization deltas are applied in this session:
+                    // each response is validated whole and committed under one
+                    // write lock (or NACKed, which revokes the session), a
+                    // workload whose referenced policy has not arrived denies,
+                    // and the PolicyWatcher re-checks every tracked connection
+                    // on each change. The control plane releases its datapath
+                    // quarantine only from ACKs on this stream, so forcing a
+                    // reconnect per delta would make that release unreachable.
+                    // An issuer-profile probe without a native provider has no
+                    // renewal semantics and still requires a fresh session.
                     if let Some(gate) = &self.session_gate {
-                        let is_security_type = msg.type_url == ADDRESS_TYPE.to_string()
-                            || msg.type_url == AUTHORIZATION_TYPE.to_string()
-                            || msg.type_url == ISSUER_PROFILE_TYPE.to_string();
-                        let native_profile = msg.type_url == ISSUER_PROFILE_TYPE.to_string() && self.config.profile_provider.is_some();
-                        if is_security_type && !native_profile && !self.types_to_expect.contains(&msg.type_url) {
+                        let probe_profile = msg.type_url == ISSUER_PROFILE_TYPE.to_string() && self.config.profile_provider.is_none();
+                        if probe_profile && !self.types_to_expect.contains(&msg.type_url) {
                             gate.mark_stale(self.session_generation);
                             warn!(
                                 generation = self.session_generation,
@@ -940,6 +954,7 @@ impl AdsClient {
                         self.types_to_expect.remove(&received_type);
                         if self.types_to_expect.is_empty() {
                             mem::drop(mem::take(&mut self.block_ready));
+                            self.snapshot_completed = true;
                             if let Some(gate) = &self.session_gate {
                                 gate.mark_snapshot_ready(self.session_generation);
                             }
@@ -1642,6 +1657,7 @@ mod tests {
             assert_eq!(ack.response_nonce, expected_nonce);
         }
 
+        // A valid live delta is applied and ACKed inside the open session.
         let late_ip = Ipv4Addr::new(10, 0, 0, 9);
         first
             .tx
@@ -1653,13 +1669,17 @@ mod tests {
             }))
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while gate.is_open() {
-                sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .expect("a live security delta must close strict inbound authorization");
+        let ack = tokio::time::timeout(Duration::from_secs(2), first.rx.recv())
+            .await
+            .expect("live delta should be acknowledged")
+            .expect("ADS stream must stay open after a valid live delta");
+        assert_eq!(ack.response_nonce, "live-address-update");
+        assert!(ack.error_detail.is_none());
+        assert!(
+            gate.is_open(),
+            "a valid live delta keeps strict admission open"
+        );
+        assert_eq!(gate.snapshot().generation, first_generation);
         assert!(
             state
                 .read()
@@ -1670,16 +1690,19 @@ mod tests {
                     },
                     None
                 )
-                .is_none(),
-            "a live delta must not be applied under the previous snapshot generation"
+                .is_some(),
+            "a valid live delta is applied in the current session"
         );
-        assert!(
-            tokio::time::timeout(Duration::from_secs(2), first.rx.recv())
-                .await
-                .expect("strict client must terminate the old ADS stream")
-                .is_none(),
-            "a live delta must not be ACKed; the client must reconnect for a full snapshot"
-        );
+
+        // Losing the stream revokes the session and requires a fresh snapshot.
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while gate.is_open() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("stream loss must close strict inbound authorization");
 
         let mut second = tokio::time::timeout(Duration::from_secs(2), connections.recv())
             .await
@@ -2853,8 +2876,8 @@ mod tests {
             drop(ack);
             drop(inbound);
         });
-        // A later security delta is fenced before application by design. It must
-        // close the strict stream, rather than preserving any earlier ALLOW.
+        // A malformed live delta is NACKed. The NACK revokes the strict session
+        // and drains it, rather than preserving any earlier ALLOW.
         first
             .tx
             .send(Ok(DeltaDiscoveryResponse {
@@ -2959,6 +2982,315 @@ mod tests {
             .await;
         watcher.await.unwrap();
     }
+
+    /// Live Address and Authorization deltas are applied inside one strict
+    /// session. A narrowed ALLOW closes only the connection it no longer
+    /// permits, and a workload whose referenced policy has not arrived denies
+    /// until that policy is delivered and again after it is removed.
+    #[tokio::test]
+    async fn strict_live_deltas_apply_in_session_and_revoke_only_affected_connections() {
+        use crate::proxy::connection_manager::{ConnectionManager, PolicyWatcher};
+        use crate::xds::istio::security::{Action, Clause, Match, Rule};
+        let gate = XdsSessionGate::new();
+        let (mut connections, client, state, _) =
+            AdsServer::spawn_with_session_gate(false, Some(gate.clone())).await;
+        let manager = ConnectionManager::default();
+        let (stop_tx, stop) = crate::drain::new();
+        let watcher = tokio::spawn(PolicyWatcher::new(state.clone(), stop, manager.clone()).run());
+        let task = tokio::spawn(client.run());
+
+        let allow = |name: &str, ports: Vec<u32>| {
+            let mut wire =
+                XdsAuthorization::decode(get_auth(0).resource.unwrap().value.as_slice()).unwrap();
+            wire.name = name.to_string();
+            wire.action = Action::Allow as i32;
+            wire.rules = vec![Rule {
+                clauses: if ports.is_empty() {
+                    vec![]
+                } else {
+                    vec![Clause {
+                        matches: vec![Match {
+                            destination_ports: ports,
+                            ..Default::default()
+                        }],
+                    }]
+                },
+            }];
+            ProtoResource {
+                name: format!("default/{name}"),
+                version: "1".into(),
+                resource: Some(Any {
+                    type_url: AUTHORIZATION_TYPE.to_string(),
+                    value: wire.encode_to_vec(),
+                }),
+                ..Default::default()
+            }
+        };
+        let ctx_for = |uid: &str, dst: &str| crate::state::ProxyRbacContext {
+            native_source: None,
+            dest_workload: state.read().workloads.find_uid(&strng::new(uid)).unwrap(),
+            conn: crate::rbac::Connection {
+                src: "10.0.0.9:42000".parse().unwrap(),
+                dst: dst.parse().unwrap(),
+                dst_network: "".into(),
+                src_identity: Some("spiffe://local/ns/default/sa/default".parse().unwrap()),
+            },
+        };
+        async fn expect_ack(rx: &mut mpsc::Receiver<DeltaDiscoveryRequest>, nonce: &str) {
+            let ack = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("live delta should be acknowledged")
+                .expect("ADS stream must stay open");
+            assert_eq!(ack.response_nonce, nonce);
+            assert!(ack.error_detail.is_none(), "{nonce} must be ACKed");
+        }
+
+        let mut ads = tokio::time::timeout(Duration::from_secs(2), connections.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        for expected in [ADDRESS_TYPE, AUTHORIZATION_TYPE] {
+            assert_eq!(ads.rx.recv().await.unwrap().type_url, expected);
+        }
+        ads.tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: ADDRESS_TYPE.to_string(),
+                nonce: "initial-address".into(),
+                resources: vec![get_address_with_uid_resource_name(
+                    0,
+                    "10.0.0.8".parse().unwrap(),
+                )],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        expect_ack(&mut ads.rx, "initial-address").await;
+        ads.tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: AUTHORIZATION_TYPE.to_string(),
+                nonce: "initial-authorization".into(),
+                resources: vec![allow("allow", vec![])],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        expect_ack(&mut ads.rx, "initial-authorization").await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !gate.is_open() {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("complete initial snapshot opens strict admission");
+        let generation = gate.snapshot().generation;
+
+        // Track two live connections to the same destination on different ports.
+        let track = |mut guard: crate::proxy::connection_manager::ConnectionGuard| {
+            tokio::spawn(async move {
+                let release = guard.watcher().wait_for_drain().await;
+                drop(release);
+                drop(guard);
+            })
+        };
+        let kept_ctx = ctx_for("default/foo0", "10.0.0.8:8080");
+        let revoked_ctx = ctx_for("default/foo0", "10.0.0.8:9090");
+        let kept = track(manager.assert_rbac(&state, &kept_ctx, None).await.unwrap());
+        let revoked = track(
+            manager
+                .assert_rbac(&state, &revoked_ctx, None)
+                .await
+                .unwrap(),
+        );
+
+        // Narrow the ALLOW to port 8080 in a live delta.
+        ads.tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: AUTHORIZATION_TYPE.to_string(),
+                nonce: "live-narrow".into(),
+                resources: vec![allow("allow", vec![8080])],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        expect_ack(&mut ads.rx, "live-narrow").await;
+        tokio::time::timeout(Duration::from_secs(2), revoked)
+            .await
+            .expect("the connection the narrowed policy no longer permits must close")
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), async {
+                while !kept.is_finished() {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .is_err(),
+            "a connection the narrowed policy still permits must stay open"
+        );
+        assert!(
+            gate.is_open(),
+            "a valid policy delta keeps the session open"
+        );
+        assert_eq!(gate.snapshot().generation, generation);
+        assert!(state.assert_rbac(&kept_ctx).await.is_ok());
+        assert!(matches!(
+            state.assert_rbac(&revoked_ctx).await,
+            Err(crate::proxy::AuthorizationRejectionError::NotAllowed)
+        ));
+
+        // A live Address delta whose referenced policy has not arrived denies.
+        let mut late = get_address_with_uid_resource_name(1, "10.0.0.10".parse().unwrap());
+        let mut late_wire =
+            XdsAddress::decode(late.resource.as_ref().unwrap().value.as_slice()).unwrap();
+        let Some(XdsType::Workload(workload)) = late_wire.r#type.as_mut() else {
+            panic!("fixture is a workload");
+        };
+        workload.authorization_policies = vec!["default/foo1-effective".into()];
+        late.resource.as_mut().unwrap().value = late_wire.encode_to_vec();
+        ads.tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: ADDRESS_TYPE.to_string(),
+                nonce: "live-address".into(),
+                resources: vec![late],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        expect_ack(&mut ads.rx, "live-address").await;
+        let late_ctx = ctx_for("default/foo1", "10.0.0.10:8080");
+        assert!(matches!(
+            state.assert_rbac(&late_ctx).await,
+            Err(crate::proxy::AuthorizationRejectionError::MissingPolicy(_))
+        ));
+
+        // Delivering the referenced policy admits; removing it denies again.
+        ads.tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: AUTHORIZATION_TYPE.to_string(),
+                nonce: "live-effective".into(),
+                resources: vec![allow("foo1-effective", vec![])],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        expect_ack(&mut ads.rx, "live-effective").await;
+        assert!(state.assert_rbac(&late_ctx).await.is_ok());
+        ads.tx
+            .send(Ok(DeltaDiscoveryResponse {
+                type_url: AUTHORIZATION_TYPE.to_string(),
+                nonce: "live-withdraw".into(),
+                removed_resources: vec!["default/foo1-effective".into()],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        expect_ack(&mut ads.rx, "live-withdraw").await;
+        assert!(matches!(
+            state.assert_rbac(&late_ctx).await,
+            Err(crate::proxy::AuthorizationRejectionError::MissingPolicy(_))
+        ));
+        assert!(gate.is_open());
+        assert_eq!(gate.snapshot().generation, generation);
+        assert!(state.assert_rbac(&kept_ctx).await.is_ok());
+
+        task.abort();
+        let _ = task.await;
+        stop_tx
+            .start_drain_and_wait(crate::drain::DrainMode::Immediate)
+            .await;
+        watcher.await.unwrap();
+        kept.await.unwrap();
+    }
+
+    /// A rejection after a complete snapshot reconnects from the initial
+    /// backoff; a session that never completes keeps growing its backoff.
+    #[tokio::test]
+    async fn completed_snapshot_restarts_reconnect_backoff() {
+        let malformed_authorization = |nonce: &str| DeltaDiscoveryResponse {
+            type_url: AUTHORIZATION_TYPE.to_string(),
+            nonce: nonce.to_string(),
+            resources: vec![ProtoResource {
+                name: "default/malformed".into(),
+                resource: Some(Any {
+                    type_url: AUTHORIZATION_TYPE.to_string(),
+                    value: vec![0xff],
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let address = || DeltaDiscoveryResponse {
+            type_url: ADDRESS_TYPE.to_string(),
+            nonce: "address".into(),
+            resources: vec![get_address_with_uid_resource_name(
+                0,
+                "10.0.0.8".parse().unwrap(),
+            )],
+            ..Default::default()
+        };
+
+        let gate = XdsSessionGate::new();
+        let (mut connections, mut client, _, _) =
+            AdsServer::spawn_with_session_gate(false, Some(gate.clone())).await;
+        let server = tokio::spawn(async move {
+            let mut ads = connections.recv().await.unwrap();
+            for _ in 0..2 {
+                ads.rx.recv().await.unwrap();
+            }
+            ads.tx.send(Ok(address())).await.unwrap();
+            ads.tx
+                .send(Ok(DeltaDiscoveryResponse {
+                    type_url: AUTHORIZATION_TYPE.to_string(),
+                    nonce: "authorization".into(),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                assert!(ads.rx.recv().await.unwrap().error_detail.is_none());
+            }
+            ads.tx
+                .send(Ok(malformed_authorization("live-bad")))
+                .await
+                .unwrap();
+            assert!(ads.rx.recv().await.unwrap().error_detail.is_some());
+            ads
+        });
+        let next = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.run_loop(Duration::from_secs(8)),
+        )
+        .await
+        .expect("a rejection after a complete snapshot must not sleep the grown backoff");
+        assert_eq!(next, INITIAL_BACKOFF * 2);
+        drop(server.await.unwrap());
+
+        let gate = XdsSessionGate::new();
+        let (mut connections, mut client, _, _) =
+            AdsServer::spawn_with_session_gate(false, Some(gate.clone())).await;
+        let server = tokio::spawn(async move {
+            let mut ads = connections.recv().await.unwrap();
+            for _ in 0..2 {
+                ads.rx.recv().await.unwrap();
+            }
+            ads.tx.send(Ok(address())).await.unwrap();
+            assert!(ads.rx.recv().await.unwrap().error_detail.is_none());
+            ads.tx
+                .send(Ok(malformed_authorization("initial-bad")))
+                .await
+                .unwrap();
+            assert!(ads.rx.recv().await.unwrap().error_detail.is_some());
+            ads
+        });
+        let grown = Duration::from_millis(100);
+        let next = tokio::time::timeout(Duration::from_secs(5), client.run_loop(grown))
+            .await
+            .unwrap();
+        assert_eq!(next, grown * 2, "an incomplete session keeps backing off");
+        assert!(!gate.is_open());
+        drop(server.await.unwrap());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn strict_policy_nack_delivery_deadline_rejects_same_stream_correction() {
         let gate = XdsSessionGate::new();
