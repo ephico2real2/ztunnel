@@ -668,6 +668,10 @@ impl Lease {
     pub fn check_current(&self) -> Result<()> {
         self.provider.current(self).map(|_| ())
     }
+    /// The verifier time of a live lease: the clock that closes its flows at their deadlines.
+    pub(crate) fn current_time(&self) -> Result<SystemTime> {
+        self.provider.current_at(self).map(|(_, now)| now)
+    }
     #[cfg(test)]
     pub fn epoch(&self) -> u64 {
         self.active.epoch
@@ -839,6 +843,13 @@ impl<IO: Unpin> ProfileIo<IO> {
     /// Inspect TLS metadata without exposing mutable unchecked application I/O.
     pub fn get_ref(&self) -> &IO {
         self.io.as_ref().expect("live TLS metadata")
+    }
+    /// When `check` closes this stream under a lease because a certificate expired: the local
+    /// certificate or the verified peer, whichever ends first.
+    pub(crate) fn certificate_deadline(&self) -> SystemTime {
+        self.peer.as_ref().map_or(self.local_deadline, |peer| {
+            self.local_deadline.min(peer.deadline())
+        })
     }
     pub fn new(io: IO, lease: Option<Lease>, local_deadline: SystemTime) -> Result<Self> {
         let flow = if let Some(lease) = &lease {
@@ -1675,6 +1686,10 @@ mod tests {
     fn expiry_step_clock() -> SystemTime {
         shifted(fixture_clock(), EXPIRY_STEP_NS.load(Ordering::SeqCst))
     }
+    static RETIRE_STEP_NS: AtomicI64 = AtomicI64::new(0);
+    fn retire_step_clock() -> SystemTime {
+        shifted(fixture_clock(), RETIRE_STEP_NS.load(Ordering::SeqCst))
+    }
     static COMMIT_STEP_NS: AtomicI64 = AtomicI64::new(0);
     fn commit_step_clock() -> SystemTime {
         shifted(fixture_clock(), COMMIT_STEP_NS.load(Ordering::SeqCst))
@@ -1684,6 +1699,105 @@ mod tests {
     fn crl_step_clock() -> SystemTime {
         let base = UNIX_EPOCH + Duration::from_nanos(CRL_STEP_BASE_NS.load(Ordering::SeqCst));
         shifted(base, CRL_STEP_NS.load(Ordering::SeqCst))
+    }
+
+    // Checkout must leave a transport before the TLS layer closes it, while the lease is still good.
+    #[tokio::test]
+    async fn pooled_transport_takes_no_new_stream_just_before_its_certificate_deadline() {
+        let d = dir();
+        let (w, e) = fixture();
+        let (p, g, s) = opened(d.path(), &e, retire_step_clock);
+        p.commit(decode(&w, &e, retire_step_clock)).unwrap();
+        ready(&p, &g, s);
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut connection = h2::server::handshake(server).await.unwrap();
+            while connection.accept().await.is_some() {}
+        });
+        let (_stop, stop) = watch::channel(false);
+        let key = crate::proxy::h2::client::WorkloadKey {
+            src_id: Identity::default(),
+            dst_id: vec![Identity::default()],
+            src: "127.0.0.1".parse().unwrap(),
+            dst: "127.0.0.2:15008".parse().unwrap(),
+        };
+        let mut sender = crate::proxy::h2::client::spawn_connection(
+            Arc::new(crate::test_helpers::test_config()),
+            client,
+            stop,
+            key,
+            None,
+            Default::default(),
+        )
+        .await
+        .unwrap();
+        let lease = p.acquire().unwrap();
+        sender.bind_profile(
+            Some(lease.clone()),
+            fixture_clock() + Duration::from_secs(20),
+        );
+        assert!(sender.ready_to_use());
+        RETIRE_STEP_NS.store(14_999_000_000, Ordering::SeqCst);
+        assert!(sender.ready_to_use(), "more than 5 s is left");
+        RETIRE_STEP_NS.store(15_000_000_000, Ordering::SeqCst);
+        lease.check_current().unwrap();
+        assert!(!sender.ready_to_use(), "5 s is left and the lease is good");
+    }
+
+    #[tokio::test]
+    async fn certificate_deadline_is_the_first_of_the_local_and_the_peer_certificate() {
+        let root = ca("root", None);
+        let a = ca("a", Some(&root));
+        let b = ca("b", Some(&root));
+        let wa = live_wire("cmtc-a", &root, &a, &b);
+        let wb = live_wire("cmtc-b", &root, &a, &b);
+        let (ea, eb) = (expected(&wa), expected(&wb));
+        let (da, db) = (dir(), dir());
+        let (pa, ga, sa) = opened(da.path(), &ea, SystemTime::now);
+        let (pb, gb, sb) = opened(db.path(), &eb, SystemTime::now);
+        pa.commit(decode(&wa, &ea, SystemTime::now)).unwrap();
+        pb.commit(decode(&wb, &eb, SystemTime::now)).unwrap();
+        ready(&pa, &ga, sa);
+        ready(&pb, &gb, sb);
+        let (early, late) = (
+            rcgen::date_time_ymd(2090, 1, 1),
+            rcgen::date_time_ymd(2100, 1, 1),
+        );
+        for (client_until, server_until, first_is_local) in
+            [(early, late, true), (late, early, false)]
+        {
+            let local = workload_until("cmtc-a.mesh.example", &a, client_until);
+            let peer = workload_until("cmtc-b.mesh.example", &b, server_until);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let client = async {
+                connect(
+                    local.clone(),
+                    Some(pa.acquire().unwrap()),
+                    TcpStream::connect(address).await.unwrap(),
+                    vec![peer.identity().unwrap()],
+                    None,
+                    hs(),
+                )
+                .await
+                .unwrap()
+                .0
+            };
+            let server = async {
+                let (raw, _) = listener.accept().await.unwrap();
+                accept(peer.clone(), Some(pb.acquire().unwrap()), raw, None, hs())
+                    .await
+                    .unwrap()
+                    .0
+            };
+            let (client, _server) = tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(client, server)
+            })
+            .await
+            .unwrap();
+            let first = if first_is_local { &local } else { &peer };
+            assert_eq!(client.certificate_deadline(), first.cert.expiry.not_after);
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1969,8 +2083,16 @@ mod tests {
             .collect()
     }
     fn workload(domain: &str, signer: &Ca) -> Arc<WorkloadCertificate> {
+        workload_until(domain, signer, rcgen::date_time_ymd(4096, 1, 1))
+    }
+    fn workload_until(
+        domain: &str,
+        signer: &Ca,
+        not_after: time::OffsetDateTime,
+    ) -> Arc<WorkloadCertificate> {
         let key = KeyPair::generate().unwrap();
         let mut p = CertificateParams::new(Vec::<String>::new()).unwrap();
+        p.not_after = not_after;
         p.is_ca = IsCa::ExplicitNoCa;
         p.serial_number = Some(rcgen::SerialNumber::from(42u64));
         p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
@@ -2724,6 +2846,7 @@ mod tests {
             src: "127.0.0.1".parse().unwrap(),
             dst: address,
         };
+        let certificate_deadline = client.certificate_deadline();
         let mut sender = crate::proxy::h2::client::spawn_connection(
             cfg,
             client,
@@ -2734,7 +2857,7 @@ mod tests {
         )
         .await
         .unwrap();
-        sender.bind_profile(Some(pa.acquire().unwrap()));
+        sender.bind_profile(Some(pa.acquire().unwrap()), certificate_deadline);
         let request = http::Request::builder()
             .method(http::Method::CONNECT)
             .uri("http://example.com")
@@ -3261,7 +3384,10 @@ mod tests {
             )
             .await
             .unwrap();
-            sender.bind_profile(Some(p.acquire().unwrap()));
+            sender.bind_profile(
+                Some(p.acquire().unwrap()),
+                fixture_clock() + Duration::from_secs(60),
+            );
             let pending = tokio::spawn(async move {
                 sender
                     .send_request(

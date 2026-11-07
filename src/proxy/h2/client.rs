@@ -29,10 +29,19 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::task::{Context, Poll};
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
 use tokio::sync::watch::Receiver;
 use tracing::{Instrument, debug, error, trace, warn};
+
+/// How long before its certificate deadline a pooled transport stops taking new streams.
+///
+/// The TLS layer closes a transport at that deadline, on both nodes. A stream opened in the last
+/// instant fails with it, so a request must go to a new transport before then. A certificate is
+/// renewed at half of its life, so the new transport has a renewed certificate already. The margin
+/// also covers the clock difference between the nodes, because each closes by its own clock.
+const RETIRE_BEFORE_CERTIFICATE_DEADLINE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 // H2ConnectClient is a wrapper abstracting h2
@@ -42,6 +51,8 @@ pub struct H2ConnectClient {
     stream_count: Arc<AtomicU16>,
     wl_key: WorkloadKey,
     profile_lease: Option<crate::tls::profile_provider::Lease>,
+    /// When the TLS layer closes this transport for certificate expiry, under `profile_lease`.
+    certificate_deadline: Option<SystemTime>,
     /// Exact local source observation this pooled transport was created for.
     /// A different or withdrawn observation must never reuse it.
     source_witness: Option<Arc<crate::state::outbound_source::OutboundSource>>,
@@ -72,8 +83,13 @@ impl Display for WorkloadKey {
 }
 
 impl H2ConnectClient {
-    pub(crate) fn bind_profile(&mut self, lease: Option<crate::tls::profile_provider::Lease>) {
+    pub(crate) fn bind_profile(
+        &mut self,
+        lease: Option<crate::tls::profile_provider::Lease>,
+        certificate_deadline: SystemTime,
+    ) {
         self.profile_lease = lease;
+        self.certificate_deadline = Some(certificate_deadline);
     }
     pub(crate) fn bind_source(
         &mut self,
@@ -114,12 +130,21 @@ impl H2ConnectClient {
     }
 
     pub fn ready_to_use(&mut self) -> bool {
-        if self
-            .profile_lease
-            .as_ref()
-            .is_some_and(|lease| lease.check_current().is_err())
-        {
-            return false;
+        if let Some(lease) = &self.profile_lease {
+            let Ok(now) = lease.current_time() else {
+                return false;
+            };
+            if self.certificate_deadline.is_some_and(|deadline| {
+                !deadline
+                    .duration_since(now)
+                    .is_ok_and(|left| left > RETIRE_BEFORE_CERTIFICATE_DEADLINE)
+            }) {
+                debug!(
+                    "retiring transport for {}: certificate deadline",
+                    self.wl_key
+                );
+                return false;
+            }
         }
         // The H2 driver observes a withdrawn source only when it is next
         // polled. Checkout must not wait for that: a stale transport is
@@ -280,6 +305,7 @@ pub(crate) async fn spawn_owned_connection(
         max_allowed_streams,
         wl_key,
         profile_lease: None,
+        certificate_deadline: None,
         source_witness: None,
         teardown,
     };
@@ -391,6 +417,29 @@ mod tests {
     }
 
     // A stream that is not doing I/O still learns of the transport failure.
+    // Without a lease nothing closes a transport at a certificate deadline, so nothing retires it.
+    #[tokio::test]
+    async fn certificate_deadline_does_not_retire_a_transport_without_a_lease() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut conn = h2::server::handshake(server_io).await.unwrap();
+            while conn.accept().await.is_some() {}
+        });
+        let (_drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+        let mut client = spawn_connection(
+            Arc::new(crate::test_helpers::test_config()),
+            client_io,
+            drain_rx,
+            wl_key(),
+            None,
+            TeardownCause::default(),
+        )
+        .await
+        .unwrap();
+        client.bind_profile(None, SystemTime::UNIX_EPOCH);
+        assert!(client.ready_to_use());
+    }
+
     #[tokio::test]
     async fn transport_failure_is_recorded() {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);

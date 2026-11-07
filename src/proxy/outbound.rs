@@ -350,6 +350,7 @@ impl OutboundConnection {
                         .record_crl_rejection(crate::proxy::metrics::Reporter::source);
                 }
             })?;
+            let certificate_deadline = tls_stream.certificate_deadline();
             let (_, ssl) = tls_stream.get_ref().get_ref();
             let peer_identity = {
                 let x509_cert = tls::certificate_from_connection(ssl);
@@ -367,7 +368,7 @@ impl OutboundConnection {
                 teardown,
             )
             .await?;
-            sender.bind_profile(lease);
+            sender.bind_profile(lease, certificate_deadline);
             let origin_network = &self.pi.cfg.network;
             let http_request = self.create_hbone_request(remote_addr, req, Some(origin_network));
             let (inner_upgraded, baggage) = sender.send_request(http_request).await?;
