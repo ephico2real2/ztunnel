@@ -79,6 +79,8 @@ jobs:
   build-image:
     name: Build and Push CI Image (ztunnel-ci${{ matrix.tag_suffix }})
     needs: build-binary
+    # The Quay robot is federated with cilium/ztunnel only: a fork builds the binaries, and cannot push this image.
+    if: github.repository == 'cilium/ztunnel'
     runs-on: ubuntu-latest
     permissions:
       contents: read
